@@ -7,12 +7,19 @@ export interface CodexManagerAccess {
   binding(managerId: string): ManagerBinding | undefined;
   manager(origin: ManagerOrigin): ManagerPort;
 }
+export interface CodexHostLifecycle {
+  connected(registration: unknown): Promise<void>;
+  admitted?(registration: unknown): Promise<void>;
+  ready?(registration: unknown): void;
+  resume(binding: ManagerBinding, signal: AbortSignal, isCurrent: () => boolean): Promise<void>;
+}
 interface Connection {
   token: string;
   instanceId: string;
   lastSeen: number;
   poll?: (response: Response) => void;
   bindings: Map<string, string>;
+  desktop?: unknown;
 }
 interface Attempt {
   connection: Connection;
@@ -20,17 +27,26 @@ interface Attempt {
   finish: (result: DeliveryResult) => void;
   promise: Promise<DeliveryResult>;
 }
+interface Recovery {
+  controller: AbortController;
+  timer: ReturnType<typeof setTimeout>;
+  expires: ReturnType<typeof setTimeout>;
+  signal: AbortSignal;
+  cancel: () => void;
+}
 
 /** Authenticated host transport. Only individual invocation metadata grants a ManagerPort. */
 export class CodexHostAdapter implements HostAdapter {
   readonly #connections = new Map<string, Connection>();
   readonly #attempts = new Map<string, Attempt>();
   readonly #completed = new Map<string, string>();
+  readonly #resumed = new Set<string>();
   readonly #timer: ReturnType<typeof setInterval>;
+  #recovery?: Recovery;
   #closed = false;
   #needsRecovery = true;
 
-  constructor(readonly id: string, private readonly credential: string, private readonly access: CodexManagerAccess, private readonly deadlineMs = 4_500, private readonly restored?: () => void) {
+  constructor(readonly id: string, private readonly credential: string, private readonly access: CodexManagerAccess, private readonly deadlineMs = 4_500, private readonly restored?: () => void, private readonly lifecycle?: CodexHostLifecycle) {
     identifier(id);
     if (!/^[a-f0-9]{64}$/.test(credential)) throw new ConnectorError("invalid_credential", "A dedicated private connector credential is required.");
     this.#timer = setInterval(() => this.#prune(), 30_000);
@@ -47,15 +63,18 @@ export class CodexHostAdapter implements HostAdapter {
       const token = request.headers.get("authorization")?.replace(/^Bearer /, "");
       if (path === `${codexRoute}/connect`) {
         if (!sameSecret(token, this.credential)) throw new ConnectorError("unauthorized", "Native connector authentication failed.", 401);
-        const body = await bodyObject(request); onlyKeys(body, ["protocol", "instanceId"]);
+        const body = await bodyObject(request); onlyKeys(body, ["protocol", "instanceId", "desktop"]);
         if (body.protocol !== connectorProtocol) throw new ConnectorError("protocol_mismatch", "The native connector and service versions differ.", 409);
         const instanceId = identifier(body.instanceId);
+        await this.lifecycle?.connected(body.desktop);
+        if (this.#closed || request.signal.aborted) throw new ConnectorError("host_closed", "The native host bridge is stopping.", 503);
         this.#prune();
         // A retry of an unacknowledged connect reuses its transport identity.
         let connection = [...this.#connections.values()].find((item) => item.instanceId === instanceId);
+        if (connection && JSON.stringify(connection.desktop) !== JSON.stringify(body.desktop)) throw new ConnectorError("desktop_owner_changed", "A connector cannot replace its native owner while reconnecting.", 409);
         if (!connection) {
           if (this.#connections.size >= 256) throw new ConnectorError("host_capacity", "Native connector capacity reached.", 503);
-          connection = { token: randomBytes(32).toString("hex"), instanceId, lastSeen: Date.now(), bindings: new Map() };
+          connection = { token: randomBytes(32).toString("hex"), instanceId, lastSeen: Date.now(), bindings: new Map(), desktop: body.desktop };
           this.#connections.set(connection.token, connection);
         }
         connection.lastSeen = Date.now();
@@ -72,6 +91,11 @@ export class CodexHostAdapter implements HostAdapter {
         const epoch = ownerEpoch(binding);
         const previous = connection.bindings.get(invocation.threadId);
         if (previous && previous !== epoch) throw new ConnectorError("owner_changed", "This connector's manager assignment changed. Reconnect deliberately.", 409);
+        await this.lifecycle?.admitted?.(connection.desktop);
+        const current = this.access.binding(invocation.threadId);
+        if (this.#closed || request.signal.aborted || !current || ownerEpoch(current) !== epoch) throw new ConnectorError("owner_changed", "The manager assignment changed before this invocation.", 409);
+        this.lifecycle?.ready?.(connection.desktop);
+        if (this.#connections.get(connection.token) !== connection) throw new ConnectorError("unauthorized", "The native connector session ended before this invocation.", 401);
         connection.bindings.set(invocation.threadId, epoch);
         const port = this.access.manager({ ...binding.origin, turnId: invocation.turnId, callId: invocation.callId });
         return privateJson(invokeManager(port, identifier(body.operation), body.arguments, invocation));
@@ -79,6 +103,8 @@ export class CodexHostAdapter implements HostAdapter {
       if (path === `${codexRoute}/poll`) {
         onlyKeys(await bodyObject(request), []);
         if (connection.poll) throw new ConnectorError("poll_conflict", "Only one receive operation is allowed per connector.", 409);
+        this.lifecycle?.ready?.(connection.desktop);
+        if (!request.signal.aborted) { this.#cancelRecovery(); this.#resumed.clear(); }
         if (!request.signal.aborted && this.#needsRecovery) {
           // An authenticated receiver is usable again, even if a crashed peer's
           // session has not expired. Merely connecting or renewing a poll is not recovery.
@@ -119,9 +145,16 @@ export class CodexHostAdapter implements HostAdapter {
     if (!current || ownerEpoch(current) !== ownerEpoch(binding)) return { status: "rejected", code: "owner_changed" };
     const existing = [...this.#attempts.values()].find((item) => item.delivery.envelope.deliveryId === envelope.deliveryId);
     if (existing) return ownerEpoch(existing.delivery.binding) === ownerEpoch(binding) ? existing.promise : { status: "rejected", code: "owner_changed" };
-    const connection = [...this.#connections.values()].find((item) => item.poll);
+    let connection: Connection | undefined;
+    for (const candidate of [...this.#connections.values()]) {
+      if (!candidate.poll) continue;
+      try { this.lifecycle?.ready?.(candidate.desktop); }
+      catch { this.#drop(candidate); continue; }
+      connection = candidate; break;
+    }
     if (!connection) {
       this.#needsRecovery = true;
+      this.#scheduleRecovery(binding, envelope.deliveryId, signal);
       return { status: "retry", retryAfterMs: 500, code: "host_offline" };
     }
     const delivery: NativeDelivery = { attemptId: randomUUID(), binding, envelope };
@@ -147,8 +180,62 @@ export class CodexHostAdapter implements HostAdapter {
 
   close(): void {
     this.#closed = true; clearInterval(this.#timer);
+    this.#cancelRecovery();
     for (const connection of this.#connections.values()) this.#drop(connection);
     this.#completed.clear();
+    this.#resumed.clear();
+  }
+  #scheduleRecovery(binding: ManagerBinding, deliveryId: string, signal: AbortSignal): void {
+    const key = JSON.stringify([ownerEpoch(binding), deliveryId]);
+    if (!this.lifecycle || this.#recovery || this.#resumed.has(key)) return;
+    const controller = new AbortController();
+    let retryAfterMs = 1_000;
+    const cancel = () => { if (this.#recovery?.controller === controller) this.#cancelRecovery(); };
+    const check = () => {
+      if (this.#recovery?.controller !== controller || controller.signal.aborted) return;
+      const current = this.access.binding(binding.origin.managerId);
+      if (this.#closed || signal.aborted || !current || ownerEpoch(current) !== ownerEpoch(binding) || [...this.#connections.values()].some((item) => item.poll)) { cancel(); return; }
+      // A receiver can be sending native input or moving between polls. Neither
+      // is evidence that its host needs to be started or its task resumed.
+      if (this.#attempts.size || [...this.#connections.values()].some((item) => Date.now() - item.lastSeen < 1_000)) {
+        this.#recovery.timer = setTimeout(check, 1_000); this.#recovery.timer.unref();
+        return;
+      }
+      // Starting a host is not delivering human input. Keep it outside the
+      // delivery deadline; only a qualified poll restores known-offline work.
+      const isCurrent = () => {
+        if (this.#closed || signal.aborted || this.#recovery?.controller !== controller) return false;
+        try {
+          const latest = this.access.binding(binding.origin.managerId);
+          return Boolean(latest && ownerEpoch(latest) === ownerEpoch(binding));
+        } catch { return false; }
+      };
+      void this.lifecycle!.resume(binding, controller.signal, isCurrent).then(() => {
+        if (!isCurrent()) return;
+        this.#resumed.add(key);
+        if (this.#resumed.size > 512) this.#resumed.delete(this.#resumed.values().next().value!);
+      }, () => {
+        if (!isCurrent()) return;
+        // An app can appear before its native server/profile is ready. Retry
+        // preparation within this recovery's deadline, even if delivery retries
+        // have ended. A successful wake request is never issued again here.
+        this.#recovery!.timer = setTimeout(check, retryAfterMs); this.#recovery!.timer.unref();
+        retryAfterMs = Math.min(retryAfterMs * 2, 4_000);
+      });
+    };
+    const timer = setTimeout(check, 1_000); timer.unref();
+    const expires = setTimeout(cancel, 15_000); expires.unref();
+    this.#recovery = { controller, timer, expires, signal, cancel };
+    signal.addEventListener("abort", cancel, { once: true });
+    if (signal.aborted) cancel();
+  }
+  #cancelRecovery(): void {
+    const recovery = this.#recovery;
+    if (!recovery) return;
+    this.#recovery = undefined;
+    clearTimeout(recovery.timer); clearTimeout(recovery.expires);
+    recovery.signal.removeEventListener("abort", recovery.cancel);
+    recovery.controller.abort();
   }
   #drop(connection: Connection): void {
     connection.poll?.(new Response(null, { status: 204 }));

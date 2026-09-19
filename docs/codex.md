@@ -4,6 +4,8 @@ Seeker connects an existing Codex Desktop manager to your local inbox. The manag
 asks through a small MCP connector; your later reply returns to that same task,
 including while it is idle or already working. The task keeps its workspace,
 model, history, permissions and native execution owner.
+After native registration, Seeker can also resume a task that Desktop has
+unloaded, or start its registered Desktop host when it is stopped.
 
 The connector runs in the runtime supplied by Codex Desktop. Seeker's service,
 store and messaging channels run on Bun. No additional model or agent executor
@@ -41,6 +43,14 @@ Ask the manager to use Seeker's `pending` tool once to confirm admission; routin
 conversation then needs no polling. Setup does not change native permission
 policies or approve other tools.
 
+That first admitted call also records the qualified Desktop application, profile,
+native storage locations and process owner in a private `codex-desktop.json`
+beside the connector configuration. These values come from the actual native
+runtime and its owner; tool arguments cannot supply a launcher or select a
+profile. When upgrading an older connector, repeat setup and reload it before
+making this call. Setup upgrades only the owned environment forwarding list and
+retains existing enabled, required and timeout settings.
+
 Use the same `--data-dir` for setup and startup when overriding the default.
 Native traffic uses an owner-protected socket in this directory; the inbox port
 is independent. The packaged launcher and connector must remain installed at the
@@ -74,7 +84,36 @@ a separate delivery state. None of these statuses
 means the underlying project work is complete or grants native execution
 permission.
 
-An unavailable connector leaves replies in Seeker. When input might already have
+When a saved reply has no receiving connector, Seeker allows normal polling gaps
+and in-flight native input to finish before requesting one host wake. It uses the
+registered application's existing-task link without adding a model prompt or
+overriding task settings. Desktop may come to the foreground and show that task.
+If the app is stopped, it starts with the registered profile and native storage
+locations. The authentic connector must qualify again before receiving input.
+Starting the app is separate from delivering the reply: slow startup leaves the
+reply saved and retryable, and receiver readiness restores known-undelivered
+work even after its ordinary retries have ended. If the app appears before its
+native server and profile are ready, Seeker rechecks startup for up to 15 seconds
+with increasing delays. A successful wake request is coalesced while the
+connector starts.
+
+An ordinary manual app restart can change the process IDs. Seeker verifies the
+running application's actual Desktop profile, code home and native database
+location before resuming the original task; a matching process ID alone is not
+the host identity. The connector then qualifies again before receiving input.
+A different or unreadable profile, ambiguous instances, missing storage evidence,
+or an incompatible native interface remains blocked. Discovery is limited to
+the service's effective OS user. A compatible app update can change its build
+number: the refreshed receiver qualifies its live input capability before it
+receives a reply. Seeker does not update the application. Keep one Desktop
+profile per Seeker data directory.
+
+Profile qualification reads the actual native process argument boundaries, so
+spaces and switch-like text in directory names cannot identify a shorter path.
+The connector's forwarded profile selector or process-list hint must match that
+independent service check before the host can register or receive input.
+
+An unavailable host leaves replies in Seeker. When input might already have
 reached Codex but its result was lost, delivery remains **unknown**; Seeker does
 not blindly submit the same native input again. The receipt and manager's later
 acknowledgement remain available for reconciliation. Restarting Seeker does not
@@ -118,6 +157,8 @@ service on loopback and keep connector credentials out of prompts and logs.
 | The task is denied | Verify the exact registered task ID. A lead should report to its manager. |
 | Native runtime is unavailable | Launch the connector through Desktop; do not replace its runtime with a PATH CLI or change host authentication. |
 | Replies are waiting | Start Seeker with the registered data directory and restore the native connector. |
+| Automatic Desktop recovery is unavailable | Repeat setup after upgrading, reload the connector, and use `pending` from the original manager once. Keep the registered application and profile available. |
+| A different Desktop profile or incompatible interface is running | Restore the registered profile and a compatible native connector; saved replies remain available. |
 | Delivery is unknown | Read the retained exchange and native receipt before attempting another delivery. |
 | Setup reports conflicting settings | Preserve the existing configuration and reconcile the specifically named Seeker section. |
 

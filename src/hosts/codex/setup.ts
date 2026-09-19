@@ -8,6 +8,7 @@ import { binding as validateBinding } from "../../core/validation.ts";
 import { ensureDataDir } from "../../local/config.ts";
 import { privateDirectory, readConnectorConfig, readConnectorCredential, readPrivateFile } from "./config.ts";
 import { CodexHostAdapter } from "./host.ts";
+import { CodexDesktopLifecycle } from "./desktop.ts";
 import { ConnectorError } from "./protocol.ts";
 
 const hostId = "codex-desktop";
@@ -81,7 +82,8 @@ export function setupCodex(options: CodexSetupOptions): { binding: ManagerBindin
 export function installSection(current: string, launcher: string, configPath: string): string {
   const begin = current.indexOf(startMarker), end = current.indexOf(endMarker);
   const parsed = Bun.TOML.parse(current) as { mcp_servers?: Record<string, unknown> };
-  const environment = ["CODEX_APP_TOOLS_PIPE_PATH", "CODEX_MCP_NODE_PATH"];
+  const legacyEnvironment = ["CODEX_APP_TOOLS_PIPE_PATH", "CODEX_MCP_NODE_PATH"];
+  const environment = [...legacyEnvironment, "CODEX_HOME", "CODEX_ELECTRON_USER_DATA_PATH", "CODEX_SQLITE_HOME"];
   const settings = { enabled: true, required: false, startup_timeout_sec: 10, tool_timeout_sec: 15 };
   if ((begin < 0) !== (end < 0) || (begin >= 0 && (end < begin || current.indexOf(startMarker, begin + startMarker.length) >= 0))) throw new ConnectorError("setup_conflict", "The existing Seeker configuration markers need manual reconciliation.");
   if (parsed.mcp_servers?.seeker && begin < 0) throw new ConnectorError("setup_conflict", "A project MCP server named seeker already exists. Preserve or reconcile it before setup.");
@@ -90,7 +92,7 @@ export function installSection(current: string, launcher: string, configPath: st
     const servers = block.mcp_servers as Record<string, unknown> | undefined;
     const seeker = servers?.seeker as Record<string, unknown> | undefined;
     if (Object.keys(block).some((key) => key !== "mcp_servers") || !servers || Object.keys(servers).some((key) => key !== "seeker") || !seeker || Object.keys(seeker).some((key) => !["command", "args", "env_vars", "enabled", "required", "startup_timeout_sec", "tool_timeout_sec"].includes(key))) throw new ConnectorError("setup_conflict", "The Seeker section contains custom settings. Preserve or reconcile them before setup.");
-    if (typeof seeker.command !== "string" || !seeker.command.endsWith("/bin/seeker-codex") || !Array.isArray(seeker.args) || seeker.args.length !== 2 || seeker.args[0] !== "--config" || JSON.stringify(seeker.env_vars) !== JSON.stringify(environment)) throw new ConnectorError("setup_conflict", "The Seeker launcher or environment was customized. Preserve or reconcile it before setup.");
+    if (typeof seeker.command !== "string" || !seeker.command.endsWith("/bin/seeker-codex") || !Array.isArray(seeker.args) || seeker.args.length !== 2 || seeker.args[0] !== "--config" || ![environment, legacyEnvironment].some((value) => JSON.stringify(seeker.env_vars) === JSON.stringify(value))) throw new ConnectorError("setup_conflict", "The Seeker launcher or environment was customized. Preserve or reconcile it before setup.");
     if (seeker.args[1] !== configPath) throw new ConnectorError("setup_conflict", "This project already uses a different Seeker data directory. Preserve that connection rather than redirecting every task.");
     for (const key of ["enabled", "required"] as const) {
       if (seeker[key] !== undefined) {
@@ -115,7 +117,8 @@ export async function loadCodexHost(core: SeekerCore, dataDir: string) {
   const path = join(dataDir, "codex-connector.json");
   if (!statIfPresent(path)) return;
   const config = readConnectorConfig(path);
-  const host = new CodexHostAdapter(config.hostId, readConnectorCredential(config.credentialFile), { binding: (managerId) => core.managerBinding(config.hostId, managerId), manager: (origin) => core.manager(origin) }, 4_500, () => { core.resumeHost(config.hostId); });
+  const lifecycle = new CodexDesktopLifecycle(join(dataDir, "codex-desktop.json"));
+  const host = new CodexHostAdapter(config.hostId, readConnectorCredential(config.credentialFile), { binding: (managerId) => core.managerBinding(config.hostId, managerId), manager: (origin) => core.manager(origin) }, 4_500, () => { core.resumeHost(config.hostId); }, lifecycle);
   let listener: Bun.Server<undefined> | undefined;
   let published: Stats | undefined;
   const removePublished = () => {

@@ -18,7 +18,7 @@ function delivery(): NativeDelivery {
   };
 }
 
-async function nativeFixture(mode: "accepted" | "drop" | "wrong-target" | "bad-frame" = "accepted") {
+async function nativeFixture(mode: "accepted" | "drop" | "wrong-target" | "bad-frame" | "extra-required" | "wrong-input-type" = "accepted") {
   const path = join(tmpdir(), `sk-${randomUUID().slice(0, 8)}.sock`);
   const requests: Record<string, any>[] = [], sockets = new Set<Socket>();
   const server = createServer((socket) => {
@@ -32,7 +32,7 @@ async function nativeFixture(mode: "accepted" | "drop" | "wrong-target" | "bad-f
       if (request.method === "tools/call" && mode === "drop") { socket.destroy(); return; }
       if (request.method === "tools/call" && mode === "bad-frame") { const header = Buffer.alloc(4); header.writeUInt32LE(0xffffffff); socket.end(header); return; }
       const result = request.method === "tools/list"
-        ? { tools: [{ name: "send_message_to_thread", namespace: "codex_app", inputSchema: { type: "object", properties: { threadId: { type: "string" }, prompt: { type: "string" } } } }] }
+        ? { tools: [{ name: "send_message_to_thread", namespace: "codex_app", inputSchema: { type: "object", properties: { threadId: { type: mode === "wrong-input-type" ? "number" : "string" }, prompt: { type: "string" } }, ...(mode === "extra-required" ? { required: ["threadId", "prompt", "newRequiredField"] } : {}) } }] }
         : { success: true, contentItems: [{ type: "inputText", text: JSON.stringify({ threadId: mode === "wrong-target" ? "different-task" : request.params.arguments.threadId }) }] };
       const body = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }));
       const frame = Buffer.alloc(4 + body.length); frame.writeUInt32LE(body.length); body.copy(frame, 4);
@@ -45,6 +45,14 @@ async function nativeFixture(mode: "accepted" | "drop" | "wrong-target" | "bad-f
 }
 
 describe("native input boundary", () => {
+  test("an incompatible refreshed input capability receives no owner notification", async () => {
+    for (const mode of ["extra-required", "wrong-input-type"] as const) {
+      const fixture = await nativeFixture(mode);
+      expect(await new CodexNativeClient(fixture.path).deliver(delivery())).toMatchObject({ status: "retry", code: "native_input_unavailable" });
+      expect(fixture.requests.map((request) => request.method)).toEqual(["tools/list"]);
+    }
+  });
+
   test("uses the exact existing target and supplies no execution setting overrides", async () => {
     const fixture = await nativeFixture();
     const result = await new CodexNativeClient(fixture.path).deliver(delivery());
@@ -97,12 +105,14 @@ describe("scoped native setup", () => {
     const previous = '[permissions]\ndefault = "read-only"\n\n[mcp_servers.existing]\ncommand = "other-tool"\n';
     const installed = installSection(previous, "/opt/seeker/bin/seeker-codex", "/private/seeker/connector.json");
     expect(installed.startsWith(previous)).toBe(true);
-    expect(Bun.TOML.parse(installed)).toMatchObject({ permissions: { default: "read-only" }, mcp_servers: { existing: { command: "other-tool" }, seeker: { required: false, env_vars: ["CODEX_APP_TOOLS_PIPE_PATH", "CODEX_MCP_NODE_PATH"] } } });
+    expect(Bun.TOML.parse(installed)).toMatchObject({ permissions: { default: "read-only" }, mcp_servers: { existing: { command: "other-tool" }, seeker: { required: false, env_vars: ["CODEX_APP_TOOLS_PIPE_PATH", "CODEX_MCP_NODE_PATH", "CODEX_HOME", "CODEX_ELECTRON_USER_DATA_PATH", "CODEX_SQLITE_HOME"] } } });
     expect(installSection(installed, "/opt/seeker/bin/seeker-codex", "/private/seeker/connector.json")).toBe(installed);
     expect(installed).not.toContain("approval_mode");
     const configured = installed.replace("enabled = true", "enabled = false").replace("required = false", "required = true").replace("tool_timeout_sec = 15", "tool_timeout_sec = 45");
     const refreshed = installSection(configured, "/opt/new-seeker/bin/seeker-codex", "/private/seeker/connector.json");
     expect(Bun.TOML.parse(refreshed)).toMatchObject({ mcp_servers: { seeker: { command: "/opt/new-seeker/bin/seeker-codex", enabled: false, required: true, tool_timeout_sec: 45 } } });
+    const legacy = configured.replace(',"CODEX_HOME","CODEX_ELECTRON_USER_DATA_PATH","CODEX_SQLITE_HOME"', "");
+    expect(installSection(legacy, "/opt/new-seeker/bin/seeker-codex", "/private/seeker/connector.json")).toBe(refreshed);
     expect(() => installSection(installed, "/opt/new-seeker/bin/seeker-codex", "/another/connector.json")).toThrow("different Seeker data directory");
   });
 

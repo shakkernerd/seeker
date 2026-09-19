@@ -13,7 +13,7 @@ export interface CodexCommandOptions {
 }
 
 export async function runCodexCommand(args: string[], options: CodexCommandOptions): Promise<void> {
-  const help = "Usage: seeker codex setup --project <directory> --task <native-task-id> --label <name> [--channel <name>] [--data-dir <path>] [--port <number>]\n\nRun setup with Seeker stopped. It registers this manager and adds only the project's Seeker MCP entry. Reload that MCP server through Codex Desktop's supported settings, then start Seeker. Existing task identity and permissions are retained. An explicit channel selection changes future questions only; existing exchanges keep their original route.";
+  const help = "Usage: seeker codex setup --project <directory> --task <native-task-id> --label <name> [--channel <name>] [--data-dir <path>] [--port <number>]\n\nRun setup with Seeker stopped. It registers this manager and adds only the project's Seeker MCP entry. Reload that MCP server through Codex Desktop's supported settings, then start Seeker. Use pending from the original manager once to register its native host for automatic task resumption. Desktop may open or come to the foreground when a saved reply needs that task. Existing task identity and permissions are retained. An explicit channel selection changes future questions only; existing exchanges keep their original route.";
   if (!args.length || args.includes("--help")) { console.log(help); return; }
   if (args.shift() !== "setup") throw new ConnectorError("unknown_command", help);
   if (Bun.version !== runtimeVersion) throw new ConnectorError("runtime_version", `Use qualified Bun ${runtimeVersion}.`);
@@ -34,6 +34,6 @@ export async function runCodexCommand(args: string[], options: CodexCommandOptio
     const recipient = input["--channel"] ? options.resolveRecipient(dataDir, input["--channel"]) : previous?.recipient ?? options.defaultRecipient;
     const result = setupCodex({ core, dataDir, packageDirectory: options.packageDirectory, projectDirectory: input["--project"], threadId: input["--task"], label: input["--label"], recipient });
     const quotedDirectory = `'${dataDir.replaceAll("'", "'\\''")}'`;
-    console.log(`Registered ${result.binding.label} for ${result.binding.recipient.channelId}.\nProject MCP configuration: ${result.projectConfigPath}\nReload the Seeker MCP server in Codex Desktop, preserving this task.\nStart the service: seeker start --data-dir ${quotedDirectory} --port ${port}\nIn the manager task, use Seeker's pending tool once to confirm admission.`);
+    console.log(`Registered ${result.binding.label} for ${result.binding.recipient.channelId}.\nProject MCP configuration: ${result.projectConfigPath}\nReload the Seeker MCP server in Codex Desktop, preserving this task.\nStart the service: seeker start --data-dir ${quotedDirectory} --port ${port}\nIn the original manager task, use Seeker's pending tool once to confirm admission and register automatic Desktop recovery.`);
   } finally { store.close(); }
 }

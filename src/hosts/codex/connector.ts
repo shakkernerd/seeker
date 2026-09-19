@@ -3,6 +3,7 @@ import { createInterface } from "node:readline";
 import type { DeliveryResult } from "../../contracts.ts";
 import { privateSocket, readConnectorConfig, readConnectorCredential, type CodexConnectorConfig } from "./config.ts";
 import { CodexNativeClient } from "./native.ts";
+import { captureDesktopOwner, type DesktopOwner } from "./desktop-owner.ts";
 import { ConnectorError, codexRoute, connectorProtocol, envelopeReference, identifier, invocationFromMetadata, maxWireBytes, record, type NativeDelivery, type NativeInvocation } from "./protocol.ts";
 import { seekerTools } from "./tools.ts";
 import { privateRequest } from "./private-http.ts";
@@ -14,7 +15,7 @@ export class CodexConnector {
   #session?: string;
   #connecting?: Promise<string>;
 
-  constructor(private readonly config: CodexConnectorConfig, private readonly credential: string, private readonly native: CodexNativeClient) {}
+  constructor(private readonly config: CodexConnectorConfig, private readonly credential: string, private readonly native: CodexNativeClient, private readonly desktop?: DesktopOwner) {}
 
   async invoke(origin: NativeInvocation, operation: string, args: unknown, signal?: AbortSignal): Promise<unknown> {
     const session = await this.#connect();
@@ -63,7 +64,7 @@ export class CodexConnector {
     this.#connecting = (async () => {
       privateSocket(this.config.socketPath);
       await this.native.qualify(this.#lifetime.signal);
-      const response = record(await this.#request("connect", { protocol: connectorProtocol, instanceId: this.#instanceId }, this.credential, 4_000));
+      const response = record(await this.#request("connect", { protocol: connectorProtocol, instanceId: this.#instanceId, ...(this.desktop ? { desktop: this.desktop } : {}) }, this.credential, 4_000));
       if (response.protocol !== connectorProtocol || response.hostId !== this.config.hostId || typeof response.session !== "string" || !/^[a-f0-9]{64}$/.test(response.session)) throw new ConnectorError("wrong_host", "The connector reached a different Seeker host registration.");
       this.#session = response.session;
       return response.session;
@@ -105,11 +106,12 @@ function pause(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-export async function runCodexConnector(configPath: string): Promise<void> {
+export async function runCodexConnector(configPath: string, owner?: DesktopOwner): Promise<void> {
   const pipe = process.env.CODEX_APP_TOOLS_PIPE_PATH;
   if (!pipe) throw new ConnectorError("native_host_required", "Run this connector through Codex Desktop's configured MCP server.");
   const config = readConnectorConfig(configPath);
-  const connector = new CodexConnector(config, readConnectorCredential(config.credentialFile), new CodexNativeClient(pipe, 3_000));
+  const desktop = owner ?? await captureDesktopOwner();
+  const connector = new CodexConnector(config, readConnectorCredential(config.credentialFile), new CodexNativeClient(pipe, 3_000), desktop);
   const pending = new Map<string | number, AbortController>();
   let initialized = false;
   const send = (message: unknown) => process.stdout.write(`${JSON.stringify(message)}\n`);

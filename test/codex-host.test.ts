@@ -6,7 +6,7 @@ import { join } from "node:path";
 import type { Decision, ManagerBinding, ReceiptEnvelope } from "../src/contracts.ts";
 import { SeekerCore } from "../src/core/seeker.ts";
 import { SqliteExchangeStore } from "../src/store/sqlite.ts";
-import { CodexHostAdapter } from "../src/hosts/codex/host.ts";
+import { CodexHostAdapter, type CodexHostLifecycle } from "../src/hosts/codex/host.ts";
 import { codexRoute, invocationFromMetadata } from "../src/hosts/codex/protocol.ts";
 import { localRecipient } from "../src/local/channel.ts";
 
@@ -14,18 +14,18 @@ const credential = "a".repeat(64), humanCredential = "b".repeat(64);
 const decision: Decision = { kind: "information", title: "Choose a label", question: "Which label?", context: "", target: "", effect: "", scope: "", conditions: "", options: [] };
 const cleanups: (() => void | Promise<void>)[] = [];
 afterEach(async () => { for (const close of cleanups.splice(0).reverse()) await close(); });
-function fixture(clock: () => number = Date.now) {
+function fixture(clock: () => number = Date.now, lifecycle?: CodexHostLifecycle, deadlineMs = 1_000) {
   const directory = mkdtempSync(join(tmpdir(), "seeker-native-test-"));
   const store = new SqliteExchangeStore(join(directory, "store.sqlite"));
   const core = new SeekerCore(store, clock);
   let restorations = 0;
   const bindings = ["manager-one", "manager-two"].map((managerId): ManagerBinding => ({ id: managerId, label: managerId, origin: { hostId: "codex-test", managerId, assignmentId: `assignment-${managerId}`, generation: 1 }, recipient: localRecipient }));
   bindings.forEach((binding) => core.bind(binding));
-  const host = new CodexHostAdapter("codex-test", credential, { binding: (id) => core.managerBinding("codex-test", id), manager: (origin) => core.manager(origin) }, 1_000, () => { restorations += 1; core.resumeHost("codex-test"); });
+  const host = new CodexHostAdapter("codex-test", credential, { binding: (id) => core.managerBinding("codex-test", id), manager: (origin) => core.manager(origin) }, deadlineMs, () => { restorations += 1; core.resumeHost("codex-test"); }, lifecycle);
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: async (request) => await host.handle(request) ?? new Response(null, { status: 404 }) });
   cleanups.push(async () => { host.close(); await server.stop(true); store.close(); rmSync(directory, { recursive: true, force: true }); });
   const send = (path: string, body: unknown, token = credential, signal?: AbortSignal) => fetch(`http://127.0.0.1:${server.port}${codexRoute}/${path}`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body), signal });
-  const connect = async () => { const response = await send("connect", { protocol: 1, instanceId: randomUUID() }); expect(response.status).toBe(200); return (await response.json()).session as string; };
+  const connect = async (desktop?: unknown) => { const response = await send("connect", { protocol: 1, instanceId: randomUUID(), ...(desktop === undefined ? {} : { desktop }) }); expect(response.status).toBe(200); return (await response.json()).session as string; };
   const invoke = (session: string, managerId: string, operation: string, args: unknown) => send("invoke", { origin: { threadId: managerId, turnId: "native-turn", callId: "native-call" }, operation, arguments: args }, session);
   return { core, store, host, bindings, send, connect, invoke, restorations: () => restorations };
 }
@@ -92,6 +92,100 @@ describe("native caller admission", () => {
 });
 
 describe("native return transport", () => {
+  test("a poll opened before registration cannot receive input after its identity becomes stale", async () => {
+    let registered = false;
+    const f = fixture(Date.now, {
+      connected: async () => {},
+      admitted: async (desktop) => { if (desktop === "qualified") registered = true; },
+      ready: (desktop) => { if (registered && desktop !== "qualified") throw new Error("stale native owner"); },
+      resume: async () => {},
+    });
+    const value = envelope(f), legacy = await f.connect(), oldPoll = f.send("poll", {}, legacy);
+    await eventually(() => f.restorations() === 1);
+    const qualified = await f.connect("qualified");
+    expect((await f.invoke(qualified, "manager-one", "pending", {})).status).toBe(200);
+    const newPoll = f.send("poll", {}, qualified);
+    await Bun.sleep(10);
+    const delivered = f.host.deliver(value.binding, value.envelope, new AbortController().signal);
+    expect((await oldPoll).status).toBe(204);
+    const packet = await (await newPoll).json();
+    expect(packet.envelope.deliveryId).toBe(value.envelope.deliveryId);
+    await f.send("result", { attemptId: packet.attemptId, result: { status: "accepted", reference: "qualified-owner" } }, qualified);
+    expect((await delivered).status).toBe("accepted");
+  });
+
+  test("offline recovery is coalesced and slow host startup never becomes uncertain delivery", async () => {
+    const resumed: { binding: ManagerBinding; signal: AbortSignal }[] = [];
+    const f = fixture(Date.now, {
+      connected: async () => {},
+      resume: async (binding, signal) => { resumed.push({ binding, signal }); await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true })); },
+    });
+    const first = envelope(f), second = envelope(f, 1), controller = new AbortController();
+    const started = Date.now();
+    for (const value of [first, second, first]) expect(await f.host.deliver(value.binding, value.envelope, controller.signal)).toMatchObject({ status: "retry", code: "host_offline" });
+    expect(Date.now() - started).toBeLessThan(200);
+    await eventually(() => resumed.length === 1, 1_500);
+    expect(resumed[0]!.binding.origin).toEqual(first.binding.origin);
+    for (let index = 0; index < 5; index += 1) expect((await f.host.deliver(first.binding, first.envelope, controller.signal)).status).toBe("retry");
+    expect(resumed).toHaveLength(1);
+    f.host.close();
+    expect(resumed[0]!.signal.aborted).toBe(true);
+  });
+
+  test("transient host preparation retries the saved receipt without repeating a successful wake", async () => {
+    const resumed: ManagerBinding[] = [];
+    const f = fixture(Date.now, {
+      connected: async () => {},
+      resume: async (binding) => {
+        resumed.push(binding);
+        if (resumed.length === 1) throw new Error("native server is still starting");
+      },
+    });
+    const first = envelope(f), second = envelope(f, 1), signal = new AbortController().signal;
+    expect(await f.host.deliver(first.binding, first.envelope, signal)).toMatchObject({ status: "retry", code: "host_offline" });
+    // Recovery owns this retry; no new delivery or receiver triggers it.
+    await eventually(() => resumed.length === 2, 2_500);
+    expect(resumed.map((binding) => binding.origin)).toEqual([first.binding.origin, first.binding.origin]);
+    for (const value of [first, second, first]) expect((await f.host.deliver(value.binding, value.envelope, signal)).status).toBe("retry");
+    await Bun.sleep(1_100);
+    expect(resumed).toHaveLength(2);
+  });
+
+  test("a busy native sender and a normal polling gap do not reopen Desktop", async () => {
+    let resumed = 0;
+    const f = fixture(Date.now, { connected: async () => {}, resume: async () => { resumed += 1; } }, 3_000);
+    const first = envelope(f), second = envelope(f, 1), session = await f.connect();
+    const polling = f.send("poll", {}, session);
+    await eventually(() => f.restorations() === 1);
+    const sending = f.host.deliver(first.binding, first.envelope, new AbortController().signal);
+    const packet = await (await polling).json();
+    expect((await f.host.deliver(second.binding, second.envelope, new AbortController().signal)).status).toBe("retry");
+    await Bun.sleep(1_100);
+    expect(resumed).toBe(0);
+    await f.send("result", { attemptId: packet.attemptId, result: { status: "accepted", reference: "native-busy" } }, session);
+    expect((await sending).status).toBe("accepted");
+    const nextPoll = f.send("poll", {}, session);
+    await Bun.sleep(1_100);
+    expect(resumed).toBe(0);
+    await f.send("disconnect", {}, session); await nextPoll;
+  });
+
+  test("cancelled, replaced and closed owners cannot start a delayed recovery", async () => {
+    let resumed = 0;
+    const lifecycle = { connected: async () => {}, resume: async () => { resumed += 1; } };
+    const cancelled = fixture(Date.now, lifecycle), replaced = fixture(Date.now, lifecycle), closed = fixture(Date.now, lifecycle);
+    const controller = new AbortController();
+    for (const f of [cancelled, replaced, closed]) {
+      const value = envelope(f);
+      expect((await f.host.deliver(value.binding, value.envelope, f === cancelled ? controller.signal : new AbortController().signal)).status).toBe("retry");
+    }
+    controller.abort();
+    replaced.store.transfer("manager-one", 1, { ...replaced.bindings[0]!.origin, generation: 2 });
+    closed.host.close();
+    await Bun.sleep(1_100);
+    expect(resumed).toBe(0);
+  });
+
   test("interleaved managers keep targets and host acceptance does not manufacture consumption", async () => {
     const f = fixture(), session = await f.connect();
     const first = envelope(f), second = envelope(f, 1);
