@@ -1,8 +1,16 @@
 #!/bin/sh
 set -eu
-if [ -z "${CODEX_MCP_NODE_PATH:-}" ] || [ ! -x "$CODEX_MCP_NODE_PATH" ]; then
-  printf '%s\n' 'Seeker requires the runtime supplied by Codex Desktop. Reload its configured MCP server.' >&2
+seeker_runtime=
+if [ "$#" -eq 4 ] && [ "$3" = '--runtime' ]; then
+  case "$4" in /*) seeker_runtime=$4 ;; esac
+  set -- "$1" "$2"
+fi
+if [ -n "${CODEX_MCP_NODE_PATH:-}" ] && [ -x "$CODEX_MCP_NODE_PATH" ]; then
+  seeker_runtime=$CODEX_MCP_NODE_PATH
+fi
+if [ -z "$seeker_runtime" ] || [ ! -x "$seeker_runtime" ]; then
+  printf '%s\n' 'Re-run Seeker native setup with its qualified Bun runtime.' >&2
   exit 1
 fi
 seeker_package_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-exec "$CODEX_MCP_NODE_PATH" "$seeker_package_dir/dist/codex-connector.mjs" "$@"
+exec "$seeker_runtime" "$seeker_package_dir/dist/codex-connector.mjs" "$@"

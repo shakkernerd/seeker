@@ -11,7 +11,7 @@ if (!result.success) {
   process.exit(1);
 }
 chmodSync("dist/cli.js", 0o755);
-const native = await Bun.build({ entrypoints: ["src/hosts/codex/connector.ts"], outdir: "dist", naming: "codex-connector.mjs", target: "node", format: "esm", packages: "external" });
+const native = await Bun.build({ entrypoints: ["src/hosts/codex-common/entry.ts"], outdir: "dist", naming: "codex-connector.mjs", target: "node", format: "esm", packages: "external" });
 if (!native.success) {
   for (const log of native.logs) console.error(log);
   process.exit(1);

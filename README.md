@@ -30,7 +30,7 @@ The demo is clearly labelled and uses a deterministic host fixture. It changes n
 - **Recoverable answers.** Pending exchanges survive interruption. Changed proposals retire old choices; later corrections and stops remain visible.
 - **Quiet by default.** One prompt per decision, with no recurring reminders.
 
-The local channel is available immediately. [Codex Desktop setup](docs/codex.md) connects an existing manager and returns replies to that same task. [Telegram setup](docs/telegram.md) adds an optional private conversation with a deliberately paired owner. The local demo uses its labelled fixture; live connections are configured separately.
+The local channel is available immediately. [Codex Desktop setup](docs/codex.md) and [Codex CLI setup](docs/codex-cli.md) connect existing managers and return replies to those same native tasks. They share one project MCP entry. [Telegram setup](docs/telegram.md) adds an optional private conversation with a deliberately paired owner. The local demo uses its labelled fixture; live connections are configured separately.
 
 ## Use and extend
 

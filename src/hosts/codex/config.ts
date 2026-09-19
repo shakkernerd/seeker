@@ -10,7 +10,7 @@ export interface CodexConnectorConfig {
 }
 
 export function readPrivateFile(path: string): string {
-  const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const stat = fstatSync(descriptor);
     if (!stat.isFile() || stat.size > 16_384 || (stat.mode & 0o077) !== 0 || (process.getuid && stat.uid !== process.getuid())) {

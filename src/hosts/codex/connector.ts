@@ -1,11 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { createInterface } from "node:readline";
 import type { DeliveryResult } from "../../contracts.ts";
 import { privateSocket, readConnectorConfig, readConnectorCredential, type CodexConnectorConfig } from "./config.ts";
 import { CodexNativeClient } from "./native.ts";
 import { captureDesktopOwner, type DesktopOwner } from "./desktop-owner.ts";
-import { ConnectorError, codexRoute, connectorProtocol, envelopeReference, identifier, invocationFromMetadata, maxWireBytes, record, type NativeDelivery, type NativeInvocation } from "./protocol.ts";
-import { seekerTools } from "./tools.ts";
+import { ConnectorError, codexRoute, connectorProtocol, envelopeReference, identifier, record, type NativeDelivery, type NativeInvocation } from "./protocol.ts";
+import { serveSeekerTools } from "../codex-common/mcp.ts";
 import { privateRequest } from "./private-http.ts";
 
 export class CodexConnector {
@@ -112,52 +111,7 @@ export async function runCodexConnector(configPath: string, owner?: DesktopOwner
   const config = readConnectorConfig(configPath);
   const desktop = owner ?? await captureDesktopOwner();
   const connector = new CodexConnector(config, readConnectorCredential(config.credentialFile), new CodexNativeClient(pipe, 3_000), desktop);
-  const pending = new Map<string | number, AbortController>();
-  let initialized = false;
-  const send = (message: unknown) => process.stdout.write(`${JSON.stringify(message)}\n`);
-  const lines = createInterface({ input: process.stdin });
   const receive = connector.receive();
-  lines.on("line", (line) => {
-    if (Buffer.byteLength(line) > maxWireBytes) { send({ jsonrpc: "2.0", id: null, error: { code: -32600, message: "MCP request too large." } }); return; }
-    let message: Record<string, unknown>;
-    try { message = record(JSON.parse(line)); }
-    catch { send({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Invalid JSON-RPC message." } }); return; }
-    if (message.method === "notifications/cancelled") {
-      try { const id = record(message.params).requestId; if (typeof id === "string" || typeof id === "number") pending.get(id)?.abort(); } catch { /* Malformed notifications cannot cancel another request. */ }
-      return;
-    }
-    if (message.id === undefined) return;
-    const requestId = message.id;
-    if ((typeof requestId !== "string" && typeof requestId !== "number") || pending.has(requestId) || pending.size >= 16) { send({ jsonrpc: "2.0", id: requestId ?? null, error: { code: -32600, message: "Invalid or duplicate MCP request." } }); return; }
-    const controller = new AbortController(); pending.set(requestId, controller);
-    void (async () => {
-      if (message.method === "initialize") {
-        if (initialized) throw new ConnectorError("already_initialized", "This connector is already initialized.");
-        initialized = true;
-        return { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "seeker", version: "0.1.0" }, instructions: "Seeker carries authentic owner conversations for explicitly registered managers. Caller identity comes from Codex. Read the current exchange and receipt before acting on a notification; context questions are not approvals. Preserve native permissions. Submit promptly, continue independent work, and never poll repeatedly." };
-      }
-      if (!initialized) throw new ConnectorError("not_initialized", "Initialize the connector first.");
-      if (message.method === "ping") return {};
-      if (message.method === "tools/list") return { tools: seekerTools };
-      if (message.method !== "tools/call") throw new ConnectorError("unknown_method", "Unsupported MCP method.");
-      const params = record(message.params);
-      try {
-        const result = await connector.invoke(invocationFromMetadata(params._meta), identifier(params.name), params.arguments ?? {}, controller.signal);
-        return { content: [{ type: "text", text: JSON.stringify(result) }] };
-      } catch (error) {
-        const known = error instanceof ConnectorError;
-        return { isError: true, content: [{ type: "text", text: JSON.stringify({ error: known ? error.code : "invalid_request", message: known ? error.message : "Seeker could not validate this request." }) }] };
-      }
-    })().then((result) => send({ jsonrpc: "2.0", id: requestId, result }), () => send({ jsonrpc: "2.0", id: requestId, error: { code: -32600, message: "Invalid MCP request." } })).finally(() => pending.delete(requestId));
-  });
-  await new Promise<void>((resolve) => { lines.once("close", resolve); process.once("SIGTERM", () => { lines.close(); resolve(); }); process.once("SIGINT", () => { lines.close(); resolve(); }); });
-  for (const controller of pending.values()) controller.abort();
-  await connector.close();
-  await receive;
-}
-
-if (import.meta.main) {
-  const args = process.argv.slice(2);
-  if (args.length !== 2 || args[0] !== "--config") { console.error("Use seeker codex setup to configure the host connector."); process.exitCode = 1; }
-  else await runCodexConnector(args[1]!).catch(() => { console.error("Seeker's native connector could not start. Check its private configuration and host-managed runtime."); process.exitCode = 1; });
+  try { await serveSeekerTools(connector); }
+  finally { await connector.close(); await receive; }
 }

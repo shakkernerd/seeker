@@ -156,3 +156,31 @@ test("unsafe address replacement is rejected before any request and unrelated so
   chmodSync(value.data, 0o755);
   expect(() => readConnectorConfig(value.configured.configPath)).toThrow("private directory");
 });
+
+test.skipIf(process.platform === "win32")("private config and credential readers reject a FIFO without blocking startup", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "seeker-native-fifo-")), path = join(directory, "private-pipe");
+  closers.push(() => rmSync(directory, { recursive: true, force: true }));
+  expect(Bun.spawnSync(["mkfifo", "-m", "600", path], { timeout: 1_000 }).exitCode).toBe(0);
+  expect(lstatSync(path).isFIFO()).toBe(true);
+  const script = `
+    import { readCliConfig } from ${JSON.stringify(new URL("../src/hosts/codex-cli/config.ts", import.meta.url).href)};
+    import { readConnectorCredential } from ${JSON.stringify(new URL("../src/hosts/codex/config.ts", import.meta.url).href)};
+    const rejected = [];
+    for (const read of [readCliConfig, readConnectorCredential]) {
+      try { read(process.argv[1]); } catch (error) { rejected.push(error.code); }
+    }
+    console.log(JSON.stringify(rejected));
+  `;
+  // The deadline belongs to the parent process, so a blocking open cannot hang the suite.
+  const child = Bun.spawn([process.execPath, "--no-install", "--eval", script, path], {
+    stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: 1_500, killSignal: "SIGKILL",
+  });
+  try {
+    expect(await child.exited).toBe(0);
+    expect(JSON.parse(await new Response(child.stdout).text())).toEqual(["unsafe_config", "unsafe_config"]);
+    expect(await new Response(child.stderr).text()).toBe("");
+  } finally {
+    if (child.exitCode === null) child.kill("SIGKILL");
+    await child.exited;
+  }
+}, 4_000);
