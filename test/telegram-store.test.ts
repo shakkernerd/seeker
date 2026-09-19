@@ -76,10 +76,18 @@ async function fixture(dropSendResponse = false) {
   let channel = makeChannel();
   let pump = new DeliveryPump(core, [new LocalChannel(), channel], [host]);
   cleanup.push(() => { pump.stop(); store.close(); });
+  function manager(id: string) {
+    const port = core.manager({ hostId: "test-host", managerId: id, assignmentId: id, generation: 1 });
+    return { ...port, get: (requestId: string) => {
+      port.get(requestId);
+      // Exercise the scoped port, then inspect durable state independently of wire paging.
+      return store.get(requestId)!;
+    } };
+  }
   function bind(id: string, initialRecipient = recipient) {
     const binding: ManagerBinding = { id, label: id, recipient: initialRecipient, origin: { hostId: "test-host", managerId: id, assignmentId: id, generation: 1 } };
     core.bind(binding);
-    return core.manager(binding.origin);
+    return manager(id);
   }
   async function flush() {
     pump.tick();
@@ -87,7 +95,7 @@ async function fixture(dropSendResponse = false) {
     expect(pump.inFlight).toBe(0);
     expect(pump.lastError).toBeUndefined();
   }
-  return { bind, sent, updates, calls, returned, deferred, notices, outcomes, flush, filename,
+  return { bind, manager, sent, updates, calls, returned, deferred, notices, outcomes, flush, filename,
     get store() { return store; }, get core() { return core; }, get channel() { return channel; },
     advance: (ms = 2_000) => { now += ms; },
     poll: () => {
@@ -145,7 +153,7 @@ test("real store routes two managers, natural discussion, stale choices and late
   await f.poll(); await f.flush();
   expect(f.calls.filter((call) => call.method === "getUpdates").at(-1)!.body.offset).toBe(7);
   expect(f.store.get("beta-request")!.exchange.receipts).toHaveLength(1);
-  const resumed = f.core.manager({ hostId: "test-host", managerId: "alpha", assignmentId: "alpha", generation: 1 });
+  const resumed = f.manager("alpha");
   resumed.update({ type: "revise", requestId: "alpha-request", expectedVersion: resumed.get("alpha-request").exchange.version, decision: decision("preview-two") });
   f.advance(); await f.flush();
   f.updates.push(click(7, "stale-click", alphaMessage), reply(8, "yes", alphaMessage));
