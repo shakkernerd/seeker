@@ -132,6 +132,25 @@ describe("native return transport", () => {
     expect(resumed[0]!.signal.aborted).toBe(true);
   });
 
+  test("transient host preparation retries the saved receipt without repeating a successful wake", async () => {
+    const resumed: ManagerBinding[] = [];
+    const f = fixture(Date.now, {
+      connected: async () => {},
+      resume: async (binding) => {
+        resumed.push(binding);
+        if (resumed.length === 1) throw new Error("native server is still starting");
+      },
+    });
+    const first = envelope(f), second = envelope(f, 1), signal = new AbortController().signal;
+    expect(await f.host.deliver(first.binding, first.envelope, signal)).toMatchObject({ status: "retry", code: "host_offline" });
+    // Recovery owns this retry; no new delivery or receiver triggers it.
+    await eventually(() => resumed.length === 2, 2_500);
+    expect(resumed.map((binding) => binding.origin)).toEqual([first.binding.origin, first.binding.origin]);
+    for (const value of [first, second, first]) expect((await f.host.deliver(value.binding, value.envelope, signal)).status).toBe("retry");
+    await Bun.sleep(1_100);
+    expect(resumed).toHaveLength(2);
+  });
+
   test("a busy native sender and a normal polling gap do not reopen Desktop", async () => {
     let resumed = 0;
     const f = fixture(Date.now, { connected: async () => {}, resume: async () => { resumed += 1; } }, 3_000);

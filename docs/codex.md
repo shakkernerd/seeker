@@ -92,7 +92,10 @@ If the app is stopped, it starts with the registered profile and native storage
 locations. The authentic connector must qualify again before receiving input.
 Starting the app is separate from delivering the reply: slow startup leaves the
 reply saved and retryable, and receiver readiness restores known-undelivered
-work even after its ordinary retries have ended.
+work even after its ordinary retries have ended. If the app appears before its
+native server and profile are ready, Seeker rechecks startup for up to 15 seconds
+with increasing delays. A successful wake request is coalesced while the
+connector starts.
 
 An ordinary manual app restart can change the process IDs. Seeker verifies the
 running application's actual Desktop profile, code home and native database

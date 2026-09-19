@@ -189,6 +189,7 @@ export class CodexHostAdapter implements HostAdapter {
     const key = JSON.stringify([ownerEpoch(binding), deliveryId]);
     if (!this.lifecycle || this.#recovery || this.#resumed.has(key)) return;
     const controller = new AbortController();
+    let retryAfterMs = 1_000;
     const cancel = () => { if (this.#recovery?.controller === controller) this.#cancelRecovery(); };
     const check = () => {
       if (this.#recovery?.controller !== controller || controller.signal.aborted) return;
@@ -200,15 +201,27 @@ export class CodexHostAdapter implements HostAdapter {
         this.#recovery.timer = setTimeout(check, 1_000); this.#recovery.timer.unref();
         return;
       }
-      this.#resumed.add(key);
-      if (this.#resumed.size > 512) this.#resumed.delete(this.#resumed.values().next().value!);
       // Starting a host is not delivering human input. Keep it outside the
       // delivery deadline; only a qualified poll restores known-offline work.
       const isCurrent = () => {
-        const latest = this.access.binding(binding.origin.managerId);
-        return !this.#closed && !signal.aborted && this.#recovery?.controller === controller && Boolean(latest && ownerEpoch(latest) === ownerEpoch(binding));
+        if (this.#closed || signal.aborted || this.#recovery?.controller !== controller) return false;
+        try {
+          const latest = this.access.binding(binding.origin.managerId);
+          return Boolean(latest && ownerEpoch(latest) === ownerEpoch(binding));
+        } catch { return false; }
       };
-      void this.lifecycle!.resume(binding, controller.signal, isCurrent).catch(() => undefined);
+      void this.lifecycle!.resume(binding, controller.signal, isCurrent).then(() => {
+        if (!isCurrent()) return;
+        this.#resumed.add(key);
+        if (this.#resumed.size > 512) this.#resumed.delete(this.#resumed.values().next().value!);
+      }, () => {
+        if (!isCurrent()) return;
+        // An app can appear before its native server/profile is ready. Retry
+        // preparation within this recovery's deadline, even if delivery retries
+        // have ended. A successful wake request is never issued again here.
+        this.#recovery!.timer = setTimeout(check, retryAfterMs); this.#recovery!.timer.unref();
+        retryAfterMs = Math.min(retryAfterMs * 2, 4_000);
+      });
     };
     const timer = setTimeout(check, 1_000); timer.unref();
     const expires = setTimeout(cancel, 15_000); expires.unref();
