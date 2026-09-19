@@ -171,11 +171,13 @@ export class TelegramChannel implements MessagingChannel {
       const action = parsed?.[2];
       const known = ingress.resolveMessage(this.#recipient.conversationId, messageId);
       if (!handle || !action || (known && known !== handle)) return { feedback: { ...feedback, text: "This action does not match the request." } };
-      if (action === "q") return { event: { ...common, sourceRef: callbackReference(callback.id), replyHandle: handle, kind: "question", text: "Could you provide more context?" }, feedback };
+      // Keep the message reference so a confirmed click can recover an uncertain
+      // send. pollOnce uses the callback ID separately for event deduplication.
+      if (action === "q") return { event: { ...common, replyHandle: handle, kind: "question", text: "Could you provide more context?" }, feedback };
       const kind = action[0] === "a" ? "approve" : action[0] === "d" ? "decline" : "answer";
       // Core validates both the choice and kind against the immutable revision and
       // supplies its meaning. Closed exchanges still accept authentic corrections.
-      return { event: { ...common, sourceRef: callbackReference(callback.id), replyHandle: handle, kind, optionId: parsed![3]!, text: "" }, feedback };
+      return { event: { ...common, replyHandle: handle, kind, optionId: parsed![3]!, text: "" }, feedback };
     }
     const feedback = { messageId };
     if (message.forward_origin !== undefined || message.external_reply !== undefined || message.quote !== undefined) {
