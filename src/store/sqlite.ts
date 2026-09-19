@@ -3,12 +3,13 @@ import { createHash, randomUUID } from "node:crypto";
 import { closeSync, constants, mkdirSync, openSync } from "node:fs";
 import { dirname } from "node:path";
 import type {
-  DeferredReply, Delivery, DeliveryResult, Exchange, ExchangeStore, ExchangeView, HistoryPage, InboundReply, IngestResult,
-  ManagerBinding, ManagerCommand, ManagerOrigin, ReceiveProgress, Recipient,
+  DeferredReply, Delivery, DeliveryResult, Exchange, ExchangeRead, ExchangeStore, ExchangeView, HistoryPage, InboundReply, IngestResult,
+  ManagerBinding, ManagerCommand, ManagerOrigin, PendingPage, ReadItem, ReadOptions, ReceiveProgress, Recipient,
 } from "../contracts.ts";
 import { create, deferInput, incorporate, mutate, reconcileInput, replyContentKey, type Change } from "../core/lifecycle.ts";
 import { channelReadiness, routeFor } from "../core/attention.ts";
 import { correlateBare, type BareCandidate } from "../core/correlation.ts";
+import { readSelection } from "../core/reads.ts";
 import { binding as validateBinding, decision, fail, id, integer, limits, origin as validateOrigin, progress as validateProgress, reply as validateReply, sameOwner, sameRecipient, SeekerError } from "../core/validation.ts";
 
 type Row = { data: string };
@@ -83,6 +84,7 @@ export class SqliteExchangeStore implements ExchangeStore {
         this.#db.run("CREATE INDEX IF NOT EXISTS exchange_state ON exchanges(state,updated_at,id)");
         this.#db.run("CREATE INDEX IF NOT EXISTS exchange_history ON exchanges(json_extract(data,'$.createdAt') DESC,id)");
         this.#db.run("CREATE INDEX IF NOT EXISTS deferred_status ON inbound(json_extract(data,'$.deferred.disposition.status'),json_extract(data,'$.deferred.exchangeId'))");
+        this.#db.run("CREATE INDEX IF NOT EXISTS deferred_input ON inbound(json_extract(data,'$.deferred.exchangeId'))");
         this.#db.run("CREATE INDEX IF NOT EXISTS inbox_history ON exchanges(json_extract(data,'$.recipient.channelId'),json_extract(data,'$.recipient.actorId'),json_extract(data,'$.recipient.conversationId'),json_extract(data,'$.createdAt') DESC,id)");
         this.#db.run("CREATE INDEX IF NOT EXISTS inbox_changes ON exchanges(json_extract(data,'$.recipient.channelId'),json_extract(data,'$.recipient.actorId'),json_extract(data,'$.recipient.conversationId'),updated_at)");
         this.#db.run("CREATE INDEX IF NOT EXISTS presented_question ON deliveries(exchange_id,json_extract(data,'$.revision'),json_extract(data,'$.acceptedAt')) WHERE state='accepted' AND json_extract(data,'$.lane')='channel' AND json_extract(data,'$.contextId') IS NULL");
@@ -184,20 +186,20 @@ export class SqliteExchangeStore implements ExchangeStore {
     }).immediate();
   }
 
-  execute(origin: ManagerOrigin, command: ManagerCommand, now: number): ExchangeView {
-    return this.#db.transaction(() => {
+  execute(origin: ManagerOrigin, command: ManagerCommand, now: number): void {
+    this.#db.transaction(() => {
       if (!["submit", "revise", "context", "cancel", "acknowledge", "reconcile-input"].includes(command.type)) fail("invalid_input", "Unknown manager operation.");
       const binding = this.binding(origin);
       id(command.requestId, "Request");
-      const existing = this.get(command.requestId);
-      if (existing && existing.exchange.bindingId !== binding.id) fail("origin_denied", "This exchange belongs to another manager.", 403);
+      const existing = this.#exchange(command.requestId);
+      if (existing && existing.bindingId !== binding.id) fail("origin_denied", "This exchange belongs to another manager.", 403);
       if (command.type === "submit") {
         const snapshot = decision(command.decision);
         if (existing) {
-          if (JSON.stringify(existing.exchange.revisions[0]!.decision) !== JSON.stringify(snapshot)) {
+          if (JSON.stringify(existing.revisions[0]!.decision) !== JSON.stringify(snapshot)) {
             fail("idempotency_conflict", "This request identity already describes a different decision.", 409);
           }
-          return existing;
+          return;
         }
         if (this.#activeCount() >= limits.exchanges) fail("capacity", "Active exchange capacity reached. Handle or cancel pending work; history was retained.", 503);
         const change = create({ ...binding, origin: validateOrigin(origin) }, command.requestId, snapshot, now);
@@ -208,19 +210,25 @@ export class SqliteExchangeStore implements ExchangeStore {
           const row = this.#db.query<Row, [string, string]>("SELECT data FROM inbound WHERE channel_id=? AND event_id=?").get(command.channelId, command.eventId);
           const record = row ? decode<InboundRecord>(row) : undefined;
           if (!record?.deferred) fail("not_found", "Deferred input not found.", 404);
-          const beforeVersion = existing.exchange.version;
-          record.deferred = reconcileInput(existing.exchange, record.deferred, command, now);
+          const beforeVersion = existing.version;
+          record.deferred = reconcileInput(existing, record.deferred, command, now);
           this.#db.query("UPDATE inbound SET data=? WHERE channel_id=? AND event_id=?").run(JSON.stringify(record), command.channelId, command.eventId);
-          this.#save({ exchange: existing.exchange, deliveries: [], changed: existing.exchange.version !== beforeVersion });
-        } else this.#save(mutate(existing.exchange, command, now));
+          this.#save({ exchange: existing, deliveries: [], changed: existing.version !== beforeVersion });
+        } else this.#save(mutate(existing, command, now));
       }
-      return this.get(command.requestId)!;
     }).immediate();
   }
 
   get(requestId: string): ExchangeView | undefined {
-    const row = this.#db.query<Row, [string]>("SELECT data FROM exchanges WHERE id=?").get(requestId);
+    const exchange = this.#exchange(requestId);
+    if (!exchange) return undefined;
+    return { exchange, deliveries: this.#db.query<Row, [string]>("SELECT data FROM deliveries WHERE exchange_id=? ORDER BY rowid").all(requestId).map(decode<Delivery>), deferredReplies: this.#deferred(requestId) };
+  }
+
+  #exchange(requestId: string, bindingId?: string): Exchange | undefined {
+    const row = this.#db.query<Row & { binding_id: string }, [string]>("SELECT data,binding_id FROM exchanges WHERE id=?").get(requestId);
     if (!row) return undefined;
+    if (bindingId && row.binding_id !== bindingId) fail("origin_denied", "This exchange belongs to another manager.", 403);
     const exchange = decode<Exchange>(row);
     const statuses = this.#db.query<Row, [string]>("SELECT data FROM dispositions WHERE receipt_id=? ORDER BY generation DESC LIMIT 2");
     for (const receipt of exchange.receipts) {
@@ -228,7 +236,66 @@ export class SqliteExchangeStore implements ExchangeStore {
       if (known[0]) receipt.disposition = JSON.parse(known[0].data) as typeof receipt.disposition;
       if (known[1]) receipt.dispositionHistory = [JSON.parse(known[1].data) as typeof receipt.disposition];
     }
-    return { exchange, deliveries: this.#db.query<Row, [string]>("SELECT data FROM deliveries WHERE exchange_id=? ORDER BY rowid").all(requestId).map(decode<Delivery>), deferredReplies: this.#deferred(requestId) };
+    return exchange;
+  }
+
+  read(requestId: string, bindingId: string, options: ReadOptions = {}): ExchangeRead | undefined {
+    const selection = readSelection(options);
+    const full = this.#exchange(requestId, bindingId);
+    if (!full) return undefined;
+    const { revisions, context, receipts, ...exchange } = full;
+    const pendingReceipts = receipts.filter((receipt) => receipt.disposition.status !== "handled").length;
+    const inputs = this.#db.query<{ total: number; pending: number }, [string]>(`SELECT count(*) AS total,
+      coalesce(sum(json_extract(data,'$.deferred.disposition.status')='pending'),0) AS pending FROM inbound WHERE json_extract(data,'$.deferred.exchangeId')=?`).get(requestId)!;
+    const deliveryCount = this.#db.query<{ count: number }, [string]>("SELECT count(*) AS count FROM deliveries WHERE exchange_id=?").get(requestId)!.count;
+    let items: ReadItem[] = [], nextCursor: string | undefined;
+    if (selection.collection === "receipts" || selection.collection === "context" || selection.collection === "revisions") {
+      const values = selection.collection === "receipts" ? receipts : selection.collection === "context" ? context : revisions;
+      if (selection.itemId) {
+        const item = values.find((item) => ("number" in item ? String(item.number) : item.id) === selection.itemId);
+        if (!item) fail("not_found", "Read item not found in this exchange.", 404);
+        items = [item];
+      } else {
+        items = values.slice(selection.position, selection.position + 1);
+        if (selection.position + items.length < values.length) nextCursor = `${selection.collection}:${selection.position + items.length}`;
+      }
+    } else if (selection.collection === "deferred") {
+      const rows = selection.itemId
+        ? this.#db.query<Row & { rowid: number }, [string, string, string]>("SELECT rowid,data FROM inbound WHERE json_extract(data,'$.deferred.exchangeId')=? AND channel_id=? AND event_id=?").all(requestId, selection.channelId!, selection.itemId)
+        : this.#db.query<Row & { rowid: number }, [string, number]>("SELECT rowid,data FROM inbound WHERE json_extract(data,'$.deferred.exchangeId')=? AND rowid>? ORDER BY rowid LIMIT 2").all(requestId, selection.position);
+      if (selection.itemId && !rows.length) fail("not_found", "Deferred input not found in this exchange.", 404);
+      items = rows.slice(0, 1).map((row) => decode<InboundRecord>(row).deferred!);
+      if (rows.length > 1) nextCursor = `deferred:${rows[0]!.rowid}`;
+    } else {
+      const rows = selection.itemId
+        ? this.#db.query<Row & { rowid: number }, [string, string]>("SELECT rowid,data FROM deliveries WHERE exchange_id=? AND id=?").all(requestId, selection.itemId)
+        : this.#db.query<Row & { rowid: number }, [string, number]>("SELECT rowid,data FROM deliveries WHERE exchange_id=? AND rowid>? ORDER BY rowid LIMIT 2").all(requestId, selection.position);
+      if (selection.itemId && !rows.length) fail("not_found", "Delivery not found in this exchange.", 404);
+      items = rows.slice(0, 1).map(decode<Delivery>);
+      if (rows.length > 1) nextCursor = `deliveries:${rows[0]!.rowid}`;
+    }
+    const itemRevision = items[0] && "revision" in items[0] ? revisions[items[0].revision - 1] : undefined;
+    const result: ExchangeRead = {
+      exchange, current: revisions[full.revision - 1]!,
+      ...(itemRevision && itemRevision.number !== full.revision ? { itemRevision } : {}),
+      counts: { revisions: revisions.length, context: context.length, receipts: receipts.length, pendingReceipts,
+        deferred: inputs.total, pendingDeferred: inputs.pending, deliveries: deliveryCount },
+      collection: selection.collection, items, ...(nextCursor ? { nextCursor } : {}),
+    };
+    if (Buffer.byteLength(JSON.stringify(result)) > 512 * 1024) fail("read_capacity", "The complete selected record exceeds the supported read size; no content was truncated.", 503);
+    return result;
+  }
+
+  pending(bindingId: string, cursor?: string): PendingPage {
+    if (cursor !== undefined) id(cursor, "Pending cursor");
+    const rows = this.#db.query<{ id: string; title: string; kind: string; version: number; revision: number; state: Exchange["state"]; pendingInputs: number; updatedAt: number }, [string, string]>(`SELECT e.id,
+      json_extract(e.data,'$.revisions[' || (json_extract(e.data,'$.revision')-1) || '].decision.title') AS title,
+      json_extract(e.data,'$.revisions[' || (json_extract(e.data,'$.revision')-1) || '].decision.kind') AS kind,
+      json_extract(e.data,'$.version') AS version,json_extract(e.data,'$.revision') AS revision,e.state,
+      coalesce(json_extract(e.data,'$.pendingInputs'),0) AS pendingInputs,e.updated_at AS updatedAt
+      FROM exchanges e WHERE e.binding_id=? AND ${activeExchange} AND e.id>? ORDER BY e.id LIMIT 21`).all(bindingId, cursor ?? "");
+    const total = this.#db.query<{ count: number }, [string]>(`SELECT count(*) AS count FROM exchanges e WHERE e.binding_id=? AND ${activeExchange}`).get(bindingId)!.count;
+    return { items: rows.slice(0, 20) as PendingPage["items"], total, ...(rows.length > 20 ? { nextCursor: rows[19]!.id } : {}) };
   }
 
   list(filter: { bindingId?: string; recipient?: Recipient; pendingOnly?: boolean } = {}): ExchangeView[] {

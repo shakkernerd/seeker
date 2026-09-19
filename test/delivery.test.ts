@@ -70,7 +70,7 @@ test("a stuck task does not block another binding on the same host adapter", asy
     const request = core.manager(binding.origin).submit({ requestId: name, decision: fixtureDecision });
     for (let index = 0; index < 4; index += 1) core.channel("local").receive([{
       eventId: `${name}-${index}`, actorId: "owner", conversationId: "inbox", sourceRef: `${name}:${index}`,
-      replyHandle: request.exchange.revisions[0]!.replyHandle, kind: "question", text: `Question ${index}?`,
+      replyHandle: request.current.replyHandle, kind: "question", text: `Question ${index}?`,
     }]);
   }
   const pump = new DeliveryPump(core, [new LocalChannel()], [{
@@ -93,7 +93,7 @@ test("a verified successor progresses while the predecessor's aborted operation 
   const core = new SeekerCore(store);
   core.bind(fixtureBinding);
   const request = core.manager(fixtureBinding.origin).submit({ requestId: "transfer", decision: fixtureDecision });
-  core.channel("local").receive([{ eventId: "answer", actorId: "owner", conversationId: "inbox", sourceRef: "local:answer", replyHandle: request.exchange.revisions[0]!.replyHandle, kind: "answer", text: "Keep it local." }]);
+  core.channel("local").receive([{ eventId: "answer", actorId: "owner", conversationId: "inbox", sourceRef: "local:answer", replyHandle: request.current.replyHandle, kind: "answer", text: "Keep it local." }]);
   let predecessorCalls = 0, successorCalls = 0;
   let settle: (() => void) | undefined;
   const pump = new DeliveryPump(core, [new LocalChannel()], [{ id: "fixture", deliver: (binding, envelope) => {

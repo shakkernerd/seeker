@@ -162,6 +162,37 @@ export interface DeferredReply {
 
 export interface HistoryPage { items: ExchangeView[]; nextCursor?: string }
 
+export type ReadCollection = "receipts" | "deferred" | "context" | "revisions" | "deliveries";
+export interface ReadOptions {
+  collection?: ReadCollection;
+  cursor?: string;
+  /** Exact receipt/context/delivery ID, or revision number; a deferred event also needs channelId. */
+  itemId?: string;
+  channelId?: string;
+}
+export type ReadItem = Receipt | DeferredReply | ContextMessage | Revision | Delivery;
+export interface ExchangeRead {
+  exchange: Omit<Exchange, "revisions" | "context" | "receipts">;
+  current: Revision;
+  itemRevision?: Revision;
+  counts: { revisions: number; context: number; receipts: number; pendingReceipts: number; deferred: number; pendingDeferred: number; deliveries: number };
+  collection: ReadCollection;
+  /** Complete records only: one item per page, never an excerpt of authority or conditions. */
+  items: ReadItem[];
+  nextCursor?: string;
+}
+export interface PendingSummary {
+  id: string;
+  title: string;
+  kind: Decision["kind"];
+  version: number;
+  revision: number;
+  state: Exchange["state"];
+  pendingInputs: number;
+  updatedAt: number;
+}
+export interface PendingPage { items: PendingSummary[]; total: number; nextCursor?: string }
+
 export interface ChannelMessage {
   deliveryId: string;
   exchangeId: string;
@@ -228,10 +259,10 @@ export type ManagerCommand =
     };
 
 export interface ManagerPort {
-  submit(input: { requestId: string; decision: Decision }): ExchangeView;
-  get(requestId: string): ExchangeView;
-  listPending(): ExchangeView[];
-  update(command: Exclude<ManagerCommand, { type: "submit" }>): ExchangeView;
+  submit(input: { requestId: string; decision: Decision }): ExchangeRead;
+  get(requestId: string, options?: ReadOptions): ExchangeRead;
+  listPending(options?: { cursor?: string }): PendingPage;
+  update(command: Exclude<ManagerCommand, { type: "submit" }>): ExchangeRead;
 }
 
 export interface ReceiveProgress {
@@ -263,8 +294,10 @@ export interface ExchangeStore {
   binding(origin: ManagerOrigin): ManagerBinding;
   findBinding(hostId: string, managerId: string): ManagerBinding | undefined;
   transfer(bindingId: string, expectedGeneration: number, successor: ManagerOrigin): void;
-  execute(origin: ManagerOrigin, command: ManagerCommand, now: number): ExchangeView;
+  execute(origin: ManagerOrigin, command: ManagerCommand, now: number): void;
   get(requestId: string): ExchangeView | undefined;
+  read(requestId: string, bindingId: string, options?: ReadOptions): ExchangeRead | undefined;
+  pending(bindingId: string, cursor?: string): PendingPage;
   list(filter?: { bindingId?: string; recipient?: Recipient; pendingOnly?: boolean }): ExchangeView[];
   history(recipient: Recipient, cursor?: string): HistoryPage;
   ingest(channelId: string, events: InboundReply[], progress: ReceiveProgress | undefined, now: number): IngestResult[];

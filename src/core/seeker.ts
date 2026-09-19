@@ -1,4 +1,4 @@
-import type { ChannelIngress, ExchangeStore, ExchangeView, InboundReply, ManagerBinding, ManagerOrigin, ManagerPort, Recipient } from "../contracts.ts";
+import type { ChannelIngress, ExchangeStore, ExchangeView, InboundReply, ManagerBinding, ManagerOrigin, ManagerPort, ReadOptions, Recipient } from "../contracts.ts";
 import { fail, id, origin as validateOrigin, sameRecipient } from "./validation.ts";
 
 /** Trusted composition owns this object. Expose only a bound ManagerPort to agent tools. */
@@ -20,17 +20,24 @@ export class SeekerCore {
   manager(input: ManagerOrigin): ManagerPort {
     const origin = Object.freeze(validateOrigin(input));
     this.store.binding(origin);
+    const read = (requestId: string, options?: ReadOptions) => {
+      const binding = this.store.binding(origin);
+      const result = this.store.read(id(requestId, "Request"), binding.id, options);
+      if (!result) fail("not_found", "Exchange not found.", 404);
+      if (result.exchange.bindingId !== binding.id) fail("origin_denied", "This exchange belongs to another manager.", 403);
+      return result;
+    };
     return {
-      submit: (input) => this.store.execute(origin, { type: "submit", requestId: input.requestId, decision: input.decision }, this.clock()),
-      get: (requestId) => {
-        const binding = this.store.binding(origin);
-        const view = this.store.get(id(requestId, "Request"));
-        if (!view) fail("not_found", "Exchange not found.", 404);
-        if (view.exchange.bindingId !== binding.id) fail("origin_denied", "This exchange belongs to another manager.", 403);
-        return view;
+      submit: (input) => {
+        this.store.execute(origin, { type: "submit", requestId: input.requestId, decision: input.decision }, this.clock());
+        return read(input.requestId);
       },
-      listPending: () => this.store.list({ bindingId: this.store.binding(origin).id, pendingOnly: true }),
-      update: (command) => this.store.execute(origin, command, this.clock()),
+      get: read,
+      listPending: (options) => this.store.pending(this.store.binding(origin).id, options?.cursor),
+      update: (command) => {
+        this.store.execute(origin, command, this.clock());
+        return read(command.requestId);
+      },
     };
   }
 
