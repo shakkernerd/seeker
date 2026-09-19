@@ -26,7 +26,7 @@ export interface DesktopOwner {
 }
 
 interface Bundle { appPath: string; appVersion: string; appBuild: string; executable: string }
-interface Inspection { app: DesktopProcess; server?: DesktopProcess; userDataPath?: string }
+interface Inspection { app: DesktopProcess; server?: DesktopProcess; userDataPath?: string; codexHome?: string; sqliteHome?: string }
 const nodeSuffix = "/Contents/Resources/cua_node/bin/node";
 const startPattern = /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/;
 
@@ -196,6 +196,11 @@ async function userData(children: DesktopProcess[], signal?: AbortSignal): Promi
   return [...selectors][0];
 }
 
+async function readSqliteHome(server: DesktopProcess, signal?: AbortSignal): Promise<string | undefined> {
+  const selected = desktopSqliteFromFiles(await command("/usr/sbin/lsof", ["-a", "-p", String(server.pid), "-Fn"], signal));
+  return selected ? await directory(selected, signal) : undefined;
+}
+
 /** Called only by a genuine MCP connector; native pipe qualification is a separate prerequisite. */
 export async function captureDesktopOwner(signal?: AbortSignal): Promise<DesktopOwner> {
   requireMac(); checkSignal(signal);
@@ -211,8 +216,7 @@ export async function captureDesktopOwner(signal?: AbortSignal): Promise<Desktop
   // MCP forwards CODEX_HOME explicitly; HOME is its ordinary host-provided
   // default. Neither value is read from tool arguments or another process.
   const codexHome = await directory(process.env.CODEX_HOME ?? join(path(process.env.HOME), ".codex"), signal);
-  const sqlite = desktopSqliteFromFiles(await command("/usr/sbin/lsof", ["-a", "-p", String(server.pid), "-Fn"], signal));
-  const sqliteHome = sqlite ? await directory(sqlite, signal) : undefined;
+  const sqliteHome = await readSqliteHome(server, signal);
   const after = await processes(signal);
   const afterApp = after.find((entry) => entry.pid === app.pid), afterServer = after.find((entry) => entry.pid === server.pid);
   if (!afterApp || !afterServer) throw failure("desktop_owner_changed", "Desktop exited during ownership inspection.");
@@ -221,8 +225,8 @@ export async function captureDesktopOwner(signal?: AbortSignal): Promise<Desktop
   return parseDesktopOwner({ profile: { appPath, appVersion: metadata.appVersion, appBuild: metadata.appBuild, userDataPath, codexHome, ...(sqliteHome ? { sqliteHome } : {}) }, app, server });
 }
 
-/** Inspects live owners without asserting CODEX_HOME for an unknown app process. */
-export async function inspectDesktop(profile: DesktopProfile, signal?: AbortSignal): Promise<Inspection[]> {
+/** Code-home discovery stays inside the stable-process inspection; absent an accessor, no home is asserted. */
+export async function inspectDesktop(profile: DesktopProfile, signal?: AbortSignal, codeHome?: (server: DesktopProcess) => string): Promise<Inspection[]> {
   requireMac(); checkSignal(signal);
   const registered = parseProfile(profile), metadata = await bundle(registered.appPath, registered, signal);
   await Promise.all([registered.userDataPath, registered.codexHome, ...(registered.sqliteHome ? [registered.sqliteHome] : [])].map(async (entry) => {
@@ -232,7 +236,19 @@ export async function inspectDesktop(profile: DesktopProfile, signal?: AbortSign
   const result: Inspection[] = [];
   for (const app of apps) {
     const server = directServer(before, app, registered.appPath), userDataPath = await userData(frameworkChildren(before, app, registered.appPath), signal);
-    result.push({ app, ...(server ? { server } : {}), ...(userDataPath ? { userDataPath } : {}) });
+    let codexHome: string | undefined;
+    if (server && codeHome) {
+      checkSignal(signal);
+      let selected: string;
+      try { selected = codeHome(server); }
+      catch (error) {
+        if (error instanceof ConnectorError) throw error;
+        throw failure("desktop_profile_unreadable", "The native server's Codex home could not be identified.");
+      }
+      codexHome = await directory(selected, signal);
+    }
+    const sqliteHome = server ? await readSqliteHome(server, signal) : undefined;
+    result.push({ app, ...(server ? { server } : {}), ...(userDataPath ? { userDataPath } : {}), ...(codexHome ? { codexHome } : {}), ...(sqliteHome ? { sqliteHome } : {}) });
   }
   const after = await processes(signal);
   unchanged(apps, after.filter((entry) => entry.executable === metadata.executable));

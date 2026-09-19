@@ -25,7 +25,7 @@ function fixture(clock: () => number = Date.now, lifecycle?: CodexHostLifecycle,
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: async (request) => await host.handle(request) ?? new Response(null, { status: 404 }) });
   cleanups.push(async () => { host.close(); await server.stop(true); store.close(); rmSync(directory, { recursive: true, force: true }); });
   const send = (path: string, body: unknown, token = credential, signal?: AbortSignal) => fetch(`http://127.0.0.1:${server.port}${codexRoute}/${path}`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body), signal });
-  const connect = async () => { const response = await send("connect", { protocol: 1, instanceId: randomUUID() }); expect(response.status).toBe(200); return (await response.json()).session as string; };
+  const connect = async (desktop?: unknown) => { const response = await send("connect", { protocol: 1, instanceId: randomUUID(), ...(desktop === undefined ? {} : { desktop }) }); expect(response.status).toBe(200); return (await response.json()).session as string; };
   const invoke = (session: string, managerId: string, operation: string, args: unknown) => send("invoke", { origin: { threadId: managerId, turnId: "native-turn", callId: "native-call" }, operation, arguments: args }, session);
   return { core, store, host, bindings, send, connect, invoke, restorations: () => restorations };
 }
@@ -92,6 +92,28 @@ describe("native caller admission", () => {
 });
 
 describe("native return transport", () => {
+  test("a poll opened before registration cannot receive input after its identity becomes stale", async () => {
+    let registered = false;
+    const f = fixture(Date.now, {
+      connected: async () => {},
+      admitted: async (desktop) => { if (desktop === "qualified") registered = true; },
+      ready: (desktop) => { if (registered && desktop !== "qualified") throw new Error("stale native owner"); },
+      resume: async () => {},
+    });
+    const value = envelope(f), legacy = await f.connect(), oldPoll = f.send("poll", {}, legacy);
+    await eventually(() => f.restorations() === 1);
+    const qualified = await f.connect("qualified");
+    expect((await f.invoke(qualified, "manager-one", "pending", {})).status).toBe(200);
+    const newPoll = f.send("poll", {}, qualified);
+    await Bun.sleep(10);
+    const delivered = f.host.deliver(value.binding, value.envelope, new AbortController().signal);
+    expect((await oldPoll).status).toBe(204);
+    const packet = await (await newPoll).json();
+    expect(packet.envelope.deliveryId).toBe(value.envelope.deliveryId);
+    await f.send("result", { attemptId: packet.attemptId, result: { status: "accepted", reference: "qualified-owner" } }, qualified);
+    expect((await delivered).status).toBe("accepted");
+  });
+
   test("offline recovery is coalesced and slow host startup never becomes uncertain delivery", async () => {
     const resumed: { binding: ManagerBinding; signal: AbortSignal }[] = [];
     const f = fixture(Date.now, {

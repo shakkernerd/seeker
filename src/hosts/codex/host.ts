@@ -11,7 +11,7 @@ export interface CodexHostLifecycle {
   connected(registration: unknown): Promise<void>;
   admitted?(registration: unknown): Promise<void>;
   ready?(registration: unknown): void;
-  resume(binding: ManagerBinding, signal: AbortSignal): Promise<void>;
+  resume(binding: ManagerBinding, signal: AbortSignal, isCurrent: () => boolean): Promise<void>;
 }
 interface Connection {
   token: string;
@@ -94,6 +94,8 @@ export class CodexHostAdapter implements HostAdapter {
         await this.lifecycle?.admitted?.(connection.desktop);
         const current = this.access.binding(invocation.threadId);
         if (this.#closed || request.signal.aborted || !current || ownerEpoch(current) !== epoch) throw new ConnectorError("owner_changed", "The manager assignment changed before this invocation.", 409);
+        this.lifecycle?.ready?.(connection.desktop);
+        if (this.#connections.get(connection.token) !== connection) throw new ConnectorError("unauthorized", "The native connector session ended before this invocation.", 401);
         connection.bindings.set(invocation.threadId, epoch);
         const port = this.access.manager({ ...binding.origin, turnId: invocation.turnId, callId: invocation.callId });
         return privateJson(invokeManager(port, identifier(body.operation), body.arguments, invocation));
@@ -143,7 +145,13 @@ export class CodexHostAdapter implements HostAdapter {
     if (!current || ownerEpoch(current) !== ownerEpoch(binding)) return { status: "rejected", code: "owner_changed" };
     const existing = [...this.#attempts.values()].find((item) => item.delivery.envelope.deliveryId === envelope.deliveryId);
     if (existing) return ownerEpoch(existing.delivery.binding) === ownerEpoch(binding) ? existing.promise : { status: "rejected", code: "owner_changed" };
-    const connection = [...this.#connections.values()].find((item) => item.poll);
+    let connection: Connection | undefined;
+    for (const candidate of [...this.#connections.values()]) {
+      if (!candidate.poll) continue;
+      try { this.lifecycle?.ready?.(candidate.desktop); }
+      catch { this.#drop(candidate); continue; }
+      connection = candidate; break;
+    }
     if (!connection) {
       this.#needsRecovery = true;
       this.#scheduleRecovery(binding, envelope.deliveryId, signal);
@@ -196,7 +204,11 @@ export class CodexHostAdapter implements HostAdapter {
       if (this.#resumed.size > 512) this.#resumed.delete(this.#resumed.values().next().value!);
       // Starting a host is not delivering human input. Keep it outside the
       // delivery deadline; only a qualified poll restores known-offline work.
-      void this.lifecycle!.resume(binding, controller.signal).catch(() => undefined);
+      const isCurrent = () => {
+        const latest = this.access.binding(binding.origin.managerId);
+        return !this.#closed && !signal.aborted && this.#recovery?.controller === controller && Boolean(latest && ownerEpoch(latest) === ownerEpoch(binding));
+      };
+      void this.lifecycle!.resume(binding, controller.signal, isCurrent).catch(() => undefined);
     };
     const timer = setTimeout(check, 1_000); timer.unref();
     const expires = setTimeout(cancel, 15_000); expires.unref();

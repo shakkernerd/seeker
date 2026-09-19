@@ -94,11 +94,13 @@ Starting the app is separate from delivering the reply: slow startup leaves the
 reply saved and retryable, and receiver readiness restores known-undelivered
 work even after its ordinary retries have ended.
 
-A newly running instance with an unverified owner, a different profile, an
-ambiguous set of running instances, or a changed application build is not a safe
-launch target. Restore and qualify the registered connector through Desktop in
-those cases. Seeker does not navigate an unknown running instance or create a
-replacement conversation. Keep one Desktop profile per Seeker data directory.
+An ordinary manual app restart can change the process IDs. Seeker verifies the
+running application's actual Desktop profile, code home and native database
+location before resuming the original task; a matching process ID alone is not
+the host identity. The connector then qualifies again before receiving input.
+A different or unreadable profile, ambiguous instances, missing storage evidence,
+or a changed application build remains blocked until the original native host can
+be qualified. Keep one Desktop profile per Seeker data directory.
 
 An unavailable host leaves replies in Seeker. When input might already have
 reached Codex but its result was lost, delivery remains **unknown**; Seeker does

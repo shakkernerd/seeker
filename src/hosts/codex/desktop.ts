@@ -1,10 +1,11 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { linkSync, lstatSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import type { ManagerBinding } from "../../contracts.ts";
 import { privateDirectory, readPrivateFile } from "./config.ts";
 import { inspectDesktop, parseDesktopOwner, sameDesktopProcess, type DesktopOwner, type DesktopProfile } from "./desktop-owner.ts";
+import { readDesktopCodeHome } from "./desktop-selectors.ts";
 import type { CodexHostLifecycle } from "./host.ts";
 import { ConnectorError, onlyKeys, record } from "./protocol.ts";
 
@@ -18,9 +19,11 @@ export class CodexDesktopLifecycle implements CodexHostLifecycle {
   readonly #qualified = new Map<string, DesktopOwner>();
   #registered?: DesktopOwner;
 
-  constructor(private readonly statePath: string, private readonly operations: DesktopOperations = { inspect: inspectDesktop, open: openDesktop }) {
+  constructor(private readonly statePath: string, private readonly operations: DesktopOperations = { inspect: (profile, signal) => inspectDesktop(profile, signal, readDesktopCodeHome), open: openDesktop }) {
     privateDirectory(dirname(statePath));
-    if (existsSync(statePath)) {
+    let present = false;
+    try { lstatSync(statePath); present = true; } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    if (present) {
       const state = record(JSON.parse(readPrivateFile(statePath)));
       onlyKeys(state, ["version", "owner"]);
       if (state.version !== 1) throw new ConnectorError("desktop_registration_invalid", "The saved Desktop registration needs reconciliation.");
@@ -36,7 +39,7 @@ export class CodexDesktopLifecycle implements CodexHostLifecycle {
     if (this.#registered && !sameProfile(owner.profile, this.#registered.profile)) throw new ConnectorError("desktop_profile_changed", "This connector belongs to a different registered Desktop profile.", 403);
     const instances = await this.operations.inspect(owner.profile, AbortSignal.timeout(3_000));
     const current = instances[0];
-    if (instances.length !== 1 || !current?.server || !sameDesktopProcess(current.app, owner.app) || !sameDesktopProcess(current.server, owner.server) || current.userDataPath !== owner.profile.userDataPath) {
+    if (instances.length !== 1 || !current?.server || !sameDesktopProcess(current.app, owner.app) || !sameDesktopProcess(current.server, owner.server) || current.userDataPath !== owner.profile.userDataPath || current.codexHome !== owner.profile.codexHome || current.sqliteHome !== owner.profile.sqliteHome) {
       throw new ConnectorError("desktop_owner_changed", "The connector's native Desktop owner could not be verified.", 403);
     }
     this.#qualified.set(ownerKey(owner), owner);
@@ -50,6 +53,7 @@ export class CodexDesktopLifecycle implements CodexHostLifecycle {
     const owner = parseDesktopOwner(value);
     if (!this.#qualified.has(ownerKey(owner))) throw new ConnectorError("desktop_owner_unqualified", "Qualify the native Desktop connector before manager admission.", 403);
     if (this.#registered && !sameProfile(this.#registered.profile, owner.profile)) throw new ConnectorError("desktop_profile_changed", "The manager belongs to a different Desktop profile.", 403);
+    this.ready(owner);
     if (!this.#registered) this.#save(owner);
   }
 
@@ -59,18 +63,20 @@ export class CodexDesktopLifecycle implements CodexHostLifecycle {
     if (ownerKey(owner) !== ownerKey(this.#registered)) throw new ConnectorError("desktop_owner_changed", "Reconnect this receiver to the registered Desktop owner.", 409);
   }
 
-  async resume(binding: ManagerBinding, signal: AbortSignal): Promise<void> {
+  async resume(binding: ManagerBinding, signal: AbortSignal, isCurrent: () => boolean): Promise<void> {
     const registered = this.#registered;
     if (!registered) throw new ConnectorError("desktop_registration_required", "Reload the updated connector and use Seeker from the registered manager once to enable recovery.");
+    if (!registered.profile.sqliteHome) throw new ConnectorError("desktop_storage_unqualified", "Qualify the original native storage directory before allowing Desktop to restart.");
     if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(binding.origin.managerId)) throw new ConnectorError("invalid_task", "Resume requires the exact registered native task ID.");
     signal.throwIfAborted();
     const instances = await this.operations.inspect(registered.profile, signal);
     if (instances.length > 1) throw new ConnectorError("desktop_owner_ambiguous", "More than one Desktop instance is running. Preserve the registered owner.");
     const current = instances[0];
-    if (current && (!sameDesktopProcess(current.app, registered.app) || current.userDataPath !== registered.profile.userDataPath)) {
-      throw new ConnectorError("desktop_owner_unqualified", "A different Desktop instance is running. Qualify its native connector before resuming this manager.");
+    if (current && (!current.server || current.userDataPath !== registered.profile.userDataPath || current.codexHome !== registered.profile.codexHome || current.sqliteHome !== registered.profile.sqliteHome)) {
+      throw new ConnectorError("desktop_owner_unqualified", "The running Desktop instance does not have the registered native profile and storage.");
     }
     signal.throwIfAborted();
+    if (!isCurrent()) throw new ConnectorError("owner_changed", "The manager assignment changed before Desktop could be resumed.");
     // No prompt or model setting is passed. The host loads the original saved
     // task; its qualified MCP receiver alone can deliver the retained receipt.
     await this.operations.open(registered.profile, binding.origin.managerId, signal);
@@ -80,7 +86,12 @@ export class CodexDesktopLifecycle implements CodexHostLifecycle {
     const temporary = `${this.statePath}.${randomUUID()}.tmp`;
     try {
       writeFileSync(temporary, `${JSON.stringify({ version: 1, owner }, null, 2)}\n`, { mode: 0o600, flag: "wx" });
-      renameSync(temporary, this.statePath);
+      if (this.#registered) {
+        const current = record(JSON.parse(readPrivateFile(this.statePath)));
+        onlyKeys(current, ["version", "owner"]);
+        if (current.version !== 1 || ownerKey(parseDesktopOwner(current.owner)) !== ownerKey(this.#registered)) throw new ConnectorError("desktop_registration_changed", "The saved Desktop registration changed outside this service.");
+        renameSync(temporary, this.statePath);
+      } else linkSync(temporary, this.statePath);
       this.#registered = owner;
     } finally { try { unlinkSync(temporary); } catch { /* A successful rename consumed it. */ } }
   }
