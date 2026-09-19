@@ -337,6 +337,37 @@ test("buffered and rounded bare replies cannot become answers to newer questions
   expect(beta.get("new-beta").exchange.receipts).toHaveLength(2);
 });
 
+test("buffered replies stay ambiguous when another presented request closes before intake", async () => {
+  const f = await fixture();
+  const alpha = f.bind("alpha");
+  const beta = f.bind("beta");
+  alpha.submit({ requestId: "alpha-request", decision: decision() });
+  await f.flush(); f.advance();
+  beta.submit({ requestId: "beta-request", decision: decision() });
+  await f.flush(); f.advance();
+  const betaMessage = f.sent.find((message) => message.text.includes("beta-request"))!;
+  const buffered = reply(1, "yes");
+  buffered.message.date = Math.floor(f.core.clock() / 1_000);
+  f.advance();
+  alpha.update({ type: "cancel", requestId: "alpha-request", expectedVersion: alpha.get("alpha-request").exchange.version, reason: "Handled elsewhere" });
+  f.updates.push(buffered);
+  await f.poll();
+  expect(f.outcomes.at(-1)).toMatchObject({ status: "unmatched", code: "context_changed_since_reply" });
+  expect(beta.get("beta-request").exchange.receipts).toHaveLength(0);
+  const explicit = reply(2, "Only staging, please", betaMessage);
+  explicit.message.date = buffered.message.date;
+  f.updates.push(explicit);
+  await f.poll();
+  expect(f.outcomes.at(-1)?.status).toBe("recorded");
+  f.advance();
+  const fresh = reply(3, "One additional condition");
+  fresh.message.date = Math.floor(f.core.clock() / 1_000);
+  f.updates.push(fresh);
+  await f.poll();
+  expect(f.outcomes.at(-1)?.status).toBe("recorded");
+  expect(beta.get("beta-request").exchange.receipts).toHaveLength(2);
+});
+
 test("forwarded text, external replies and selected quotes never become a bare owner answer", async () => {
   const f = await fixture();
   const manager = f.bind("alpha");
