@@ -6,6 +6,8 @@ import type { Decision, HostAdapter, ManagerBinding } from "../src/contracts";
 import { DeliveryPump } from "../src/core/delivery";
 import { SeekerCore } from "../src/core/seeker";
 import { SqliteExchangeStore } from "../src/store/sqlite";
+import { LocalChannel, localRecipient } from "../src/local/channel";
+import { limits } from "../src/core/validation";
 import { TelegramApi } from "../src/channels/telegram/api";
 import { TelegramChannel } from "../src/channels/telegram/channel";
 
@@ -33,9 +35,16 @@ async function fixture(dropSendResponse = false) {
   const calls: { method: string; body: Record<string, unknown> }[] = [];
   const sent: Record<string, any>[] = [];
   const returned: string[] = [];
+  const deferred: string[] = [];
+  const notices: string[] = [];
   const host: HostAdapter = { id: "test-host", deliver: async (binding, envelope) => {
-    returned.push(`${binding.origin.managerId}:${envelope.receipt.id}`);
-    return { status: "accepted", reference: envelope.receipt.id };
+    if ("receipt" in envelope) {
+      returned.push(`${binding.origin.managerId}:${envelope.receipt.id}`);
+      return { status: "accepted", reference: envelope.receipt.id };
+    }
+    if ("deferred" in envelope) deferred.push(`${binding.origin.managerId}:${envelope.deferred.event.eventId}`);
+    else notices.push(`${binding.origin.managerId}:${envelope.notice.deliveryId}`);
+    return { status: "accepted", reference: envelope.deliveryId };
   } };
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     const method = new URL(request.url).pathname.split("/").at(-1)!;
@@ -64,10 +73,10 @@ async function fixture(dropSendResponse = false) {
   });
   const makeChannel = () => new TelegramChannel(api, recipient, { now: () => now, sleep: async (ms) => { now += ms; } });
   let channel = makeChannel();
-  let pump = new DeliveryPump(core, [channel], [host]);
+  let pump = new DeliveryPump(core, [new LocalChannel(), channel], [host]);
   cleanup.push(() => { pump.stop(); store.close(); });
-  function bind(id: string) {
-    const binding: ManagerBinding = { id, label: id, recipient, origin: { hostId: "test-host", managerId: id, assignmentId: id, generation: 1 } };
+  function bind(id: string, initialRecipient = recipient) {
+    const binding: ManagerBinding = { id, label: id, recipient: initialRecipient, origin: { hostId: "test-host", managerId: id, assignmentId: id, generation: 1 } };
     core.bind(binding);
     return core.manager(binding.origin);
   }
@@ -77,14 +86,14 @@ async function fixture(dropSendResponse = false) {
     expect(pump.inFlight).toBe(0);
     expect(pump.lastError).toBeUndefined();
   }
-  return { bind, sent, updates, calls, returned, flush, filename,
+  return { bind, sent, updates, calls, returned, deferred, notices, flush, filename,
     get store() { return store; }, get core() { return core; }, get channel() { return channel; },
     advance: () => { now += 2_000; },
     poll: () => channel.pollOnce(core.channel(channel.id), new AbortController().signal),
     restart: () => {
       pump.stop(); store.close();
       store = new SqliteExchangeStore(filename); core = new SeekerCore(store, () => now);
-      channel = makeChannel(); pump = new DeliveryPump(core, [channel], [host]);
+      channel = makeChannel(); pump = new DeliveryPump(core, [new LocalChannel(), channel], [host]);
       store.recoverInterruptedDeliveries();
     },
   };
@@ -169,7 +178,7 @@ test("editing a bare answer keeps its original manager after that request is han
   f.updates.push(original);
   await f.poll(); await f.flush();
   const receipt = alpha.get("alpha-request").exchange.receipts[0]!;
-  alpha.update({ type: "acknowledge", requestId: "alpha-request", receiptId: receipt.id, status: "handled", evidenceRef: "controlled:handled", expectedVersion: alpha.get("alpha-request").exchange.version });
+  alpha.update({ type: "acknowledge", requestId: "alpha-request", receiptId: receipt.id, status: "handled", resolvesExchange: true, evidenceRef: "controlled:handled", expectedVersion: alpha.get("alpha-request").exchange.version });
   expect(alpha.get("alpha-request").exchange.state).toBe("handled");
   const beta = f.bind("beta");
   beta.submit({ requestId: "beta-request", decision: decision() });
@@ -198,4 +207,72 @@ test("late stop on an uncertain send remains correlated after its answer was han
   await f.poll(); await f.flush();
   expect(f.store.get("lost-send")!.exchange.receipts.at(-1)).toMatchObject({ kind: "stop", classification: "correction", revision: 1 });
   expect(f.store.get("lost-send")!.exchange.state).toBe("reconcile");
+});
+
+test("metadata-only edits stay quiet while A/B/A text edits remain distinct corrections", async () => {
+  const f = await fixture();
+  const manager = f.bind("alpha");
+  manager.submit({ requestId: "edit-request", decision: decision() });
+  await f.flush();
+  const original = reply(1, "Proceed with the preview");
+  f.updates.push(original);
+  await f.poll(); await f.flush();
+  const receipt = manager.get("edit-request").exchange.receipts[0]!;
+  manager.update({ type: "acknowledge", requestId: "edit-request", receiptId: receipt.id, status: "handled", resolvesExchange: true, evidenceRef: "controlled:handled", expectedVersion: manager.get("edit-request").exchange.version });
+  f.updates.push({ update_id: 2, edited_message: { ...original.message, edit_date: 101, link_preview_options: { is_disabled: true } } });
+  await f.poll(); await f.flush();
+  expect(manager.get("edit-request").exchange.receipts).toHaveLength(1);
+  expect(manager.get("edit-request").exchange.state).toBe("handled");
+  expect(f.returned).toHaveLength(1);
+  f.updates.push({ update_id: 3, edited_message: { ...original.message, text: "Do not publish the preview", edit_date: 102 } });
+  await f.poll();
+  f.updates.push({ update_id: 4, edited_message: { ...original.message, edit_date: 103 } });
+  await f.poll();
+  expect(manager.get("edit-request").exchange.receipts.map((item) => item.text)).toEqual(["Proceed with the preview", "Do not publish the preview", "Proceed with the preview"]);
+  expect(manager.get("edit-request").exchange.state).toBe("reconcile");
+});
+
+test("full exchanges retain input for manager review while another manager's reply commits", async () => {
+  const f = await fixture();
+  const alpha = f.bind("alpha");
+  alpha.submit({ requestId: "full-request", decision: decision() });
+  await f.flush();
+  const original = f.sent[0]!;
+  const handle = alpha.get("full-request").exchange.revisions[0]!.replyHandle;
+  const channel = f.core.channel(f.channel.id);
+  for (let i = 0; i < limits.receipts; i++) channel.receive([{ eventId: `seed-${i}`, actorId: "42", conversationId: "42", sourceRef: `seed-${i}`, replyHandle: handle, kind: "question", text: `Context ${i}?` }]);
+  const beta = f.bind("beta");
+  beta.submit({ requestId: "healthy-request", decision: decision() });
+  f.advance(); await f.flush();
+  const healthy = f.sent.find((message) => message.text.includes("healthy-request"))!;
+  f.updates.push(reply(1, "/stop Please wait for my correction", original), reply(2, "Why?", healthy));
+  await f.poll(); await f.flush();
+  const full = alpha.get("full-request");
+  expect(full.exchange.receipts).toHaveLength(limits.receipts);
+  expect(full.deferredReplies?.[0]?.event.text).toBe("/stop Please wait for my correction");
+  expect(f.deferred).toContain("alpha:1");
+  expect(beta.get("healthy-request").exchange.receipts).toHaveLength(1);
+  expect(f.sent.some((message) => message.text === "Saved for manager review; no decision applied.")).toBe(true);
+  expect(channel.progress()?.cursor).toBe("3");
+});
+
+test("trusted local-to-Telegram routing affects new requests and preserves old local references", async () => {
+  const f = await fixture();
+  const manager = f.bind("alpha", localRecipient);
+  manager.submit({ requestId: "old-local", decision: decision() });
+  await f.flush();
+  const oldReference = manager.get("old-local").deliveries[0]!.reference!;
+  f.core.setRecipient("alpha", 1, recipient);
+  manager.submit({ requestId: "new-telegram", decision: decision() });
+  await f.flush();
+  const message = f.sent.find((item) => item.text.includes("new-telegram"))!;
+  expect(manager.get("old-local").exchange.recipient).toEqual(localRecipient);
+  expect(manager.get("old-local").deliveries[0]!.reference).toBe(oldReference);
+  expect(manager.get("new-telegram").exchange.recipient).toEqual(recipient);
+  const local = f.core.channel(localRecipient.channelId).receive([{ eventId: "old-local-answer", actorId: localRecipient.actorId, conversationId: localRecipient.conversationId, sourceRef: "local-answer", replyToRef: oldReference, kind: "question", text: "Why?" }]);
+  expect(local[0]!.status).toBe("recorded");
+  f.updates.push(reply(1, "Why?", message));
+  await f.poll(); await f.flush();
+  expect(manager.get("old-local").exchange.receipts).toHaveLength(1);
+  expect(manager.get("new-telegram").exchange.receipts).toHaveLength(1);
 });

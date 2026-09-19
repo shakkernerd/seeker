@@ -22,6 +22,8 @@ The owner is saved only after that local confirmation. A public username, the fi
 
 Seeker saves the verified numeric account and private-chat IDs, bot identity, and token-file path in a private `telegram.json` file. The bot token stays in its separate file; neither the invitation nor confirmation code is retained. Pairing does not create a manager or grant an agent access to a recipient. Select the saved Telegram recipient through the host adapter's trusted manager setup.
 
+Changing a manager's selected channel affects new questions. Existing questions keep their original channel and reply references, so continue answering them where you received them. Keep that original channel available until those exchanges are handled.
+
 ## Run Seeker
 
 ```sh
@@ -65,6 +67,8 @@ Ordinary bot conversations are Telegram cloud chats. Send bounded decision summa
 **Pairing did not complete.** Check that the token file is private and contains the dedicated bot's current token, the bot has no other receiver or webhook, and the invitation has not expired. Run pairing again to obtain a fresh invitation. Never publish raw provider requests while diagnosing token errors.
 
 **The token was rotated.** Replace the contents of the same private token file while Seeker is stopped, then restart. A token for a different bot is rejected because it does not match the saved pairing. An existing pairing is never silently overwritten.
+
+**A retry budget was exhausted.** After restoring connectivity, restart Seeker to resume requests known to have been rejected temporarily. Their recorded retry deadlines still apply. Unknown and permanent failures are not replayed by this recovery path.
 
 **Receiver ownership remains after a crash.** Normal shutdown removes the host-local lock. After an abrupt crash, Seeker deliberately refuses automatic takeover. Stop every receiver for that bot and verify the process ID recorded in its `~/.seeker/telegram-receivers/<bot-id>.lock` file has exited. Only then remove that one stale lock and restart. Removing a lock while its owner is alive permits competing receivers. The data directory and exchange database must be preserved.
 
