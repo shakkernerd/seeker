@@ -1,0 +1,28 @@
+{
+  "name": "@shakkernerd/seeker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Durable conversations between your agent managers and you.",
+  "license": "MIT",
+  "repository": "github:shakkernerd/seeker",
+  "type": "module",
+  "bin": { "seeker": "dist/cli.js" },
+  "exports": { ".": { "types": "./dist/types/index.d.ts", "import": "./dist/index.js" } },
+  "files": ["dist", "docs", "README.md", "LICENSE", ".bun-version"],
+  "engines": { "bun": "1.4.2" },
+  "packageManager": "bun@1.4.2",
+  "scripts": {
+    "start": "bun src/cli.ts start",
+    "demo": "bun src/cli.ts demo",
+    "build": "bun scripts/build.ts",
+    "verify:package": "bun scripts/verify-package.ts",
+    "pack": "bun run build && bun pm pack --destination .artifacts/packages",
+    "check": "tsc --noEmit",
+    "test": "bun test",
+    "cli": "bun src/cli.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "typescript": "7.0.2"
+  }
+}
