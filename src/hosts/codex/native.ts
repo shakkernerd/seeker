@@ -6,7 +6,7 @@ class NativeFailure extends Error {
   constructor(readonly code: string, readonly written: boolean) { super(code); }
 }
 
-/** Uses only the local native input tool; never starts, resumes, or forks an executor. */
+/** Uses the registered app's existing-task input tool without creating another executor. */
 export class CodexNativeClient {
   #namespace?: string;
   constructor(private readonly pipePath: string, private readonly timeoutMs = 4_000) {}
@@ -16,8 +16,8 @@ export class CodexNativeClient {
     if (!Array.isArray(response.tools)) throw new NativeFailure("native_incompatible", false);
     const tool = response.tools.map(record).find((item) => item.name === "send_message_to_thread");
     if (!tool || typeof tool.namespace !== "string") throw new NativeFailure("native_input_unavailable", false);
-    const properties = record(record(tool.inputSchema).properties);
-    if (!properties.threadId || !properties.prompt) throw new NativeFailure("native_incompatible", false);
+    const schema = record(tool.inputSchema), properties = record(schema.properties);
+    if (schema.type !== "object" || record(properties.threadId).type !== "string" || record(properties.prompt).type !== "string" || (schema.required !== undefined && (!Array.isArray(schema.required) || schema.required.some((field) => field !== "threadId" && field !== "prompt")))) throw new NativeFailure("native_incompatible", false);
     this.#namespace = identifier(tool.namespace);
   }
 

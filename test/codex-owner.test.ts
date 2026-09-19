@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { desktopAppFromRuntime, desktopSqliteFromFiles, desktopUserDataFromArguments, parseDesktopOwner, parseDesktopProcesses, sameDesktopProcess, type DesktopOwner } from "../src/hosts/codex/desktop-owner.ts";
 
 const bundle = "/Applications/ChatGPT.app";
+const effectiveUid = 501;
 function owner(): DesktopOwner {
   return {
     profile: { appPath: bundle, appVersion: "26.915.31945", appBuild: "9922", userDataPath: "/Users/example/Library/Application Support/Codex", codexHome: "/Users/example/.codex", sqliteHome: "/Users/example/codex-state" },
@@ -19,7 +20,7 @@ describe("Desktop process ownership", () => {
   });
 
   test("parses executable paths with spaces and retains independent process start identities", () => {
-    const processes = parseDesktopProcesses(`    0     0 Sat Sep 19 08:59:00 2026 kernel_task\n  100     1 Sat Sep 19 09:00:00 2026 ${bundle}/Contents/MacOS/ChatGPT\n  102   100 Sat Sep 19 09:00:02 2026 ${bundle}/Contents/Frameworks/Codex Framework.framework/Versions/153.0.8010.48/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)\n`);
+    const processes = parseDesktopProcesses(`    0     0     0 Sat Sep 19 08:59:00 2026 kernel_task\n  501   100     1 Sat Sep 19 09:00:00 2026 ${bundle}/Contents/MacOS/ChatGPT\n  501   102   100 Sat Sep 19 09:00:02 2026 ${bundle}/Contents/Frameworks/Codex Framework.framework/Versions/153.0.8010.48/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)\n`, effectiveUid);
     expect(processes).toHaveLength(2);
     expect(processes[0]).toEqual(owner().app);
     expect(processes[1]!.executable).toContain("Codex Framework.framework");
@@ -27,12 +28,26 @@ describe("Desktop process ownership", () => {
     for (const change of [{ startedAt: "Sat Sep 19 09:00:03 2026" }, { pid: 102 }, { parentPid: 2 }, { executable: "/tmp/ChatGPT" }]) {
       expect(sameDesktopProcess(owner().app, { ...owner().app, ...change })).toBe(false);
     }
-    expect(() => parseDesktopProcesses("100 malformed metadata")).toThrow();
-    expect(() => parseDesktopProcesses(`100 1 Sat Sep 19 09:00:00 2026 /a\n100 1 Sat Sep 19 09:00:01 2026 /b`)).toThrow();
+    expect(() => parseDesktopProcesses("501 100 malformed metadata", effectiveUid)).toThrow();
+    expect(() => parseDesktopProcesses(`501 100 1 Sat Sep 19 09:00:00 2026 /a\n501 100 1 Sat Sep 19 09:00:01 2026 /b`, effectiveUid)).toThrow();
+  });
+
+  test("foreign effective UIDs are excluded before malformed or decoy owner fields are parsed", () => {
+    const local = `501 100 1 Sat Sep 19 09:00:00 2026 ${bundle}/Contents/MacOS/ChatGPT`;
+    const foreign = [
+      `502 200 1 Sat Sep 19 09:00:00 2026 ${bundle}/Contents/MacOS/ChatGPT`,
+      `502 100 1 Sat Sep 19 09:00:00 2026 ${bundle}/Contents/MacOS/ChatGPT`,
+      `0 101 100 Sat Sep 19 09:00:01 2026 ${bundle}/Contents/Resources/codex`,
+      `502 malformed process fields ${bundle}/Contents/MacOS/ChatGPT`,
+      "502 102 100 invalid-start relative/path",
+    ].join("\n");
+    expect(parseDesktopProcesses(`${foreign}\n${local}`, effectiveUid)).toEqual([owner().app]);
+    expect(parseDesktopProcesses(foreign, effectiveUid)).toEqual([]);
+    expect(() => parseDesktopProcesses(local, Number.NaN)).toThrow();
   });
 
   test("an unrelated non-normalized process path cannot block or impersonate a Desktop owner", () => {
-    const [entry] = parseDesktopProcesses("200 1 Sat Sep 19 09:00:00 2026 /opt/tool/bin/../lib/tool\n");
+    const [entry] = parseDesktopProcesses("501 200 1 Sat Sep 19 09:00:00 2026 /opt/tool/bin/../lib/tool\n", effectiveUid);
     expect(entry?.executable).toBe("/opt/tool/bin/../lib/tool");
     expect(() => parseDesktopOwner({ ...owner(), app: entry })).toThrow();
     expect(() => parseDesktopOwner({ ...owner(), app: { ...owner().app, executable: `${bundle}/Contents/Resources/../MacOS/ChatGPT` } })).toThrow();

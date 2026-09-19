@@ -60,7 +60,7 @@ test("service restart can reuse the pinned live owner or start its stopped profi
 test("a manually restarted app can resume the original task only with the same actual native profile", async () => {
   const f = fixture();
   await f.lifecycle.connected(f.owner); await f.lifecycle.admitted(f.owner);
-  const replacement: DesktopOwner = { ...f.owner, app: { ...f.owner.app, pid: 201 }, server: { ...f.owner.server, pid: 202, parentPid: 201 } };
+  const replacement: DesktopOwner = { ...f.owner, profile: { ...f.profile, appVersion: "1.1.0", appBuild: "2" }, app: { ...f.owner.app, pid: 201 }, server: { ...f.owner.server, pid: 202, parentPid: 201 } };
   f.instances([observed(replacement)]);
   await f.lifecycle.resume(binding, new AbortController().signal, () => true);
   expect(f.opened).toEqual([{ profile: f.profile, taskId }]);
@@ -71,6 +71,7 @@ test("a manually restarted app can resume the original task only with the same a
   f.instances([observed(replacement)]);
   await expect(f.lifecycle.connected({ ...replacement, profile: { ...replacement.profile, codexHome: "/private/other-home" } })).rejects.toThrow("different registered Desktop profile");
   await f.lifecycle.connected(replacement);
+  expect(JSON.parse(readFileSync(f.statePath, "utf8")).owner.profile.appBuild).toBe("2");
   await f.lifecycle.resume(binding, new AbortController().signal, () => true);
   expect(f.opened).toHaveLength(2);
   expect(() => f.lifecycle.ready(f.owner)).toThrow("registered Desktop owner");

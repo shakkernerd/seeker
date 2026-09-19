@@ -99,8 +99,11 @@ running application's actual Desktop profile, code home and native database
 location before resuming the original task; a matching process ID alone is not
 the host identity. The connector then qualifies again before receiving input.
 A different or unreadable profile, ambiguous instances, missing storage evidence,
-or a changed application build remains blocked until the original native host can
-be qualified. Keep one Desktop profile per Seeker data directory.
+or an incompatible native interface remains blocked. Discovery is limited to
+the service's effective OS user. A compatible app update can change its build
+number: the refreshed receiver qualifies its live input capability before it
+receives a reply. Seeker does not update the application. Keep one Desktop
+profile per Seeker data directory.
 
 An unavailable host leaves replies in Seeker. When input might already have
 reached Codex but its result was lost, delivery remains **unknown**; Seeker does
@@ -147,7 +150,7 @@ service on loopback and keep connector credentials out of prompts and logs.
 | Native runtime is unavailable | Launch the connector through Desktop; do not replace its runtime with a PATH CLI or change host authentication. |
 | Replies are waiting | Start Seeker with the registered data directory and restore the native connector. |
 | Automatic Desktop recovery is unavailable | Repeat setup after upgrading, reload the connector, and use `pending` from the original manager once. Keep the registered application and profile available. |
-| A different Desktop instance or build is running | Qualify its authentic connector in the original manager before retrying; do not substitute another profile or daemon. |
+| A different Desktop profile or incompatible interface is running | Restore the registered profile and a compatible native connector; saved replies remain available. |
 | Delivery is unknown | Read the retained exchange and native receipt before attempting another delivery. |
 | Setup reports conflicting settings | Preserve the existing configuration and reconcile the specifically named Seeker section. |
 

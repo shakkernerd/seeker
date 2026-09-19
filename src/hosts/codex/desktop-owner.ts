@@ -79,11 +79,17 @@ export function sameDesktopProcess(a: DesktopProcess, b: DesktopProcess): boolea
 }
 
 /** Pure OS-output parsers are shared with focused ownership tests. No command arguments are retained. */
-export function parseDesktopProcesses(output: string): DesktopProcess[] {
+export function parseDesktopProcesses(output: string, effectiveUid: number): DesktopProcess[] {
+  if (!Number.isSafeInteger(effectiveUid) || effectiveUid < 0 || effectiveUid > 0xffffffff) throw failure("desktop_user_unavailable", "The effective OS user could not be identified.");
   const processes: DesktopProcess[] = [], ids = new Set<number>();
   for (const line of output.split("\n")) {
     if (!line.trim()) continue;
-    const match = /^\s*(\d+)\s+(\d+)\s+((?:\S+\s+){4}\d{4})\s+(.+)$/.exec(line);
+    const user = /^\s*(\d+)(?:\s+|$)/.exec(line);
+    if (!user) throw failure("desktop_process_unreadable", "The OS process snapshot has no numeric user identity.");
+    // Filter before reading any other fields: foreign rows cannot contribute
+    // candidates, duplicate PIDs, or malformed profile metadata.
+    if (Number(user[1]) !== effectiveUid) continue;
+    const match = /^\s*(\d+)\s+(\d+)\s+((?:\S+\s+){4}\d{4})\s+(.+)$/.exec(line.slice(user[0].length));
     if (!match) throw failure("desktop_process_unreadable", "The OS process snapshot was not recognized.");
     const pid = Number(match[1]), parentPid = Number(match[2]), executable = match[4]!;
     if (ids.has(pid)) throw failure("desktop_process_unreadable", "The OS process snapshot contains duplicate identities.");
@@ -150,7 +156,7 @@ async function directory(value: string, signal?: AbortSignal): Promise<string> {
     throw failure("desktop_path_unavailable", "A registered Desktop directory is unavailable.");
   }
 }
-async function bundle(appPath: string, expected?: DesktopProfile, signal?: AbortSignal): Promise<Bundle> {
+async function bundle(appPath: string, signal?: AbortSignal): Promise<Bundle> {
   const canonical = await directory(appPath, signal);
   if (canonical !== appPath || !canonical.endsWith(".app")) throw failure("desktop_bundle_changed", "The registered Desktop bundle path has changed.");
   let info: Record<string, unknown>;
@@ -158,12 +164,15 @@ async function bundle(appPath: string, expected?: DesktopProfile, signal?: Abort
   catch (error) { if (error instanceof ConnectorError) throw error; throw failure("desktop_bundle_invalid", "The Desktop bundle metadata is invalid."); }
   if (!info || info.CFBundleIdentifier !== "com.openai.codex" || typeof info.CFBundleExecutable !== "string" || !/^[a-zA-Z0-9 ._-]{1,80}$/.test(info.CFBundleExecutable) || info.CFBundleExecutable === "." || info.CFBundleExecutable === "..") throw failure("desktop_bundle_invalid", "The application is not the registered native Desktop host.");
   const result = { appPath: canonical, appVersion: version(info.CFBundleShortVersionString), appBuild: version(info.CFBundleVersion), executable: join(canonical, "Contents", "MacOS", info.CFBundleExecutable) };
-  if (expected && (expected.appVersion !== result.appVersion || expected.appBuild !== result.appBuild)) throw failure("desktop_bundle_changed", "Desktop changed versions; qualify its native connector again before recovery.");
   return result;
 }
 const serverPath = (appPath: string) => join(appPath, "Contents", "Resources", "codex");
 async function processes(signal?: AbortSignal): Promise<DesktopProcess[]> {
-  return parseDesktopProcesses(await command("/bin/ps", ["-axww", "-o", "pid=,ppid=,lstart=,comm="], signal));
+  const uid = process.geteuid?.();
+  if (uid === undefined) throw failure("desktop_user_unavailable", "The effective OS user could not be identified.");
+  // macOS user selection can include setuid processes. The numeric uid column
+  // independently verifies effective ownership, without widening selection via -a.
+  return parseDesktopProcesses(await command("/bin/ps", ["-u", String(uid), "-xww", "-o", "uid=,pid=,ppid=,lstart=,comm="], signal), uid);
 }
 function frameworkChildren(snapshot: DesktopProcess[], app: DesktopProcess, appPath: string): DesktopProcess[] {
   const prefix = `${appPath}/Contents/Frameworks/Codex Framework.framework/Versions/`;
@@ -207,7 +216,7 @@ export async function captureDesktopOwner(signal?: AbortSignal): Promise<Desktop
   let runtime: string;
   try { runtime = await realpath(process.execPath); }
   catch { throw failure("native_host_required", "The connector's executing runtime cannot be identified."); }
-  const appPath = desktopAppFromRuntime(runtime), metadata = await bundle(appPath, undefined, signal);
+  const appPath = desktopAppFromRuntime(runtime), metadata = await bundle(appPath, signal);
   const before = await processes(signal), server = before.find((entry) => entry.pid === process.ppid);
   const app = server && before.find((entry) => entry.pid === server.parentPid);
   if (!server || !app || server.executable !== serverPath(appPath) || app.executable !== metadata.executable || directServer(before, app, appPath)?.pid !== server.pid) throw failure("native_host_required", "The connector was not launched directly by this Desktop app-server.");
@@ -228,7 +237,7 @@ export async function captureDesktopOwner(signal?: AbortSignal): Promise<Desktop
 /** Code-home discovery stays inside the stable-process inspection; absent an accessor, no home is asserted. */
 export async function inspectDesktop(profile: DesktopProfile, signal?: AbortSignal, codeHome?: (server: DesktopProcess) => string): Promise<Inspection[]> {
   requireMac(); checkSignal(signal);
-  const registered = parseProfile(profile), metadata = await bundle(registered.appPath, registered, signal);
+  const registered = parseProfile(profile), metadata = await bundle(registered.appPath, signal);
   await Promise.all([registered.userDataPath, registered.codexHome, ...(registered.sqliteHome ? [registered.sqliteHome] : [])].map(async (entry) => {
     if (await directory(entry, signal) !== entry) throw failure("desktop_path_changed", "A registered Desktop directory now resolves to a different location.");
   }));
