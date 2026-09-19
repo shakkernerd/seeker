@@ -11,7 +11,7 @@ import { cliHostId, cliRoute } from "../src/hosts/codex-cli/config.ts";
 import { CodexCliHost } from "../src/hosts/codex-cli/host.ts";
 import type { CliOwner, RegisteredCliOwner } from "../src/hosts/codex-cli/owner.ts";
 import { NativeRpcError } from "../src/hosts/codex-cli/rpc.ts";
-import type { CliRuntime, NativeCliConnection } from "../src/hosts/codex-cli/runtime.ts";
+import { createNativeCliRuntime, type CliRuntime, type NativeCliConnection } from "../src/hosts/codex-cli/runtime.ts";
 import { readCliRegistration, saveCliRegistration } from "../src/hosts/codex-cli/state.ts";
 
 const cleanups: (() => void | Promise<void>)[] = [];
@@ -220,6 +220,34 @@ test("cold recovery retains the registered profile and saved UUID, without model
   expect((await attempt(f, value)).status).toBe("accepted");
   const input = f.calls.find((call) => call.method === "turn/start")!;
   expect(input.params).toEqual({ threadId: managerId, input: [{ type: "text", text: nativeWakeup({ attemptId: "fixture", binding: value.binding, envelope: value.envelope }) }] });
+  expect(f.calls.some((call) => call.method === "thread/start")).toBe(false);
+});
+
+test("a manually restarted original host repairs the saved PID and receives the pending receipt on the original UUID", async () => {
+  const f = fixture(), value = reply(f);
+  const current: CliOwner = { ...f.owner, process: { ...f.owner.process, pid: 41002, startedAt: "Sat Sep 19 10:01:00 2026" } };
+  const probeRpc = { ...f.rpc, connected: true, onNotice: undefined };
+  const connect = f.runtime.connect;
+  let discoveries = 0, connections = 0, starts = 0;
+  Object.assign(f.runtime, createNativeCliRuntime({
+    verify: f.runtime.verify,
+    gone: async (owner) => owner.process.pid === f.owner.process.pid,
+    find: async (owner, signal) => { signal.throwIfAborted(); expect(owner).toEqual(f.owner); discoveries += 1; return current; },
+    connect: async (owner, signal) => ++connections === 1 ? probeRpc : connect(owner, signal),
+    start() { starts += 1; throw new Error("A verified live owner must not launch another executor"); },
+    async capture() { throw new Error("No child was started"); },
+    async readProcess() { throw new Error("No child was started"); },
+  }));
+  await prepare(f, value);
+  expect(starts).toBe(0); expect(discoveries).toBe(2); expect(probeRpc.connected).toBe(false);
+  expect(f.connections).toEqual([current]);
+  expect(readCliRegistration(f.statePath)).toEqual({ ...f.registration, owner: current });
+  expect(f.calls.filter((call) => call.method === "thread/resume").map((call) => call.params)).toEqual([{ threadId: managerId, excludeTurns: true }]);
+  expect(f.calls.some((call) => call.method === "turn/start")).toBe(false);
+  expect((await attempt(f, value)).status).toBe("accepted");
+  expect(f.calls.filter((call) => call.method === "turn/start").map((call) => call.params)).toEqual([
+    { threadId: managerId, input: [{ type: "text", text: nativeWakeup({ attemptId: "fixture", binding: value.binding, envelope: value.envelope }) }] },
+  ]);
   expect(f.calls.some((call) => call.method === "thread/start")).toBe(false);
 });
 

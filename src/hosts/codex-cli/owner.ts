@@ -57,17 +57,18 @@ export function sameCliProfile(a: CliOwner, b: CliOwner): boolean {
   return a.codexHome === b.codexHome && a.sqliteHome === b.sqliteHome && a.cwd === b.cwd && a.listen === b.listen && a.socketPath === b.socketPath && a.process.executable === b.process.executable && JSON.stringify(a.executableFile) === JSON.stringify(b.executableFile);
 }
 
+export type CliOwnerProbe = (file: "/bin/ps" | "/usr/sbin/lsof", args: string[], signal: AbortSignal, missing?: boolean) => Promise<string>;
 async function command(file: "/bin/ps" | "/usr/sbin/lsof", args: string[], signal: AbortSignal, missing = false): Promise<string> {
   if (process.platform !== "darwin") throw failure("cli_platform_unsupported", "Native CLI ownership is currently qualified on macOS.");
   signal.throwIfAborted();
-  return new Promise((resolve, reject) => execFile(file, args, { encoding: "utf8", timeout: 1_500, maxBuffer: 262_144, killSignal: "SIGKILL", signal, env: { PATH: "/usr/bin:/bin:/usr/sbin", LANG: "C", LC_ALL: "C", TZ: "UTC" } }, (error, stdout) => {
-    if (error && !(missing && error.code === 1 && !stdout.trim())) reject(failure("cli_probe_failed", "The OS could not verify the registered CLI owner."));
+  return new Promise((resolve, reject) => execFile(file, args, { encoding: "utf8", timeout: 1_500, maxBuffer: 262_144, killSignal: "SIGKILL", signal, env: { PATH: "/usr/bin:/bin:/usr/sbin", LANG: "C", LC_ALL: "C", TZ: "UTC" } }, (error, stdout, stderr) => {
+    if (stderr.trim() || (error && !(missing && error.code === 1 && !stdout.trim()))) reject(failure("cli_probe_failed", "The OS could not verify the registered CLI owner."));
     else resolve(stdout);
   }));
 }
 
-export async function readCliProcess(pid: number, signal: AbortSignal): Promise<CliProcess | undefined> {
-  const value = await command("/bin/ps", ["-ww", "-p", String(integer(pid, 2)), "-o", "pid=,ppid=,uid=,lstart=,comm="], signal, true);
+export async function readCliProcess(pid: number, signal: AbortSignal, probe: CliOwnerProbe = command): Promise<CliProcess | undefined> {
+  const value = await probe("/bin/ps", ["-ww", "-p", String(integer(pid, 2)), "-o", "pid=,ppid=,uid=,lstart=,comm="], signal, true);
   if (!value.trim()) return;
   const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+((?:\S+\s+){4}\d{4})\s+(.+?)\s*$/.exec(value);
   if (!match) throw failure("cli_probe_failed", "The OS process identity was not recognized.");
@@ -97,13 +98,14 @@ export function verifyNativeSocket(socketPath: string): void {
   const file = lstatSync(socketPath);
   if (!file.isSocket() || file.uid !== process.getuid?.() || (file.mode & 0o077) !== 0) throw failure("unsafe_native_socket", "The native Unix socket must be private and owned by your user.");
 }
-async function inspect(pid: number, codexHome: string, sqliteHome: string, signal: AbortSignal): Promise<CliOwner> {
-  const before = await readCliProcess(pid, signal);
+async function inspect(pid: number, codexHome: string, sqliteHome: string, signal: AbortSignal, readCodeHome?: (server: CliProcess) => string, probe: CliOwnerProbe = command): Promise<CliOwner> {
+  const before = await readCliProcess(pid, signal, probe);
   if (!before || before.uid !== process.getuid?.()) throw failure("native_cli_required", "The original CLI process is unavailable.");
+  if (readCodeHome && readCodeHome(before) !== codexHome) throw failure("cli_profile_changed", "The running CLI uses a different native Codex home.");
   const [argv, cwdOutput, files] = await Promise.all([
-    command("/bin/ps", ["-ww", "-p", String(pid), "-o", "command="], signal),
-    command("/usr/sbin/lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"], signal),
-    command("/usr/sbin/lsof", ["-a", "-p", String(pid), "-Fn"], signal),
+    probe("/bin/ps", ["-ww", "-p", String(pid), "-o", "command="], signal),
+    probe("/usr/sbin/lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"], signal),
+    probe("/usr/sbin/lsof", ["-a", "-p", String(pid), "-Fn"], signal),
   ]);
   const cwdNames = cwdOutput.split("\n").filter((line) => line.startsWith("n")).map((line) => line.slice(1));
   if (cwdNames.length !== 1) throw failure("cli_profile_ambiguous", "The native CLI working directory is ambiguous.");
@@ -113,7 +115,7 @@ async function inspect(pid: number, codexHome: string, sqliteHome: string, signa
   if (!databases.length || databases.some((name) => dirname(name) !== sqliteHome)) throw failure("cli_profile_ambiguous", "The CLI state directory does not match its native MCP environment.");
   const owner = parseCliOwner({ process: before, codexHome, sqliteHome, cwd: realpathSync(cwdNames[0]!), ...endpoints, executableFile: executableFile(before.executable) });
   verifyCliFiles(owner); verifyNativeSocket(owner.socketPath);
-  const after = await readCliProcess(pid, signal);
+  const after = await readCliProcess(pid, signal, probe);
   if (!after || !sameCliProcess(before, after)) throw failure("cli_owner_changed", "CLI ownership changed during inspection. Retry once startup settles.");
   return owner;
 }
@@ -133,6 +135,38 @@ export async function originalCliGone(owner: CliOwner, signal: AbortSignal): Pro
   // left alone rather than treated as evidence that starting another is safe.
   const current = await readCliProcess(owner.process.pid, signal);
   return !current || !sameCliProcess(current, owner.process);
+}
+
+/** Recovery discovery is separate from genuine MCP ancestry and requires actual native home evidence. */
+export async function findRunningCli(previous: CliOwner, signal: AbortSignal, readCodeHome: (server: CliProcess) => string, probe: CliOwnerProbe = command): Promise<CliOwner | undefined> {
+  verifyCliFiles(previous);
+  if (previous.process.uid !== process.getuid?.()) throw failure("native_cli_required", "The registered CLI belongs to a different OS user.");
+  try { verifyNativeSocket(previous.socketPath); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  const socketOwners = async () => {
+    // Enumerate open Unix sockets, including an unlinked listener. A missing
+    // filesystem entry alone cannot prove that another execution owner is absent.
+    const output = await probe("/usr/sbin/lsof", ["-n", "-a", "-U", "-u", String(previous.process.uid), "-Fpn0"], signal, true);
+    const owners = new Set<number>(); let pid: number | undefined, descriptor = false;
+    for (const raw of output.split("\0")) {
+      const field = raw.replace(/^\n+/, "");
+      if (!field) continue;
+      if (/^p\d+$/.test(field)) { pid = integer(Number(field.slice(1)), 1); descriptor = false; }
+      else if (/^f\d+$/.test(field) && pid !== undefined) descriptor = true;
+      else if (field.startsWith("n") && pid !== undefined && descriptor) {
+        if (field.slice(1) === previous.socketPath) owners.add(pid);
+      } else throw failure("cli_probe_failed", "The OS Unix socket ownership snapshot was not recognized.");
+    }
+    if (owners.size > 1) throw failure("cli_owner_ambiguous", "More than one process holds the registered CLI endpoint.");
+    return [...owners][0];
+  };
+  const pid = await socketOwners();
+  if (pid === undefined) return;
+  const current = await inspect(pid, previous.codexHome, previous.sqliteHome, signal, readCodeHome, probe);
+  if (!sameCliProfile(current, previous)) throw failure("cli_owner_changed", "The running CLI does not match its registered profile.");
+  if (await socketOwners() !== pid) throw failure("cli_owner_changed", "CLI endpoint ownership changed during inspection.");
+  signal.throwIfAborted();
+  return current;
 }
 
 /** Native startup locks/probes its same-home Unix endpoint and refuses a live listener. */
