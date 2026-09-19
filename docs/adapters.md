@@ -48,4 +48,4 @@ Verified original native human messages use `core.receiveNative`, which is separ
 
 ## Composition
 
-Create one store and `SeekerCore`, configure the concrete adapters, then call `startRuntime({ core, accessKey, channels, hosts, hostHandler })`. It supplies the local inbox and delivery pump. The caller starts/stops provider receivers and closes the store after the runtime stops. There is no automatic provider discovery or second daemon per channel. A native bridge may mount its narrow, independently authenticated routes through `hostHandler`.
+Create one store and `SeekerCore`, configure the concrete adapters, then call `startRuntime({ core, accessKey, channels, hosts })`. It supplies the local inbox and delivery pump. The caller starts/stops provider receivers and closes the store after the runtime stops. There is no automatic provider discovery or second daemon per channel. The Codex Desktop adapter owns its private Unix listener through `loadCodexHost`; its lifecycle is separate from the local inbox listener.
