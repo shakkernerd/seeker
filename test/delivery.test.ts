@@ -87,3 +87,29 @@ test("a stuck task does not block another binding on the same host adapter", asy
     pump.stop(); settle?.(); await Bun.sleep(0);
   } finally { pump.stop(); store.close(); }
 });
+
+test("a verified successor progresses while the predecessor's aborted operation remains quarantined", async () => {
+  const store = new SqliteExchangeStore(":memory:");
+  const core = new SeekerCore(store);
+  core.bind(fixtureBinding);
+  const request = core.manager(fixtureBinding.origin).submit({ requestId: "transfer", decision: fixtureDecision });
+  core.channel("local").receive([{ eventId: "answer", actorId: "owner", conversationId: "inbox", sourceRef: "local:answer", replyHandle: request.exchange.revisions[0]!.replyHandle, kind: "answer", text: "Keep it local." }]);
+  let predecessorCalls = 0, successorCalls = 0;
+  let settle: (() => void) | undefined;
+  const pump = new DeliveryPump(core, [new LocalChannel()], [{ id: "fixture", deliver: (binding, envelope) => {
+    if (binding.origin.generation === 1) {
+      predecessorCalls += 1;
+      return new Promise((resolve) => { settle = () => resolve({ status: "accepted", reference: "predecessor" }); });
+    }
+    successorCalls += 1;
+    expect(envelope.requiresReconciliation).toBe(true);
+    return Promise.resolve({ status: "accepted", reference: "successor" });
+  } }], 20);
+  try {
+    pump.start(); await Bun.sleep(40);
+    store.transfer(fixtureBinding.id, 1, { ...fixtureBinding.origin, managerId: "successor", generation: 2 });
+    await Bun.sleep(240);
+    expect(predecessorCalls).toBe(1); expect(successorCalls).toBe(1);
+    pump.stop(); settle?.(); await Bun.sleep(0);
+  } finally { pump.stop(); store.close(); }
+});

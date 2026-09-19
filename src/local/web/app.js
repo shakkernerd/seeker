@@ -330,15 +330,25 @@ $("reply-form").addEventListener("submit", async (event) => {
   draft.attempt = attempt; draft.sending = true; draft.notice = ""; renderComposer(view);
   try {
     const result = await api("/api/replies", attempt);
+    if (draft.attempt !== attempt) return;
     if (result.status === "deferred") recorded(draft, true);
     else if (result.status === "recorded" || (result.status === "duplicate" && result.receiptId)) recorded(draft);
-    else { draft.attempt = undefined; draft.error = true; draft.notice = result.code?.includes("stale") ? "This request changed. Your draft is kept; review the current revision before sending." : "This response was not recorded. Your draft is kept; refresh and review the request."; }
+    else { draft.sending = false; draft.attempt = undefined; draft.error = true; draft.notice = result.code?.includes("stale") ? "This request changed. Your draft is kept; review the current revision before sending." : "This response was not recorded. Your draft is kept; refresh and review the request."; }
   } catch (error) {
     if (draft.attempt !== attempt) return;
     draft.error = true;
-    if (error.status && error.status < 500) { draft.attempt = undefined; draft.notice = error.status === 409 ? "This request changed. Your draft is kept; review the current revision before sending." : error.message; if (error.status === 401) showLogin("Unlock the inbox again to send your retained draft."); }
+    if (error.status === 401 || error.status === 403) {
+      draft.sending = false;
+      draft.notice = "Unlock the inbox again to safely retry this same response.";
+      showLogin(draft.notice);
+    }
+    else if (error.status && error.status < 500) { draft.sending = false; draft.attempt = undefined; draft.notice = error.status === 409 ? "This request changed. Your draft is kept; review the current revision before sending." : error.message; }
     else draft.notice = "The result of this send is unconfirmed. Keep this tab open. Retry sends this exact same response safely.";
-  } finally { draft.sending = false; if (selectedId === view.exchange.id) renderComposer(views.get(selectedId) || view); await refresh(); }
+  } finally {
+    if (draft.attempt === attempt) draft.sending = false;
+    if (selectedId === view.exchange.id) renderComposer(views.get(selectedId) || view);
+    await refresh();
+  }
 });
 window.addEventListener("hashchange", () => select(hashId(), false));
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });

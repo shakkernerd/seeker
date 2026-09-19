@@ -2,7 +2,7 @@ import type { Delivery, Exchange } from "../contracts.ts";
 import { isAnswer } from "./lifecycle.ts";
 
 export function routeFor(exchange: Exchange, lane: Delivery["lane"]): string {
-  return lane === "channel" ? `channel:${exchange.recipient.channelId}` : `host:${exchange.origin.hostId}:${exchange.bindingId}`;
+  return lane === "channel" ? `channel:${exchange.recipient.channelId}` : `host:${exchange.origin.hostId}:${exchange.bindingId}:${exchange.origin.generation}`;
 }
 
 export function channelReadiness(exchange: Exchange, attempt: Delivery): "send" | "defer" | "retire" {

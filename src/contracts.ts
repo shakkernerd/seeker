@@ -50,6 +50,8 @@ export interface InboundReply {
   conversationId: string;
   sourceRef: string;
   occurredAt?: number;
+  /** The source time denotes [occurredAt, occurredAt + precision); defaults to 1 ms. */
+  occurredAtPrecisionMs?: number;
   /** Opaque revision handle, or a provider reference resolved by the store. */
   replyHandle?: string;
   replyToRef?: string;
@@ -75,6 +77,7 @@ export interface Receipt {
     eventId: string;
     reference: string;
     occurredAt?: number;
+    occurredAtPrecisionMs?: number;
     recordedAt: number;
     verification: "channel" | "native";
   };
@@ -106,6 +109,7 @@ export interface Exchange {
   version: number;
   revision: number;
   state: "waiting" | "answered" | "reconcile" | "handled" | "cancelled";
+  pendingInputs?: number;
   revisions: Revision[];
   context: ContextMessage[];
   receipts: Receipt[];
@@ -136,6 +140,7 @@ export interface Delivery {
   nextAt: number;
   attemptId?: string;
   reference?: string;
+  acceptedAt?: number;
   code?: string;
 }
 

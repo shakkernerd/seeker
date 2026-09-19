@@ -116,6 +116,10 @@ export function reply(value: InboundReply): InboundReply {
   if (value.replyToRef !== undefined) result.replyToRef = text(value.replyToRef, "Replied message", 500);
   if (value.optionId !== undefined) result.optionId = id(value.optionId, "Choice");
   if (value.occurredAt !== undefined) result.occurredAt = integer(value.occurredAt, "Source time", 0);
+  if (value.occurredAtPrecisionMs !== undefined) {
+    result.occurredAtPrecisionMs = integer(value.occurredAtPrecisionMs, "Source time precision");
+    if (result.occurredAt === undefined || !Number.isSafeInteger(result.occurredAt + result.occurredAtPrecisionMs)) fail("invalid_input", "Source time precision needs a bounded source time.");
+  }
   return result;
 }
 

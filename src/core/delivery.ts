@@ -29,9 +29,11 @@ export class DeliveryPump {
 
   tick(): void {
     if (this.#stopped || this.#active.size >= 4 || this.lastError) return;
+    const capacity = Math.min(4 - this.#active.size, 32 - this.#active.size - this.#abandoned.size);
+    if (capacity <= 0) return;
     try {
       const excluded = [...this.#active.values(), ...this.#abandoned.values()].map((item) => item.route);
-      for (const attempt of this.core.store.claimDeliveries(4 - this.#active.size, this.core.clock(), excluded)) this.#dispatch(attempt);
+      for (const attempt of this.core.store.claimDeliveries(capacity, this.core.clock(), excluded)) this.#dispatch(attempt);
     } catch { this.lastError = "store_write_failed"; }
   }
 
@@ -99,7 +101,7 @@ export class DeliveryPump {
       const receipt = exchange.receipts.find((item) => item.id === attempt.receiptId)!;
       return adapter.deliver({ ...binding, origin: exchange.origin }, {
         deliveryId: attempt.id, exchangeId: exchange.id, revision, receipt,
-        requiresReconciliation: exchange.state === "reconcile" || receipt.revision !== exchange.revision,
+        requiresReconciliation: exchange.state === "reconcile" || receipt.revision !== exchange.revision || Boolean(receipt.dispositionHistory?.length),
       }, controller.signal);
     });
     operation.then(commit, () => commit({ status: "unknown", code: "adapter_error" })).finally(() => {

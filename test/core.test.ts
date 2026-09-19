@@ -119,11 +119,13 @@ describe("durable exchange lifecycle", () => {
   });
 
   test("ambiguous bare replies do not choose the newest manager; unique bare replies can correlate", () => {
-    const { manager, channel, event } = setup();
+    const { manager, channel, event, store } = setup();
     manager.submit({ requestId: "request-2", decision: fixtureDecision });
-    expect(channel.receive([event("bare1", { replyHandle: undefined, kind: "question", optionId: undefined, text: "Which folder?" })])[0]!.code).toBe("ambiguous");
+    expect(channel.receive([event("bare1", { replyHandle: undefined, occurredAt: 1_000, kind: "question", optionId: undefined, text: "Which folder?" })])[0]!.code).toBe("ambiguous");
     manager.update({ type: "cancel", requestId: "request-2", expectedVersion: 1, reason: "Redundant sample" });
-    expect(channel.receive([event("bare2", { replyHandle: undefined, kind: "question", optionId: undefined, text: "Which folder?" })])[0]!.exchangeId).toBe("request-1");
+    const presented = store.claimDeliveries(4, 1_000)[0]!;
+    store.completeDelivery(presented.id, presented.attemptId!, { status: "accepted", reference: "local:presented" }, 1_000);
+    expect(channel.receive([event("bare2", { replyHandle: undefined, occurredAt: 1_000, kind: "question", optionId: undefined, text: "Which folder?" })])[0]!.exchangeId).toBe("request-1");
   });
 
   test("native authenticated source can reconcile an exchange without manufacturing provider provenance", () => {
@@ -174,7 +176,7 @@ describe("durable exchange lifecycle", () => {
     manager.update({ type: "reconcile-input", requestId: "request-1", expectedVersion: view.exchange.version, channelId: "local", eventId: "important-correction", evidenceRef: "native:reconciliation", note: "Applied the condition to the existing work." });
     expect(core.inbox(fixtureBinding.recipient).find((item) => item.exchange.id === "request-1")!.deferredReplies!.find((item) => item.event.eventId === "important-correction")!.disposition.status).toBe("handled");
     const receipt = manager.get("request-1").exchange.receipts[0]!;
-    expect(manager.update({ type: "acknowledge", requestId: "request-1", expectedVersion: view.exchange.version, receiptId: receipt.id,
+    expect(manager.update({ type: "acknowledge", requestId: "request-1", expectedVersion: manager.get("request-1").exchange.version, receiptId: receipt.id,
       status: "handled", evidenceRef: "native:capacity-recovery", note: "n".repeat(2_000) }).exchange.receipts[0]!.disposition.status).toBe("handled");
     expect(manager.update({ type: "cancel", requestId: "request-1", expectedVersion: manager.get("request-1").exchange.version, reason: "x".repeat(2_000) }).exchange.cancellation).toBeDefined();
   });
@@ -188,6 +190,25 @@ describe("durable exchange lifecycle", () => {
     expect(manager.get("request-1").deliveries.find((item) => item.lane === "channel" && item.revision === 2)!.state).toBe("queued");
     manager.update({ type: "acknowledge", requestId: "request-1", expectedVersion: view.exchange.version, receiptId: correction.receiptId!, status: "handled", evidenceRef: "native:correction-clarified" });
     expect(store.claimDeliveries(4, 2_000).some((item) => item.lane === "channel" && item.revision === 2)).toBe(true);
+  });
+
+  test("a saved deferred stop invalidates prior approval views and blocks resolution", () => {
+    const { manager, channel, event } = setup();
+    for (let index = 0; index < 127; index += 1) {
+      const receipt = channel.receive([event(`context-${index}`, { kind: "question", optionId: undefined, text: "Context please?" })])[0]!;
+      manager.update({ type: "acknowledge", requestId: "request-1", receiptId: receipt.receiptId!, status: "handled", evidenceRef: `native:context-${index}`, expectedVersion: manager.get("request-1").exchange.version });
+    }
+    const approval = channel.receive([event("approval")])[0]!;
+    const beforeStop = manager.get("request-1").exchange.version;
+    expect(channel.receive([event("stop-at-capacity", { kind: "stop", optionId: undefined, text: "Stop before doing this." })])[0]!.status).toBe("deferred");
+    const afterStop = manager.get("request-1");
+    expect(afterStop.exchange.version).toBe(beforeStop + 1);
+    expect(afterStop.exchange.state).toBe("reconcile");
+    expect(() => manager.update({ type: "acknowledge", requestId: "request-1", receiptId: approval.receiptId!, status: "handled", evidenceRef: "native:old-view", expectedVersion: beforeStop })).toThrow("changed");
+    expect(() => manager.update({ type: "acknowledge", requestId: "request-1", receiptId: approval.receiptId!, status: "handled", resolvesExchange: true, evidenceRef: "native:unchecked", expectedVersion: afterStop.exchange.version })).toThrow("later saved input");
+    const reconciled = manager.update({ type: "reconcile-input", requestId: "request-1", channelId: "local", eventId: "stop-at-capacity", evidenceRef: "native:stop-understood", expectedVersion: afterStop.exchange.version });
+    expect(reconciled.exchange.pendingInputs).toBe(0);
+    expect(reconciled.exchange.version).toBe(afterStop.exchange.version + 1);
   });
 
   test("restored host retries only known-unaccepted work and preserves its delay", () => {
@@ -222,8 +243,10 @@ describe("durable exchange lifecycle", () => {
   });
 
   test("editing an old bare reply stays with its original exchange after another becomes pending", () => {
-    const { manager, channel, event } = setup();
-    const initial = channel.receive([event("original", { replyHandle: undefined, kind: "answer", optionId: undefined, text: "Use local." })])[0]!;
+    const { manager, channel, event, store } = setup();
+    const presented = store.claimDeliveries(4, 1_000)[0]!;
+    store.completeDelivery(presented.id, presented.attemptId!, { status: "accepted", reference: "local:presented" }, 1_000);
+    const initial = channel.receive([event("original", { replyHandle: undefined, occurredAt: 1_000, kind: "answer", optionId: undefined, text: "Use local." })])[0]!;
     manager.update({ type: "acknowledge", requestId: "request-1", expectedVersion: manager.get("request-1").exchange.version, receiptId: initial.receiptId!, status: "handled", resolvesExchange: true, evidenceRef: "native:original" });
     manager.submit({ requestId: "new-question", decision: fixtureDecision });
     const edited = channel.receive([event("edited", { replyHandle: undefined, replyToRef: "message:original", sourceRef: "message:original", kind: "correction", optionId: undefined, text: "Stop that earlier change." })])[0]!;
@@ -241,6 +264,35 @@ describe("durable exchange lifecycle", () => {
     expect(channel.receive([edit("edit-a", "A")])[0]!.status).toBe("recorded");
     expect(channel.receive([edit("more-metadata", "A")])[0]!.status).toBe("duplicate");
     expect(manager.get("request-1").exchange.receipts.map((item) => item.text)).toEqual(["A", "B", "A"]);
+  });
+
+  test("buffered bare replies cannot acquire a future question or material revision", () => {
+    const { core, store, manager, channel, event } = setup();
+    manager.update({ type: "cancel", requestId: "request-1", expectedVersion: 1, reason: "Old question ended" });
+    const later = new SeekerCore(store, () => 5_500).manager(fixtureBinding.origin);
+    const replacement = later.submit({ requestId: "later-question", decision: fixtureDecision });
+    const bare = { replyHandle: undefined, kind: "answer" as const, optionId: undefined, text: "Yes" };
+    expect(channel.receive([event("buffered", { ...bare, occurredAt: 1_000, occurredAtPrecisionMs: 1_000 })])[0]!.code).toBe("predates_current_revision");
+    expect(channel.receive([event("rounded", { ...bare, occurredAt: 5_000, occurredAtPrecisionMs: 1_000 })])[0]!.code).toBe("uncertain_chronology");
+    expect(channel.receive([event("untimed", bare)])[0]!.code).toBe("source_time_required");
+    expect(later.get("later-question").exchange.receipts).toHaveLength(0);
+    expect(channel.receive([event("explicit-same-second", { ...bare, replyHandle: replacement.exchange.revisions[0]!.replyHandle, occurredAt: 5_000, occurredAtPrecisionMs: 1_000 })])[0]!.status).toBe("recorded");
+    const revised = new SeekerCore(store, () => 9_000).manager(fixtureBinding.origin);
+    revised.update({ type: "revise", requestId: "later-question", expectedVersion: revised.get("later-question").exchange.version, decision: { ...fixtureDecision, target: "new material scope" } });
+    expect(core.channel("local").receive([event("prior-revision", { ...bare, occurredAt: 7_000, occurredAtPrecisionMs: 1_000 })])[0]!.code).toBe("predates_current_revision");
+  });
+
+  test("bare reply context requires an accepted question presented before the source-time interval", () => {
+    const { channel, store, event } = setup();
+    const bare = { replyHandle: undefined, kind: "answer" as const, optionId: undefined, text: "Yes", occurredAt: 2_000 };
+    expect(channel.receive([event("before-send", bare)])[0]!.code).toBe("question_not_presented");
+    const attempt = store.claimDeliveries(4, 3_000)[0]!;
+    store.completeDelivery(attempt.id, attempt.attemptId!, { status: "unknown", code: "io_timeout" }, 3_100);
+    expect(channel.receive([event("unknown-send", { ...bare, occurredAt: 4_000 })])[0]!.code).toBe("question_not_presented");
+    store.completeDelivery(attempt.id, attempt.attemptId!, { status: "accepted", reference: "late-provider-result" }, 5_500);
+    expect(channel.receive([event("buffered-before-presentation", { ...bare, occurredAt: 4_000 })])[0]!.code).toBe("predates_presentation");
+    expect(channel.receive([event("presentation-overlap", { ...bare, occurredAt: 5_000, occurredAtPrecisionMs: 1_000 })])[0]!.code).toBe("uncertain_chronology");
+    expect(channel.receive([event("presented-context", { ...bare, occurredAt: 6_000, occurredAtPrecisionMs: 1_000 })])[0]!.status).toBe("recorded");
   });
 
   test("trusted future recipient selection preserves old-channel replies and fixed old routes", () => {

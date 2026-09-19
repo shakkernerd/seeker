@@ -42,7 +42,7 @@ export function isAnswer(receipt: Receipt, exchange: Exchange): boolean {
 }
 
 export function refreshState(exchange: Exchange): void {
-  if (exchange.receipts.some((item) => item.classification === "correction" && item.disposition.status !== "handled")) {
+  if ((exchange.pendingInputs ?? 0) > 0 || exchange.receipts.some((item) => item.classification === "correction" && item.disposition.status !== "handled")) {
     exchange.state = "reconcile";
     return;
   }
@@ -56,7 +56,15 @@ export function refreshState(exchange: Exchange): void {
   exchange.state = answered ? (receipts.every((item) => item.disposition.status === "handled") ? "handled" : "answered") : pendingAnswer ? "answered" : "waiting";
 }
 
-export function reconcileInput(exchange: Exchange, deferred: DeferredReply, command: Extract<ManagerCommand, { type: "reconcile-input" }>): DeferredReply {
+export function deferInput(exchange: Exchange, now: number): Change {
+  exchange.pendingInputs = (exchange.pendingInputs ?? 0) + 1;
+  exchange.version += 1;
+  exchange.updatedAt = now;
+  refreshState(exchange);
+  return { exchange, deliveries: [], changed: true };
+}
+
+export function reconcileInput(exchange: Exchange, deferred: DeferredReply, command: Extract<ManagerCommand, { type: "reconcile-input" }>, now: number): DeferredReply {
   if (deferred.exchangeId !== exchange.id) fail("origin_denied", "This input belongs to another exchange.", 403);
   text(command.evidenceRef, "Reconciliation evidence", 500);
   if (command.note !== undefined) text(command.note, "Reconciliation note", 2_000, true);
@@ -66,6 +74,10 @@ export function reconcileInput(exchange: Exchange, deferred: DeferredReply, comm
   }
   if (command.expectedVersion !== exchange.version) fail("version_conflict", "The exchange changed; reconcile its current state first.", 409);
   deferred.disposition = { status: "handled", generation: exchange.origin.generation, evidenceRef: command.evidenceRef, ...(command.note === undefined ? {} : { note: command.note }) };
+  exchange.pendingInputs = Math.max(0, (exchange.pendingInputs ?? 0) - 1);
+  exchange.version += 1;
+  exchange.updatedAt = now;
+  refreshState(exchange);
   return deferred;
 }
 
@@ -89,6 +101,7 @@ export function mutate(exchange: Exchange, command: Exclude<ManagerCommand, { ty
     if (command.note !== undefined) text(command.note, "Manager note", 2_000, true);
     if (command.resolvesExchange !== undefined && typeof command.resolvesExchange !== "boolean") fail("invalid_input", "Resolution must be explicit.");
     if (command.resolvesExchange && (command.status !== "handled" || existing.kind === "question" || existing.revision !== exchange.revision)) fail("invalid_resolution", "Only a handled response to the current decision may resolve it.", 409);
+    if (command.resolvesExchange && (exchange.pendingInputs ?? 0) > 0) fail("reconciliation_required", "Reconcile the later saved input before resolving this decision.", 409);
     if (existing.disposition.status === command.status && existing.disposition.generation === exchange.origin.generation &&
       existing.disposition.evidenceRef === command.evidenceRef && existing.disposition.note === command.note && existing.disposition.resolvesExchange === command.resolvesExchange) return result;
     if (existing.disposition.status === "handled" && command.status !== "handled") fail("already_handled", "A handled receipt cannot be downgraded; record a correction separately.", 409);
@@ -166,6 +179,7 @@ export function incorporate(
     source: {
       channelId, actorId: input.actorId, conversationId: input.conversationId, eventId: input.eventId,
       reference: input.sourceRef, ...(input.occurredAt === undefined ? {} : { occurredAt: input.occurredAt }),
+      ...(input.occurredAtPrecisionMs === undefined ? {} : { occurredAtPrecisionMs: input.occurredAtPrecisionMs }),
       recordedAt: now, verification,
     },
     disposition: { status: "pending" },

@@ -6,8 +6,9 @@ import type {
   DeferredReply, Delivery, DeliveryResult, Exchange, ExchangeStore, ExchangeView, HistoryPage, InboundReply, IngestResult,
   ManagerBinding, ManagerCommand, ManagerOrigin, ReceiveProgress, Recipient,
 } from "../contracts.ts";
-import { create, incorporate, mutate, reconcileInput, replyContentKey, type Change } from "../core/lifecycle.ts";
+import { create, deferInput, incorporate, mutate, reconcileInput, replyContentKey, type Change } from "../core/lifecycle.ts";
 import { channelReadiness, routeFor } from "../core/attention.ts";
+import { correlateBare, type BareCandidate } from "../core/correlation.ts";
 import { binding as validateBinding, decision, fail, id, integer, limits, origin as validateOrigin, progress as validateProgress, reply as validateReply, sameOwner, sameRecipient, SeekerError } from "../core/validation.ts";
 
 type Row = { data: string };
@@ -36,7 +37,7 @@ export class SqliteExchangeStore implements ExchangeStore {
       this.#db.run("PRAGMA fullfsync = ON");
       this.#db.run("PRAGMA foreign_keys = ON");
       const version = this.#db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version;
-      if (version < 0 || version > 5) fail("store_version", "This store needs a compatible Seeker version; it was not changed.");
+      if (version < 0 || version > 6) fail("store_version", "This store needs a compatible Seeker version; it was not changed.");
       this.#db.transaction(() => {
         this.#db.run(`
           CREATE TABLE IF NOT EXISTS bindings (id TEXT PRIMARY KEY, data TEXT NOT NULL);
@@ -83,7 +84,14 @@ export class SqliteExchangeStore implements ExchangeStore {
         this.#db.run("CREATE INDEX IF NOT EXISTS exchange_history ON exchanges(json_extract(data,'$.createdAt') DESC,id)");
         this.#db.run("CREATE INDEX IF NOT EXISTS deferred_status ON inbound(json_extract(data,'$.deferred.disposition.status'),json_extract(data,'$.deferred.exchangeId'))");
         this.#db.run("CREATE INDEX IF NOT EXISTS inbox_history ON exchanges(json_extract(data,'$.recipient.channelId'),json_extract(data,'$.recipient.actorId'),json_extract(data,'$.recipient.conversationId'),json_extract(data,'$.createdAt') DESC,id)");
-        this.#db.run("PRAGMA user_version = 5");
+        this.#db.run("CREATE INDEX IF NOT EXISTS presented_question ON deliveries(exchange_id,json_extract(data,'$.revision'),json_extract(data,'$.acceptedAt')) WHERE state='accepted' AND json_extract(data,'$.lane')='channel' AND json_extract(data,'$.contextId') IS NULL");
+        if (version > 0 && version < 6) {
+          this.#db.run(`UPDATE exchanges SET state='reconcile', data=json_set(data,'$.pendingInputs',
+            (SELECT count(*) FROM inbound WHERE json_extract(inbound.data,'$.deferred.exchangeId')=exchanges.id AND json_extract(inbound.data,'$.deferred.disposition.status')='pending'),
+            '$.state','reconcile','$.version',json_extract(data,'$.version')+1)
+            WHERE id IN (SELECT json_extract(data,'$.deferred.exchangeId') FROM inbound WHERE json_extract(data,'$.deferred.disposition.status')='pending')`);
+        }
+        this.#db.run("PRAGMA user_version = 6");
       }).immediate();
     } catch (error) {
       this.#db.close();
@@ -199,8 +207,10 @@ export class SqliteExchangeStore implements ExchangeStore {
           const row = this.#db.query<Row, [string, string]>("SELECT data FROM inbound WHERE channel_id=? AND event_id=?").get(command.channelId, command.eventId);
           const record = row ? decode<InboundRecord>(row) : undefined;
           if (!record?.deferred) fail("not_found", "Deferred input not found.", 404);
-          record.deferred = reconcileInput(existing.exchange, record.deferred, command);
+          const beforeVersion = existing.exchange.version;
+          record.deferred = reconcileInput(existing.exchange, record.deferred, command, now);
           this.#db.query("UPDATE inbound SET data=? WHERE channel_id=? AND event_id=?").run(JSON.stringify(record), command.channelId, command.eventId);
+          this.#save({ exchange: existing.exchange, deliveries: [], changed: existing.exchange.version !== beforeVersion });
         } else this.#save(mutate(existing.exchange, command, now));
       }
       return this.get(command.requestId)!;
@@ -284,7 +294,7 @@ export class SqliteExchangeStore implements ExchangeStore {
       const excluded = [...excludedRoutes];
       const claimed: Delivery[] = [];
       while (claimed.length < limit) {
-        const route = "json_extract(d.data,'$.lane') || ':' || CASE json_extract(d.data,'$.lane') WHEN 'channel' THEN json_extract(e.data,'$.recipient.channelId') ELSE json_extract(e.data,'$.origin.hostId') || ':' || e.binding_id END";
+        const route = "json_extract(d.data,'$.lane') || ':' || CASE json_extract(d.data,'$.lane') WHEN 'channel' THEN json_extract(e.data,'$.recipient.channelId') ELSE json_extract(e.data,'$.origin.hostId') || ':' || e.binding_id || ':' || json_extract(e.data,'$.origin.generation') END";
         const row = this.#db.query<Row, (string | number)[]>(`SELECT d.data FROM deliveries d JOIN exchanges e ON e.id=d.exchange_id
           WHERE d.state IN ('queued','retry') AND d.next_at<=? ${excluded.length ? `AND (${route}) NOT IN (${excluded.map(() => "?").join(",")})` : ""}
           ORDER BY d.next_at,d.rowid LIMIT 1`).get(now, ...excluded);
@@ -327,6 +337,7 @@ export class SqliteExchangeStore implements ExchangeStore {
       if (result.status === "accepted") {
         if (!result.reference || result.reference.length > 500) fail("invalid_adapter_result", "Adapter reference is invalid.");
         item.reference = result.reference;
+        item.acceptedAt = now;
         delete item.code;
         if (item.lane === "channel") {
           const exchange = this.get(item.exchangeId)!.exchange;
@@ -486,9 +497,16 @@ export class SqliteExchangeStore implements ExchangeStore {
         } else if (event.replyHandle || event.replyToRef) {
           result = { eventId: event.eventId, status: "unmatched", code: "unknown_message" };
         } else {
-          const candidates = this.list({ recipient: { channelId, actorId: event.actorId, conversationId: event.conversationId }, pendingOnly: true });
-          if (candidates.length === 1) target = { exchange: candidates[0]!.exchange, revision: candidates[0]!.exchange.revision };
-          else result = { eventId: event.eventId, status: "unmatched", code: candidates.length ? "ambiguous" : "no_pending_exchange" };
+          // Project only correlation metadata; do not hydrate every conversation for a bare reply.
+          const candidates = this.#db.query<BareCandidate, string[]>(`SELECT e.id,json_extract(e.data,'$.revision') AS revision,
+            json_extract(e.data,'$.revisions[' || (json_extract(e.data,'$.revision')-1) || '].createdAt') AS createdAt,
+            (SELECT min(json_extract(d.data,'$.acceptedAt')) FROM deliveries d WHERE d.exchange_id=e.id AND d.state='accepted'
+              AND json_extract(d.data,'$.lane')='channel' AND json_extract(d.data,'$.contextId') IS NULL
+              AND json_extract(d.data,'$.revision')=json_extract(e.data,'$.revision')) AS presentedAt
+            FROM exchanges e WHERE ${where} AND ${activeExchange}`).all(...params);
+          const match = correlateBare(candidates, event);
+          if (match.candidate) target = { exchange: this.get(match.candidate.id)!.exchange, revision: match.candidate.revision };
+          else result = { eventId: event.eventId, status: "unmatched", code: match.code };
         }
         if (target && !sameRecipient(target.exchange.recipient, { channelId, actorId: event.actorId, conversationId: event.conversationId })) {
           fail("recipient_denied", "Reply does not belong to this recipient.", 403);
@@ -519,6 +537,9 @@ export class SqliteExchangeStore implements ExchangeStore {
       if (error instanceof SeekerError && error.code === "capacity" && target) {
         const count = this.#db.query<{ count: number }, []>("SELECT count(*) AS count FROM inbound WHERE json_extract(data,'$.deferred.disposition.status')='pending'").get()!.count;
         if (count >= limits.deferredInputs) fail("ingress_capacity", "The pending input queue is full; this batch was not acknowledged.", 503);
+        // Reload after the rolled-back content admission; its working object may have changed.
+        const persisted = this.get(target.exchange.id)!.exchange;
+        this.#save(deferInput(persisted, now));
         deferred = { channelId, event, exchangeId: target.exchange.id, revision: target.revision, recordedAt: now, verification: native ? "native" : "channel", disposition: { status: "pending" } };
         result = { eventId: event.eventId, status: "deferred", exchangeId: target.exchange.id, code: "exchange_capacity" };
         this.#correlate(channelId, event.conversationId, event.sourceRef, target.exchange.revisions[target.revision - 1]!.replyHandle);
