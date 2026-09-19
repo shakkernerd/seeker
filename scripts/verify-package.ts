@@ -129,7 +129,7 @@ async function verify(directory: string) {
   };
   const pinned = readFileSync(join(root, ".bun-version"), "utf8").trim();
   check(Bun.version === pinned && manifest.engines.bun === pinned, `Run this check with the package's qualified Bun ${pinned}.`);
-  const required = [manifest.bin.seeker, manifest.exports["."].import, manifest.exports["."].types];
+  const required = [manifest.bin.seeker, manifest.exports["."].import, manifest.exports["."].types, "dist/codex-connector.mjs", "bin/seeker-codex"];
   check(required.every((path) => existsSync(resolve(root, path))), "Built CLI, library or declarations are missing. Run bun run build first.");
 
   phase = "packing and inspecting the distributable";
@@ -147,7 +147,7 @@ async function verify(directory: string) {
     check(name.startsWith("package/") && !parts.some((part) => part === ".." || part === "." || part === "" ||
       ["src", "source", "test", "tests", "node_modules", ".artifacts", ".git"].includes(part)), "The tarball contains an unsafe or private path.");
     check(!/\.(?:key|pem|sqlite(?:-wal|-shm)?|db|log|tgz)$/i.test(relative), "The tarball contains a key, database, log or nested archive.");
-    const allowed = ["package.json", "README.md", "LICENSE", ".bun-version"].includes(relative) ||
+    const allowed = ["package.json", "README.md", "LICENSE", ".bun-version", "bin/", "bin/seeker-codex"].includes(relative) ||
       /^dist\/(?:[a-zA-Z0-9_.-]+\/)*[a-zA-Z0-9_.-]+\.(?:m?js|cjs|d\.[cm]?ts)$/.test(relative) ||
       /^docs\/(?:[a-zA-Z0-9_.-]+\/)*[a-zA-Z0-9_.-]+\.md$/.test(relative) ||
       /^(?:dist|docs)(?:\/[a-zA-Z0-9_.-]+)*\/$/.test(relative);
@@ -179,12 +179,24 @@ async function verify(directory: string) {
   const probe = join(consumer, "verify-exports.mjs");
   writeFileSync(probe, `import * as seeker from ${JSON.stringify(manifest.name)};
 if (!import.meta.resolve(${JSON.stringify(manifest.name)}).startsWith(${JSON.stringify(`${pathToFileURL(realpathSync(installed)).href}/`)})) throw new Error("Package import escaped the fresh installation.");
-for (const name of ["SeekerCore", "DeliveryPump", "SeekerError", "SqliteExchangeStore", "LocalChannel", "createLocalServer", "startRuntime", "defaultDataDir", "ensureDataDir", "loadAccessKey"]) {
+for (const name of ["SeekerCore", "DeliveryPump", "SeekerError", "SqliteExchangeStore", "LocalChannel", "createLocalServer", "startRuntime", "defaultDataDir", "ensureDataDir", "loadAccessKey", "setupCodex", "loadCodexHost"]) {
   if (typeof seeker[name] !== "function") throw new Error("A public library export is missing.");
 }
 if (seeker.version !== ${JSON.stringify(manifest.version)} || seeker.runtimeVersion !== Bun.version || seeker.localRecipient.channelId !== "local") throw new Error("Installed library metadata differs from its CLI.");
 `);
   await run("Installed library import", [process.execPath, probe], consumer);
+
+  phase = "checking installed native setup";
+  const nativeProject = join(directory, "native-project"), nativeData = join(directory, "native-data");
+  mkdirSync(nativeProject);
+  await run("Installed native manager setup", [bin, "codex", "setup", "--project", nativeProject, "--task", "00000000-0000-7000-8000-000000000001", "--label", "Package proof manager", "--data-dir", nativeData], consumer);
+  const projectConfig = Bun.TOML.parse(readFileSync(join(nativeProject, ".codex", "config.toml"), "utf8")) as { mcp_servers?: { seeker?: { command?: string; required?: boolean } } };
+  const launcher = join(installed, "bin", "seeker-codex");
+  check(projectConfig.mcp_servers?.seeker?.command === realpathSync(launcher) && projectConfig.mcp_servers.seeker.required === false && (statSync(launcher).mode & 0o111) !== 0,
+    "Installed setup did not select its executable host launcher without changing required-server policy.");
+  const connector = JSON.parse(readFileSync(join(nativeData, "codex-connector.json"), "utf8")) as { version?: number; socketPath?: string; credentialFile?: string };
+  check(connector.version === 2 && connector.socketPath === join(realpathSync(nativeData), "codex.sock") && connector.credentialFile === join(realpathSync(nativeData), "codex.key") &&
+    (statSync(connector.credentialFile).mode & 0o077) === 0, "Installed native setup did not preserve its private socket and credential boundary.");
 
   phase = "exercising the installed controlled fixture";
   const dataDir = join(directory, "private-data");
@@ -241,5 +253,5 @@ catch (error) {
 }
 if (result) {
   console.log(JSON.stringify({ ...result, elapsedMs: Date.now() - startedAt,
-    proof: "Fresh installed CLI and public exports; controlled fixture question, context, conditioned answer, handled receipt and restart retention." }));
+    proof: "Fresh installed CLI, public exports and private native setup; controlled fixture question, context, conditioned answer, handled receipt and restart retention." }));
 }

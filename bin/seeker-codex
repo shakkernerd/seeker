@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+if [ -z "${CODEX_MCP_NODE_PATH:-}" ] || [ ! -x "$CODEX_MCP_NODE_PATH" ]; then
+  printf '%s\n' 'Seeker requires the runtime supplied by Codex Desktop. Reload its configured MCP server.' >&2
+  exit 1
+fi
+seeker_package_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+exec "$CODEX_MCP_NODE_PATH" "$seeker_package_dir/dist/codex-connector.mjs" "$@"

@@ -8,6 +8,10 @@ import { FixtureHost, seedFixture } from "./local/fixture.ts";
 import { startRuntime } from "./local/runtime.ts";
 import { runTelegramCommand } from "./channels/telegram/cli.ts";
 import { loadTelegram } from "./channels/telegram/runtime.ts";
+import { loadTelegramRecipient } from "./channels/telegram/config.ts";
+import { loadCodexHost } from "./hosts/codex/setup.ts";
+import { runCodexCommand } from "./cli/codex.ts";
+import { localRecipient } from "./local/channel.ts";
 
 const help = `Seeker ${version} — durable conversations with your agent managers
 
@@ -17,6 +21,7 @@ Usage: seeker <command> [options]
   demo                  Try the local channel with a labelled host fixture
   access-key            Print the local browser/CLI access key deliberately
   telegram              Pair or inspect the optional Telegram channel
+  codex setup           Connect an existing Codex Desktop manager
 
 Options:
   --data-dir <path>     Private Seeker store directory
@@ -33,6 +38,18 @@ Pending exchanges survive shutdown. A fixture is not a real agent manager.
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   if (args[0] === "telegram") { await runTelegramCommand(args.slice(1)); return; }
+  if (args[0] === "codex") {
+    await runCodexCommand(args.slice(1), { packageDirectory: resolve(import.meta.dir, ".."), defaultRecipient: localRecipient, resolveRecipient: (dataDir, channel) => {
+      if (channel === "local") return localRecipient;
+      if (channel === "telegram") {
+        const recipient = loadTelegramRecipient(dataDir);
+        if (recipient) return recipient;
+        throw new SeekerError("channel_unavailable", "Pair the Telegram owner before selecting that channel.");
+      }
+      throw new SeekerError("channel_unavailable", "Choose local or an explicitly paired Telegram channel.");
+    } });
+    return;
+  }
   if (args.includes("--help") || args.length === 0) { console.log(help); return; }
   if (args.includes("--version")) { console.log(version); return; }
   const command = args.shift();
@@ -57,25 +74,35 @@ async function main(): Promise<void> {
   const core = new SeekerCore(store);
   let runtime: ReturnType<typeof startRuntime> | undefined;
   let telegram: ReturnType<typeof loadTelegram>;
+  let native: Awaited<ReturnType<typeof loadCodexHost>>;
+  let initializing: Promise<void> | undefined;
   let closing: Promise<void> | undefined;
   const shutdown = (): Promise<void> => closing ??= (async () => {
     runtime?.pump.stop();
-    await telegram?.stopReceiver();
-    if (runtime) await runtime.stop();
+    const failures: unknown[] = [];
+    try { await telegram?.stopReceiver(); } catch (error) { failures.push(error); }
+    await initializing?.catch(() => {});
+    for (const result of await Promise.allSettled([native?.close(), runtime?.stop()])) if (result.status === "rejected") failures.push(result.reason);
     store.close();
     process.removeListener("SIGINT", stop);
     process.removeListener("SIGTERM", stop);
+    if (failures.length) throw new AggregateError(failures, "An adapter could not stop cleanly.");
   })();
-  const stop = () => { void shutdown().catch(() => { process.exitCode = 1; }); };
+  const stop = () => { void shutdown().catch(() => { console.error("Seeker could not completely stop its adapters."); process.exitCode = 1; }); };
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
   try {
-    if (fixture) seedFixture(core);
-    telegram = fixture ? undefined : loadTelegram(core, dataDir, (message) => console.error(`Seeker: ${message}`));
-    await telegram?.startReceiver();
-    if (closing) { await closing; return; }
-    runtime = startRuntime({ core, accessKey, port, mode: fixture ? "fixture" : "local", channels: telegram ? [telegram.channel] : [], hosts: fixture ? [new FixtureHost(core)] : [] });
-    console.log(`Seeker ${version}${fixture ? " · controlled demo fixture" : ""}\nOpen http://127.0.0.1:${runtime.server.port}\nAccess key: ${join(dataDir, "access.key")}\nStore: ${join(dataDir, "exchanges.sqlite")}\nPress Ctrl+C to stop. Pending exchanges will be retained.`);
+    initializing = (async () => {
+      if (fixture) seedFixture(core);
+      native = fixture ? undefined : await loadCodexHost(core, dataDir);
+      if (closing) return;
+      telegram = fixture ? undefined : loadTelegram(core, dataDir, (message) => console.error(`Seeker: ${message}`));
+      await telegram?.startReceiver();
+      if (closing) return;
+      runtime = startRuntime({ core, accessKey, port, mode: fixture ? "fixture" : "local", channels: telegram ? [telegram.channel] : [], hosts: fixture ? [new FixtureHost(core)] : native ? [native.host] : [] });
+      console.log(`Seeker ${version}${fixture ? " · controlled demo fixture" : ""}\nOpen http://127.0.0.1:${runtime.server.port}\nAccess key: ${join(dataDir, "access.key")}\nStore: ${join(dataDir, "exchanges.sqlite")}\nPress Ctrl+C to stop. Pending exchanges will be retained.`);
+    })();
+    await initializing;
   } catch (error) {
     if (closing) { await closing; return; }
     await shutdown();
