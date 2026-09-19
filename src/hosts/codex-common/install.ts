@@ -1,3 +1,4 @@
+import { accessSync, constants } from "node:fs";
 import { isAbsolute } from "node:path";
 import { ConnectorError } from "../codex/protocol.ts";
 
@@ -6,6 +7,10 @@ const endMarker = "# Seeker native connector: end";
 const legacyEnvironment = ["CODEX_APP_TOOLS_PIPE_PATH", "CODEX_MCP_NODE_PATH"];
 const environment = [...legacyEnvironment, "CODEX_HOME", "CODEX_ELECTRON_USER_DATA_PATH", "CODEX_SQLITE_HOME"];
 const runtimePath = (value: unknown): value is string => typeof value === "string" && isAbsolute(value) && !/[\0\r\n]/.test(value);
+function executableRuntime(path: string): boolean {
+  try { accessSync(path, constants.X_OK); return true; }
+  catch { return false; }
+}
 const conversationTools = ["submit", "get", "pending", "update"] as const;
 const approvalModes = ["auto", "prompt", "writes", "approve"] as const;
 const permissionKeys = ["default_tools_approval_mode", "enabled_tools", "disabled_tools", "tools"] as const;
@@ -95,9 +100,9 @@ export function installSection(current: string, launcher: string, configPath: st
     const recordedRuntime = Array.isArray(args) && args.length === 4 && args[2] === "--runtime" && runtimePath(args[3]);
     if (typeof seeker.command !== "string" || !seeker.command.endsWith("/bin/seeker-codex") || !Array.isArray(args) || (!legacyArgs && !recordedRuntime) || args[0] !== "--config" || ![environment, legacyEnvironment].some((value) => JSON.stringify(seeker.env_vars) === JSON.stringify(value))) throw new ConnectorError("setup_conflict", "The Seeker launcher or environment was customized. Preserve or reconcile it before setup.");
     if (args[1] !== configPath) throw new ConnectorError("setup_conflict", "This project already uses a different Seeker data directory. Preserve that connection rather than redirecting every task.");
-    // A later Desktop setup may execute through a different Bun installation.
-    // Keep the already recorded fallback so existing CLI and Desktop setup coexist.
-    if (recordedRuntime) bunRuntime = args[3] as string;
+    // Preserve a usable fallback across Desktop and CLI setup; repair an
+    // unavailable one with the caller's qualified runtime, matching the launcher's -x check.
+    if (recordedRuntime && executableRuntime(args[3] as string)) bunRuntime = args[3] as string;
     for (const key of ["enabled", "required"] as const) {
       if (seeker[key] !== undefined) {
         if (typeof seeker[key] !== "boolean") throw new ConnectorError("setup_conflict", "The Seeker lifecycle settings are invalid.");

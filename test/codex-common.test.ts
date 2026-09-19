@@ -1,11 +1,23 @@
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { conversationPermissionRestrictions, installSection } from "../src/hosts/codex-common/install.ts";
 import { seekerTools } from "../src/hosts/codex/tools.ts";
 import { maxWireBytes } from "../src/hosts/codex/protocol.ts";
 
 const launcher = "/opt/seeker/bin/seeker-codex";
 const configPath = "/private/seeker/codex-connector.json";
-const bunRuntime = "/opt/bun-1.4.2/bin/bun";
+const bunRuntime = process.execPath;
+const runtimeDirectories: string[] = [];
+afterEach(() => { for (const directory of runtimeDirectories.splice(0)) rmSync(directory, { recursive: true, force: true }); });
+function runtimeFixture(): string {
+  const directory = mkdtempSync(join(tmpdir(), "seeker-runtime-"));
+  runtimeDirectories.push(directory);
+  const path = join(directory, "bun");
+  symlinkSync(bunRuntime, path);
+  return path;
+}
 const legacyEnvironment = ["CODEX_APP_TOOLS_PIPE_PATH", "CODEX_MCP_NODE_PATH"];
 const desktopEnvironment = [...legacyEnvironment, "CODEX_HOME", "CODEX_ELECTRON_USER_DATA_PATH", "CODEX_SQLITE_HOME"];
 const prefix = 'model = "fixture-model"\n[permissions]\ndefault = "read-only"\n[mcp_servers.other]\ncommand = "other-tool"\n';
@@ -42,15 +54,28 @@ for (const [name, environment] of [["legacy two-variable", legacyEnvironment], [
   });
 }
 
-test("CLI and Desktop setup coexist in either order without replacing a recorded fallback", () => {
-  const cliFirst = installSection(prefix, launcher, configPath, bunRuntime);
+test("CLI and Desktop setup coexist in either order without replacing a usable recorded fallback", () => {
+  const cliRuntime = runtimeFixture();
+  const cliFirst = installSection(prefix, launcher, configPath, cliRuntime);
   expect(installSection(cliFirst, launcher, configPath)).toBe(cliFirst);
   const desktopFirst = installSection(prefix, launcher, configPath);
-  expect(installSection(desktopFirst, launcher, configPath, bunRuntime)).toBe(desktopFirst);
-  const relocated = installSection(cliFirst, "/opt/updated-seeker/bin/seeker-codex", configPath, "/opt/another-bun/bin/bun");
-  expect(section(relocated).args).toEqual(["--config", configPath, "--runtime", bunRuntime]);
+  expect(installSection(desktopFirst, launcher, configPath, cliRuntime)).toBe(desktopFirst);
+  const relocated = installSection(cliFirst, "/opt/updated-seeker/bin/seeker-codex", configPath, bunRuntime);
+  expect(section(relocated).args).toEqual(["--config", configPath, "--runtime", cliRuntime]);
   expect(section(relocated).command).toBe("/opt/updated-seeker/bin/seeker-codex");
   expect(relocated.match(/\[mcp_servers\.seeker\]/g)).toHaveLength(1);
+});
+
+test.each(["removed", "nonexecutable"] as const)("setup repairs a %s recorded runtime without changing native settings", (unavailable) => {
+  const previousRuntime = runtimeFixture();
+  const original = installSection(`${prefix}${existingSection(desktopEnvironment)}${suffix}`, launcher, configPath, previousRuntime);
+  // Remove the fixture symlink before replacing it; never change the real Bun executable.
+  rmSync(previousRuntime);
+  if (unavailable === "nonexecutable") writeFileSync(previousRuntime, "Unavailable runtime fixture", { mode: 0o600 });
+  const repaired = installSection(original, launcher, configPath, bunRuntime);
+  expect(section(repaired)).toEqual({ ...section(original), args: ["--config", configPath, "--runtime", bunRuntime] });
+  expect(repaired.startsWith(prefix)).toBe(true); expect(repaired.endsWith(suffix)).toBe(true);
+  expect(installSection(repaired, launcher, configPath, bunRuntime)).toBe(repaired);
 });
 
 test("setup rejects data-directory redirection, custom fields and unrecognized launch arguments", () => {
