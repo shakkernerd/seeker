@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Decision, HostAdapter, ManagerBinding } from "../src/contracts";
+import type { Decision, HostAdapter, IngestResult, ManagerBinding } from "../src/contracts";
 import { DeliveryPump } from "../src/core/delivery";
 import { SeekerCore } from "../src/core/seeker";
 import { SqliteExchangeStore } from "../src/store/sqlite";
@@ -37,6 +37,7 @@ async function fixture(dropSendResponse = false) {
   const returned: string[] = [];
   const deferred: string[] = [];
   const notices: string[] = [];
+  const outcomes: IngestResult[] = [];
   const host: HostAdapter = { id: "test-host", deliver: async (binding, envelope) => {
     if ("receipt" in envelope) {
       returned.push(`${binding.origin.managerId}:${envelope.receipt.id}`);
@@ -86,10 +87,17 @@ async function fixture(dropSendResponse = false) {
     expect(pump.inFlight).toBe(0);
     expect(pump.lastError).toBeUndefined();
   }
-  return { bind, sent, updates, calls, returned, deferred, notices, flush, filename,
+  return { bind, sent, updates, calls, returned, deferred, notices, outcomes, flush, filename,
     get store() { return store; }, get core() { return core; }, get channel() { return channel; },
-    advance: () => { now += 2_000; },
-    poll: () => channel.pollOnce(core.channel(channel.id), new AbortController().signal),
+    advance: (ms = 2_000) => { now += ms; },
+    poll: () => {
+      const ingress = core.channel(channel.id);
+      return channel.pollOnce({ ...ingress, receive: (events, progress) => {
+        const result = ingress.receive(events, progress);
+        outcomes.push(...result);
+        return result;
+      } }, new AbortController().signal);
+    },
     restart: () => {
       pump.stop(); store.close();
       store = new SqliteExchangeStore(filename); core = new SeekerCore(store, () => now);
@@ -103,7 +111,7 @@ function reply(updateId: number, text: string, replyTo?: Record<string, unknown>
   return { update_id: updateId, message: { message_id: updateId + 1_000, date: 100, from: { id: 42, is_bot: false }, chat: { id: 42, type: "private" }, text, ...(replyTo ? { reply_to_message: replyTo } : {}) } };
 }
 function click(updateId: number, callbackId: string, message: Record<string, any>, index = 0) {
-  return { update_id: updateId, callback_query: { id: callbackId, from: { id: 42, is_bot: false }, message, data: message.reply_markup.inline_keyboard[index][0].callback_data } };
+  return { update_id: updateId, callback_query: { id: callbackId, chat_instance: "fixture-chat", from: { id: 42, is_bot: false }, message, data: message.reply_markup.inline_keyboard[index][0].callback_data } };
 }
 
 test("real store routes two managers, natural discussion, stale choices and late corrections across restart", async () => {
@@ -275,4 +283,93 @@ test("trusted local-to-Telegram routing affects new requests and preserves old l
   await f.poll(); await f.flush();
   expect(manager.get("old-local").exchange.receipts).toHaveLength(1);
   expect(manager.get("new-telegram").exchange.receipts).toHaveLength(1);
+});
+
+test("buffered and rounded bare replies cannot become answers to newer questions or revisions", async () => {
+  const f = await fixture();
+  const alpha = f.bind("alpha");
+  alpha.submit({ requestId: "old-alpha", decision: decision() });
+  await f.flush(); f.advance();
+  alpha.update({ type: "cancel", requestId: "old-alpha", expectedVersion: 1, reason: "Handled elsewhere" });
+  f.advance();
+  const beta = f.bind("beta");
+  beta.submit({ requestId: "new-beta", decision: decision() });
+  await f.flush();
+  const beforeQuestion = reply(1, "yes"); beforeQuestion.message.date = 1;
+  f.updates.push(beforeQuestion); await f.poll();
+  expect(f.outcomes.at(-1)).toMatchObject({ status: "unmatched", code: "predates_current_revision" });
+  expect(beta.get("new-beta").exchange.receipts).toHaveLength(0);
+  f.advance();
+  beta.update({ type: "revise", requestId: "new-beta", expectedVersion: beta.get("new-beta").exchange.version, decision: decision("preview-two") });
+  await f.flush();
+  const beforeRevision = reply(2, "yes"); beforeRevision.message.date = 5;
+  f.updates.push(beforeRevision); await f.poll();
+  expect(f.outcomes.at(-1)).toMatchObject({ status: "unmatched", code: "predates_current_revision" });
+  f.advance(1_500);
+  beta.update({ type: "revise", requestId: "new-beta", expectedVersion: beta.get("new-beta").exchange.version, decision: decision("preview-three") });
+  await f.flush();
+  const sameSecond = Math.floor(f.core.clock() / 1_000);
+  const uncertain = reply(3, "yes"); uncertain.message.date = sameSecond;
+  f.updates.push(uncertain); await f.poll();
+  expect(f.outcomes.at(-1)).toMatchObject({ status: "unmatched", code: "uncertain_chronology" });
+  const current = f.sent.find((message) => message.text.includes("Publish to preview-three?"))!;
+  const explicit = reply(4, "Only this preview", current); explicit.message.date = sameSecond;
+  f.updates.push(explicit); await f.poll();
+  expect(f.outcomes.at(-1)?.status).toBe("recorded");
+  expect(beta.get("new-beta").exchange.receipts[0]!.source.occurredAtPrecisionMs).toBe(1_000);
+  f.advance();
+  const fresh = reply(5, "One additional condition"); fresh.message.date = Math.floor(f.core.clock() / 1_000);
+  f.updates.push(fresh); await f.poll();
+  expect(f.outcomes.at(-1)?.status).toBe("recorded");
+  expect(beta.get("new-beta").exchange.receipts).toHaveLength(2);
+});
+
+test("forwarded text, external replies and selected quotes never become a bare owner answer", async () => {
+  const f = await fixture();
+  const manager = f.bind("alpha");
+  manager.submit({ requestId: "direct-request", decision: decision() });
+  await f.flush();
+  const original = f.sent[0]!;
+  const context = [
+    { forward_origin: { type: "user", date: 1, sender_user: { id: 99, is_bot: false, first_name: "Fixture" } } },
+    { external_reply: { origin: { type: "channel", date: 1 }, chat: { id: -99, type: "channel" }, message_id: 8 } },
+    { quote: { text: "Only the quoted fragment", position: 0 }, reply_to_message: original },
+  ];
+  context.forEach((fields, index) => {
+    const input = reply(index + 1, "Approve this");
+    f.updates.push({ ...input, message: { ...input.message, ...fields } });
+  });
+  await f.poll();
+  expect(manager.get("direct-request").exchange.receipts).toHaveLength(0);
+  expect(f.sent.filter((message) => message.text.includes("ordinary direct reply"))).toHaveLength(3);
+  f.updates.push(reply(4, "Use staging only", original));
+  await f.poll();
+  expect(manager.get("direct-request").exchange.receipts[0]?.text).toBe("Use staging only");
+});
+
+test("inaccessible callback messages retain authenticated handles while stale revisions remain rejected", async () => {
+  const f = await fixture(true);
+  const manager = f.bind("alpha");
+  manager.submit({ requestId: "inaccessible-request", decision: decision() });
+  await f.flush();
+  const original = f.sent[0]!;
+  const inaccessible = (id: number) => {
+    const event = click(id, `inaccessible-${id}`, original);
+    event.callback_query.message = { message_id: original.message_id, chat: original.chat, date: 0 };
+    return event;
+  };
+  const wrongSender = inaccessible(1); wrongSender.callback_query.from.id = 99;
+  const wrongChat = inaccessible(2); wrongChat.callback_query.message.chat = { id: 99, type: "private" };
+  f.updates.push(wrongSender, wrongChat);
+  await f.poll();
+  expect(manager.get("inaccessible-request").exchange.receipts).toHaveLength(0);
+  f.updates.push(inaccessible(3));
+  await f.poll(); await f.flush();
+  expect(manager.get("inaccessible-request").exchange.receipts).toHaveLength(1);
+  manager.update({ type: "revise", requestId: "inaccessible-request", expectedVersion: manager.get("inaccessible-request").exchange.version, decision: decision("preview-two") });
+  f.advance(); await f.flush();
+  f.updates.push(inaccessible(4));
+  await f.poll();
+  expect(f.outcomes.at(-1)).toMatchObject({ status: "rejected", code: "stale_revision" });
+  expect(manager.get("inaccessible-request").exchange.receipts).toHaveLength(1);
 });

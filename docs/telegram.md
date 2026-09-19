@@ -45,10 +45,11 @@ Every prompt identifies its manager, exchange, and revision, and presents the de
 - Use **More context** to ask that same manager for an explanation. Its answer arrives within the same exchange.
 - Use `/pending` to see open requests, or `/help` for a short reminder of the supported interaction.
 - If several requests are open, a bare reply is ambiguous. Seeker asks you to reply to the intended request instead of selecting the newest manager.
+- Buffered replies cannot answer a newer question that did not exist when they were sent. If Telegram's rounded timestamp leaves the context uncertain, Seeker asks for a direct reply to the intended request.
 - An old choice cannot authorize a materially changed revision. Reply to the current prompt to answer it.
 - Reply with `/correct ...` or `/stop ...` to preserve a later correction, including a correction to an old request. Editing an earlier text answer retains its original correlation; an edit without a recoverable original reference is left unmatched.
 
-Text is the supported input. Photos, voice messages, attachments, and captions are not interpreted as decisions. Seeker responds with the supported text path. Groups, inline-mode interactions, private topics, automatic reminders, urgency exceptions, and public webhooks are outside this first version.
+Your own direct text is the supported input. Photos, voice messages, attachments, captions, forwarded messages, replies to external messages, and selected text quotes are not interpreted as decisions. Seeker asks for an ordinary direct reply to its request so another person's words or partial context cannot become your instruction. Groups, inline-mode interactions, private topics, automatic reminders, urgency exceptions, and public webhooks are outside this first version.
 
 ## Delivery and recovery
 

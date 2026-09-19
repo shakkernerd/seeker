@@ -155,12 +155,17 @@ export class TelegramChannel implements MessagingChannel {
     const messageId = telegramId(message.message_id);
     if (!messageId) return {};
     const common = { actorId: this.#recipient.actorId, conversationId: this.#recipient.conversationId, sourceRef: messageId,
-      ...(!callback && providerTime(message) !== undefined ? { occurredAt: providerTime(message) } : {}),
+      ...(!callback && providerTime(message) !== undefined ? { occurredAt: providerTime(message), occurredAtPrecisionMs: 1_000 } : {}),
     };
     if (callback) {
       if (typeof callback.id !== "string" || callback.id.length > 256) return {};
       const feedback = { callbackId: callback.id };
-      if (typeof callback.data !== "string" || callback.data.length > 64 || !isRecord(message.from) || message.from.is_bot !== true || telegramId(message.from.id) !== this.#api.botId) return { feedback: { ...feedback, text: "This action is unavailable. Reply to the request in text." } };
+      // Telegram's InaccessibleMessage has chat/message identity and date=0, but
+      // no author. The authenticated callback sender/chat and durable handle still apply.
+      const botMessage = isRecord(message.from)
+        ? message.from.is_bot === true && telegramId(message.from.id) === this.#api.botId
+        : message.from === undefined && message.date === 0;
+      if (typeof callback.data !== "string" || callback.data.length > 64 || !botMessage) return { feedback: { ...feedback, text: "This action is unavailable. Reply to the request in text." } };
       const parsed = /^([A-Za-z0-9][A-Za-z0-9_-]{1,60}):(q|[adr]:([A-Za-z0-9][A-Za-z0-9._:-]{0,127}))$/.exec(callback.data);
       const handle = parsed?.[1];
       const action = parsed?.[2];
@@ -173,6 +178,9 @@ export class TelegramChannel implements MessagingChannel {
       return { event: { ...common, sourceRef: callbackReference(callback.id), replyHandle: handle, kind, optionId: parsed![3]!, text: "" }, feedback };
     }
     const feedback = { messageId };
+    if (message.forward_origin !== undefined || message.external_reply !== undefined || message.quote !== undefined) {
+      return { feedback: { ...feedback, text: "Please send your own text as an ordinary direct reply to a Seeker request. Forwarded messages, external replies, and selected quotes are not interpreted as your answer." } };
+    }
     if (typeof message.text !== "string" || !message.text.trim() || message.text.includes("\0") || message.text.length > 4_096) return { feedback: { ...feedback, text: "Seeker supports text replies only (up to 4,096 characters). Please type your answer or question; this input was not interpreted." } };
     const text = message.text.trim();
     if (text === "/start" || text.startsWith("/start ") || text === "/help") return { feedback: { ...feedback, text: "Reply to a Seeker request to answer or ask a question. Use /pending to see open requests. Use /correct or /stop for a correction to an old request. Text only." } };
