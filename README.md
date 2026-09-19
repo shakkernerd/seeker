@@ -30,12 +30,12 @@ The demo is clearly labelled and uses a deterministic host fixture. It changes n
 - **Recoverable answers.** Pending exchanges survive interruption. Changed proposals retire old choices; later corrections and stops remain visible.
 - **Quiet by default.** One prompt per decision, with no recurring reminders.
 
-The local channel is available in this package. Native agent-host connections and messaging providers attach through small typed interfaces; a local demo does not establish a live connection to Codex or Telegram.
+The local channel is available immediately. [Telegram setup](docs/telegram.md) adds an optional private conversation with a deliberately paired owner. Native agent-host connections attach through small typed interfaces; the local demo does not establish a live connection to Codex or Telegram.
 
 ## Use and extend
 
 [Local setup and recovery](docs/local.md) covers authentication, data, startup, and operating limits. [Architecture](docs/architecture.md) explains the component boundaries. [Adapter contracts](docs/adapters.md) describes authenticated origin, reply correlation, and receipts. [Development and packaging](docs/development.md) covers verification and the installable tarball.
 
-Seeker runs as one Bun process with one local SQLite store. It listens on loopback, has no runtime package dependencies, and does not contain an LLM or agent executor.
+Seeker runs as one Bun process with one local SQLite store. It listens on loopback and uses grammY for its optional Telegram adapter. It does not contain an LLM or agent executor.
 
 MIT licensed.

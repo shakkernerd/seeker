@@ -1,6 +1,6 @@
 # Development and packaging
 
-Use Bun 1.4.2, pinned in `.bun-version` and `package.json`. TypeScript and Bun's type declarations are the only development dependencies. Runtime code uses Bun HTTP/SQLite and built-in modules; the lockfile records exact dependency provenance.
+Use Bun 1.4.2, pinned in `.bun-version` and `package.json`. TypeScript and Bun's type declarations are the development dependencies. Core uses Bun HTTP/SQLite and built-in modules; the optional Telegram adapter uses pinned grammY. The lockfile records exact dependency provenance, and [Telegram implementation notes](telegram.md#implementation) explain its SDK and durable polling boundary.
 
 ```sh
 bun install --frozen-lockfile --ignore-scripts
