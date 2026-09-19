@@ -32,7 +32,7 @@ Declared choices use the corresponding `kind` and `optionId`. Free text uses `an
 
 Results distinguish recorded input, duplicate input, rejected stale/invalid scope, unmatched input, and deferred input. A per-exchange capacity limit returns `deferred`: normalized text, conditions, source and target are durably saved, but no decision is applied. Unrelated events and the batch cursor can still commit. The original manager receives a `DeferredEnvelope` and uses `reconcile-input` with current version and evidence to record handling outside the full conversation. Global storage/queue failure still aborts the batch.
 
-A receiver must make unsupported, unmatched, or deferred input visible through its supported channel response. Corrections that edit an existing message use its original `sourceRef` and reply correlation; unchanged metadata-only edits coalesce against that message's latest content, while A/B/A edits remain distinct. A `possible-gap` continuity marker remains visible across subsequent successful polls; successful polling alone cannot prove missing input was recovered.
+A receiver must make unsupported, unmatched, or deferred input visible through its supported channel response. A question revised or closed after a buffered reply cannot make another question its inferred destination; retained presentation/change evidence instead requires clarification. Corrections that edit an existing message use its original `sourceRef` and reply correlation; unchanged metadata-only edits coalesce against that message's latest content, while A/B/A edits remain distinct. A `possible-gap` continuity marker remains visible across subsequent successful polls; successful polling alone cannot prove missing input was recovered.
 
 ## Manager return
 

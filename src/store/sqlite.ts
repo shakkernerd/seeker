@@ -84,6 +84,7 @@ export class SqliteExchangeStore implements ExchangeStore {
         this.#db.run("CREATE INDEX IF NOT EXISTS exchange_history ON exchanges(json_extract(data,'$.createdAt') DESC,id)");
         this.#db.run("CREATE INDEX IF NOT EXISTS deferred_status ON inbound(json_extract(data,'$.deferred.disposition.status'),json_extract(data,'$.deferred.exchangeId'))");
         this.#db.run("CREATE INDEX IF NOT EXISTS inbox_history ON exchanges(json_extract(data,'$.recipient.channelId'),json_extract(data,'$.recipient.actorId'),json_extract(data,'$.recipient.conversationId'),json_extract(data,'$.createdAt') DESC,id)");
+        this.#db.run("CREATE INDEX IF NOT EXISTS inbox_changes ON exchanges(json_extract(data,'$.recipient.channelId'),json_extract(data,'$.recipient.actorId'),json_extract(data,'$.recipient.conversationId'),updated_at)");
         this.#db.run("CREATE INDEX IF NOT EXISTS presented_question ON deliveries(exchange_id,json_extract(data,'$.revision'),json_extract(data,'$.acceptedAt')) WHERE state='accepted' AND json_extract(data,'$.lane')='channel' AND json_extract(data,'$.contextId') IS NULL");
         if (version > 0 && version < 6) {
           this.#db.run(`UPDATE exchanges SET state='reconcile', data=json_set(data,'$.pendingInputs',
@@ -504,7 +505,15 @@ export class SqliteExchangeStore implements ExchangeStore {
               AND json_extract(d.data,'$.lane')='channel' AND json_extract(d.data,'$.contextId') IS NULL
               AND json_extract(d.data,'$.revision')=json_extract(e.data,'$.revision')) AS presentedAt
             FROM exchanges e WHERE ${where} AND ${activeExchange}`).all(...params);
-          const match = correlateBare(candidates, event);
+          // A later revision or closure must not make another formerly ambiguous
+          // question appear unique. Retained presentation/change evidence is enough
+          // to fail closed; two IDs suffice to detect any other changed context.
+          const sourceEnd = (event.occurredAt ?? 0) + (event.occurredAtPrecisionMs ?? 1) - 1;
+          const changed = event.occurredAt === undefined ? [] : this.#db.query<{ id: string }, (string | number)[]>(`SELECT e.id FROM exchanges e
+            WHERE ${where} AND json_extract(e.data,'$.createdAt')<=? AND e.updated_at>?
+            AND EXISTS(SELECT 1 FROM deliveries d WHERE d.exchange_id=e.id AND json_extract(d.data,'$.lane')='channel'
+              AND json_extract(d.data,'$.contextId') IS NULL AND d.state IN ('sending','unknown','accepted')) LIMIT 2`).all(...params, sourceEnd, event.occurredAt);
+          const match = correlateBare(candidates, event, changed.map((item) => item.id));
           if (match.candidate) target = { exchange: this.get(match.candidate.id)!.exchange, revision: match.candidate.revision };
           else result = { eventId: event.eventId, status: "unmatched", code: match.code };
         }

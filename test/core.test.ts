@@ -295,6 +295,58 @@ describe("durable exchange lifecycle", () => {
     expect(channel.receive([event("presented-context", { ...bare, occurredAt: 6_000, occurredAtPrecisionMs: 1_000 })])[0]!.status).toBe("recorded");
   });
 
+  for (const change of ["revise", "cancel", "handle"]) test(`buffered ambiguity survives another manager's later ${change}`, () => {
+    const { store, core, event } = setup();
+    let now = 1_000;
+    const timed = new SeekerCore(store, () => now);
+    const managerA = timed.manager(fixtureBinding.origin);
+    const originB = { ...fixtureBinding.origin, managerId: "manager-b", assignmentId: "work-b" };
+    core.bind({ ...fixtureBinding, id: "binding-b", origin: originB });
+    const managerB = timed.manager(originB);
+    const questionB = managerB.submit({ requestId: "question-b", decision: fixtureDecision });
+    for (let index = 0; index < 2; index += 1) {
+      const send = store.claimDeliveries(4, now)[0]!;
+      store.completeDelivery(send.id, send.attemptId!, { status: "accepted", reference: `presented:${index}` }, now);
+    }
+    now = 3_000;
+    if (change === "revise") managerA.update({ type: "revise", requestId: "request-1", expectedVersion: 1, decision: { ...fixtureDecision, target: "changed destination" } });
+    else if (change === "cancel") managerA.update({ type: "cancel", requestId: "request-1", expectedVersion: 1, reason: "Closed after the buffered reply" });
+    else {
+      const receipt = timed.channel("local").receive([event("close-a")])[0]!;
+      managerA.update({ type: "acknowledge", requestId: "request-1", expectedVersion: managerA.get("request-1").exchange.version, receiptId: receipt.receiptId!, status: "handled", evidenceRef: "native:handled-a" });
+    }
+    now = 5_000;
+    const buffered = event("historically-ambiguous", { replyHandle: undefined, kind: "answer", optionId: undefined, text: "Yes", occurredAt: 2_000, occurredAtPrecisionMs: 1_000 });
+    expect(timed.channel("local").receive([buffered])[0]!.code).toBe("context_changed_since_reply");
+    expect(timed.channel("local").receive([buffered])[0]!.status).toBe("unmatched");
+    expect(managerB.get("question-b").exchange.receipts).toHaveLength(0);
+    expect(timed.channel("local").receive([event("explicit-b", { replyHandle: questionB.exchange.revisions[0]!.replyHandle, kind: "question", optionId: undefined, text: "Clarify B", occurredAt: 2_000 })])[0]!.exchangeId).toBe("question-b");
+    if (change !== "revise") expect(timed.channel("local").receive([event("after-closure", { replyHandle: undefined, kind: "answer", optionId: undefined, text: "Yes to the remaining request", occurredAt: 6_000 })])[0]!.exchangeId).toBe("question-b");
+  });
+
+  for (const lateResult of [false, true]) test(`an escaped earlier send retains ambiguity before ${lateResult ? "a delayed acceptance" : "any send result"}`, () => {
+    const store = new SqliteExchangeStore(":memory:"); openStores.push(store);
+    let now = 1_000;
+    const core = new SeekerCore(store, () => now);
+    core.bind(fixtureBinding);
+    const originB = { ...fixtureBinding.origin, managerId: "manager-b", assignmentId: "work-b" };
+    core.bind({ ...fixtureBinding, id: "binding-b", origin: originB });
+    const managerA = core.manager(fixtureBinding.origin), managerB = core.manager(originB);
+    managerB.submit({ requestId: "question-b", decision: fixtureDecision });
+    const sendB = store.claimDeliveries(4, now)[0]!;
+    store.completeDelivery(sendB.id, sendB.attemptId!, { status: "accepted", reference: "presented-b" }, now);
+    managerA.submit({ requestId: "question-a", decision: fixtureDecision });
+    const sendA = store.claimDeliveries(4, now)[0]!;
+    now = 3_000;
+    managerA.update({ type: "revise", requestId: "question-a", expectedVersion: 1, decision: { ...fixtureDecision, target: "later scope" } });
+    if (lateResult) store.completeDelivery(sendA.id, sendA.attemptId!, { status: "accepted", reference: "accepted-earlier-confirmed-late" }, 3_500);
+    now = 5_000;
+    const result = core.channel("local").receive([{ eventId: "buffered", actorId: "owner", conversationId: "inbox", sourceRef: "message:buffered", kind: "answer", text: "Yes", occurredAt: 2_000 }])[0]!;
+    expect(result.status).toBe("unmatched");
+    expect(result.code).toBe("context_changed_since_reply");
+    expect(managerB.get("question-b").exchange.receipts).toHaveLength(0);
+  });
+
   test("trusted future recipient selection preserves old-channel replies and fixed old routes", () => {
     const { core, manager, channel, event, created } = setup();
     const recipient = { channelId: "other", actorId: "paired-owner", conversationId: "private-chat" };
