@@ -116,10 +116,13 @@ describe("scoped native setup", () => {
     expect(() => installSection(installed, "/opt/new-seeker/bin/seeker-codex", "/another/connector.json")).toThrow("different Seeker data directory");
   });
 
-  test("refuses unrelated or customized seeker settings instead of overwriting permission policy", () => {
+  test("preserves recognized permission policy and refuses unrelated custom settings", () => {
     expect(() => installSection('[mcp_servers.seeker]\ncommand = "mine"\n', "/new", "/config")).toThrow("already exists");
     const installed = installSection("", "/opt/seeker/bin/seeker-codex", "/config");
     const customized = installed.replace("# Seeker native connector: end", 'default_tools_approval_mode = "prompt"\n# Seeker native connector: end');
-    expect(() => installSection(customized, "/newer", "/config")).toThrow("custom settings");
+    const preserved = Bun.TOML.parse(installSection(customized, "/newer/bin/seeker-codex", "/config")) as { mcp_servers: { seeker: { default_tools_approval_mode: string; tools?: unknown } } };
+    expect(preserved.mcp_servers.seeker.default_tools_approval_mode).toBe("prompt");
+    expect(preserved.mcp_servers.seeker.tools).toBeUndefined();
+    expect(() => installSection(customized.replace('default_tools_approval_mode = "prompt"', "custom_native_setting = true"), "/newer/bin/seeker-codex", "/config")).toThrow("custom settings");
   });
 });

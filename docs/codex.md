@@ -135,6 +135,11 @@ server, and a saved task record in a different daemon are not attachment to the
 Desktop task. Requalify native behavior after host updates; the host integration
 interfaces are version-sensitive.
 
+[CLI managers](codex-cli.md) use their own explicitly registered native Unix
+app-server. Both hosts share the same project MCP entry and tool definitions;
+setup preserves their separate private registrations and verifies actual host
+ancestry before selecting either path.
+
 Manager admission uses the individual native task identity supplied by the host,
 checked against explicit registration. Tool arguments cannot select a manager,
 role, recipient or owner generation. Workers sharing a session tree or connector

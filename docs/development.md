@@ -11,7 +11,7 @@ bun run verify:package
 bun run pack
 ```
 
-The build produces `dist/cli.js`, the `dist/index.js` library, and declarations in `dist/types`. Browser assets are embedded in the build. `bun run pack` produces an installable tarball in `.artifacts/packages`; it does not publish to a registry. Package contents exclude local data, keys, tests, development caches, and proof artifacts.
+The build produces `dist/cli.js`, the `dist/index.js` library, declarations in `dist/types`, and the shared Node-compatible `dist/codex-connector.mjs` used by `bin/seeker-codex`. The native entry selects Desktop or CLI from verified process ancestry and serves the same MCP definitions. Browser assets are embedded in the build. `bun run pack` produces an installable tarball in `.artifacts/packages`; it does not publish to a registry. Package contents exclude local data, keys, tests, development caches, and proof artifacts.
 
 Install that tarball into a separate consumer directory with `bun add /absolute/path/to/the.tgz`, then run its `node_modules/.bin/seeker --help` or `demo`. The CLI's Bun shebang requires the pinned Bun version on PATH. The package remains private to prevent accidental registry publication; local tarball installation works normally.
 
