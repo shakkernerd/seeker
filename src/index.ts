@@ -9,3 +9,4 @@ export { startRuntime, type RuntimeOptions } from "./local/runtime.ts";
 export { defaultDataDir, ensureDataDir, loadAccessKey, version, runtimeVersion } from "./local/config.ts";
 export { createTelegramChannel, type TelegramReceiver } from "./channels/telegram/index.ts";
 export { loadTelegramRecipient } from "./channels/telegram/config.ts";
+export { loadCodexHost, setupCodex, type CodexSetupOptions } from "./hosts/codex/setup.ts";

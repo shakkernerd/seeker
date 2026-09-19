@@ -30,7 +30,7 @@ The demo is clearly labelled and uses a deterministic host fixture. It changes n
 - **Recoverable answers.** Pending exchanges survive interruption. Changed proposals retire old choices; later corrections and stops remain visible.
 - **Quiet by default.** One prompt per decision, with no recurring reminders.
 
-The local channel is available immediately. [Telegram setup](docs/telegram.md) adds an optional private conversation with a deliberately paired owner. Native agent-host connections attach through small typed interfaces; the local demo does not establish a live connection to Codex or Telegram.
+The local channel is available immediately. [Codex Desktop setup](docs/codex.md) connects an existing manager and returns replies to that same task. [Telegram setup](docs/telegram.md) adds an optional private conversation with a deliberately paired owner. The local demo uses its labelled fixture; live connections are configured separately.
 
 ## Use and extend
 

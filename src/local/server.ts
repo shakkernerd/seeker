@@ -15,7 +15,6 @@ export interface LocalServerOptions {
   accessKey: string;
   port?: number;
   mode?: "local" | "fixture";
-  hostHandler?: (request: Request, server: Server<undefined>) => Response | undefined | Promise<Response | undefined>;
 }
 
 function equal(a: string, b: string): boolean {
@@ -70,15 +69,11 @@ export function createLocalServer(options: LocalServerOptions): Server<undefined
   const server = Bun.serve<undefined>({
     hostname: "127.0.0.1", port: options.port ?? 4317,
     maxRequestBodySize: 65_536, idleTimeout: 10,
-    async fetch(request, server) {
+    async fetch(request) {
       try {
         const url = new URL(request.url);
         if (request.headers.get("host") !== new URL(base).host || url.origin !== base) fail("host_denied", "Use the exact local Seeker address.", 403);
         const path = url.pathname;
-        if (options.hostHandler) {
-          const response = await options.hostHandler(request, server);
-          if (response) return response;
-        }
         if (request.method === "GET") {
           if (path === "/favicon.ico") return new Response(null, { status: 204, headers: securityHeaders });
           const assets: Record<string, [string, string]> = {
