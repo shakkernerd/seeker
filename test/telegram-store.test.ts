@@ -159,3 +159,43 @@ test("lost send response remains unknown without retry, but an authenticated rep
   expect(f.store.get("lost-send")!.exchange.receipts[0]!.kind).toBe("question");
   expect(f.returned[0]).toStartWith("alpha:");
 });
+
+test("editing a bare answer keeps its original manager after that request is handled", async () => {
+  const f = await fixture();
+  const alpha = f.bind("alpha");
+  alpha.submit({ requestId: "alpha-request", decision: decision() });
+  await f.flush();
+  const original = reply(1, "Proceed with the preview");
+  f.updates.push(original);
+  await f.poll(); await f.flush();
+  const receipt = alpha.get("alpha-request").exchange.receipts[0]!;
+  alpha.update({ type: "acknowledge", requestId: "alpha-request", receiptId: receipt.id, status: "handled", evidenceRef: "controlled:handled", expectedVersion: alpha.get("alpha-request").exchange.version });
+  expect(alpha.get("alpha-request").exchange.state).toBe("handled");
+  const beta = f.bind("beta");
+  beta.submit({ requestId: "beta-request", decision: decision() });
+  f.advance(); await f.flush();
+  f.restart();
+  f.updates.push({ update_id: 2, edited_message: { ...original.message, text: "Stop; I changed my mind", edit_date: 101 } });
+  await f.poll(); await f.flush();
+  expect(f.store.get("alpha-request")!.exchange.receipts.at(-1)).toMatchObject({ kind: "correction", classification: "correction", text: "Stop; I changed my mind" });
+  expect(f.store.get("beta-request")!.exchange.receipts).toHaveLength(0);
+  expect(f.returned.at(-1)).toStartWith("alpha:");
+});
+
+test("late stop on an uncertain send remains correlated after its answer was handled", async () => {
+  const f = await fixture(true);
+  const manager = f.bind("alpha");
+  manager.submit({ requestId: "lost-send", decision: decision() });
+  await f.flush();
+  const original = f.sent[0]!;
+  f.updates.push(click(1, "answer-on-unknown-send", original));
+  await f.poll(); await f.flush();
+  const receipt = manager.get("lost-send").exchange.receipts[0]!;
+  manager.update({ type: "acknowledge", requestId: "lost-send", receiptId: receipt.id, status: "handled", evidenceRef: "controlled:handled", expectedVersion: manager.get("lost-send").exchange.version });
+  expect(f.core.channel(f.channel.id).pending(recipient)).toHaveLength(0);
+  f.restart();
+  f.updates.push(reply(2, "/stop Do not publish anything else", original));
+  await f.poll(); await f.flush();
+  expect(f.store.get("lost-send")!.exchange.receipts.at(-1)).toMatchObject({ kind: "stop", classification: "correction", revision: 1 });
+  expect(f.store.get("lost-send")!.exchange.state).toBe("reconcile");
+});
