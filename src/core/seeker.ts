@@ -1,15 +1,21 @@
 import type { ChannelIngress, ExchangeStore, ExchangeView, InboundReply, ManagerBinding, ManagerOrigin, ManagerPort, Recipient } from "../contracts.ts";
-import { fail, id, origin as validateOrigin } from "./validation.ts";
+import { fail, id, origin as validateOrigin, sameRecipient } from "./validation.ts";
 
 /** Trusted composition owns this object. Expose only a bound ManagerPort to agent tools. */
 export class SeekerCore {
   constructor(readonly store: ExchangeStore, readonly clock: () => number = Date.now) {}
 
   bind(binding: ManagerBinding): void { this.store.bind(binding); }
+  setRecipient(bindingId: string, expectedGeneration: number, recipient: Recipient): void {
+    this.store.setRecipient(bindingId, expectedGeneration, recipient);
+  }
 
   managerBinding(hostId: string, managerId: string): ManagerBinding | undefined {
     return this.store.findBinding(hostId, managerId);
   }
+
+  resumeHost(hostId: string): number { return this.store.resumeRoute("host", id(hostId, "Host"), this.clock()); }
+  resumeChannel(channelId: string): number { return this.store.resumeRoute("channel", id(channelId, "Channel"), this.clock()); }
 
   manager(input: ManagerOrigin): ManagerPort {
     const origin = Object.freeze(validateOrigin(input));
@@ -48,4 +54,10 @@ export class SeekerCore {
   }
 
   inbox(recipient: Recipient): ExchangeView[] { return this.store.list({ recipient }); }
+  history(recipient: Recipient, cursor?: string) { return this.store.history(recipient, cursor); }
+  forRecipient(requestId: string, recipient: Recipient): ExchangeView {
+    const view = this.store.get(id(requestId, "Request"));
+    if (!view || !sameRecipient(view.exchange.recipient, recipient)) fail("not_found", "Exchange not found.", 404);
+    return view;
+  }
 }

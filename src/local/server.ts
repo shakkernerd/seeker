@@ -115,11 +115,10 @@ export function createLocalServer(options: LocalServerOptions): Server<undefined
           return json({ signedOut: true }, 200, { "Set-Cookie": "seeker_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0" });
         }
         if (path === "/api/exchanges" && request.method === "GET") return json(options.core.inbox(localRecipient));
+        if (path === "/api/history" && request.method === "GET") return json(options.core.history(localRecipient, url.searchParams.get("cursor") ?? undefined));
         if (path.startsWith("/api/exchanges/") && request.method === "GET") {
           const id = decodeURIComponent(path.slice("/api/exchanges/".length));
-          const view = options.core.inbox(localRecipient).find((item) => item.exchange.id === id);
-          if (!view) fail("not_found", "Exchange not found.", 404);
-          return json(view);
+          return json(options.core.forRecipient(id, localRecipient));
         }
         if (path === "/api/replies" && request.method === "POST") {
           const input = await body(request);

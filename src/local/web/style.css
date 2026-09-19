@@ -60,6 +60,10 @@ textarea[readonly] { background: #f2f4f0; }
 .item-state { font-size: 10px; color: var(--teal); margin-top: 2px; }
 .inbox-footnote { margin: 24px 4px 0; color: var(--muted); font-size: 10px; line-height: 1.7; max-width: 185px; }
 .inbox-empty { padding: 20px 4px; font-size: 13px; color: var(--muted); }
+.history-controls { display: flex; flex-wrap: wrap; gap: 7px; margin: 18px 3px 0; }
+.history-controls .quiet-button { font-size: 11px; }
+.history-note { margin: 8px 3px 0; font-size: 10px; color: var(--muted); line-height: 1.6; }
+.history-origin { margin-top: 6px; color: var(--muted); font-size: 10px; }
 .conversation { min-width: 0; border-left: 1px solid var(--border); padding: 3px 0 25px 36px; }
 .exchange-heading { margin-bottom: 24px; }
 .title-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 15px; margin: 10px 0; }
@@ -96,6 +100,7 @@ textarea[readonly] { background: #f2f4f0; }
 .message p { font-size: 13px; line-height: 1.75; white-space: pre-wrap; overflow-wrap: anywhere; }
 .message .message-conditions { margin-top: 10px; padding-top: 10px; border-top: 1px solid #d9e2d4; font-size: 12px; }
 .message .message-status { color: var(--muted); font-size: 10px; line-height: 1.65; margin-top: 12px; }
+.message.saved-input .message-status { color: var(--orange); font-weight: 600; }
 .composer { background: #fff; border: 1px solid var(--border); border-radius: 12px; padding: 22px; margin-top: 23px; }
 .compose-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 15px; }
 .compose-heading label { font-size: 13px; font-weight: 600; }

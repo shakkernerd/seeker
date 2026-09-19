@@ -36,6 +36,8 @@
         <p class="inbox-description">A question. A decision. A next step.</p>
         <nav id="request-list" class="request-list" aria-label="Requests"></nav>
         <p id="inbox-empty" class="inbox-empty" hidden>No requests yet.</p>
+        <div class="history-controls" aria-label="Inbox history"><button id="older-history" class="quiet-button" type="button">Older history</button><button id="recent-only" class="quiet-button" type="button" disabled>Recent only</button></div>
+        <p id="history-note" class="history-note" role="status" hidden></p>
         <p class="inbox-footnote">Every reply stays with its original request.</p>
       </aside>
       <main class="conversation" id="conversation">
@@ -50,6 +52,7 @@
             <p id="manager" class="eyebrow"></p>
             <div class="title-row"><h1 id="title"></h1><span id="state" class="status-badge"></span></div>
             <p id="receipt-status" class="receipt-status" role="status"></p>
+            <p id="history-origin" class="history-origin" hidden>Opened from retained history.</p>
           </header>
           <section class="request-card" aria-label="Current request">
             <div class="section-kicker"><span id="request-kind"></span><span id="revision"></span></div>

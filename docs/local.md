@@ -37,7 +37,9 @@ The data directory must be private (mode 700) and owned by the current user. The
 
 Close with Ctrl+C or SIGTERM. Restart with the same data directory. A browser reconnects and can sign in again; accepted replies and request identities remain in the store. An answer received while the manager is offline stays pending for that manager. No replacement task is created.
 
-An interrupted external send becomes `unknown` because it may already have succeeded. Seeker does not automatically repeat an uncertain operation. The manager/adapter reconciles against the original endpoint and reads the durable receipt. Definite retry failures respect their delay hints and exhaust after five attempts; this never deletes the answer.
+An interrupted external send becomes `unknown` because it may already have succeeded. Seeker does not automatically repeat an uncertain operation. A failed or uncertain channel contact produces one status notice for the original manager; it is not a human response. The manager can inspect the exchange and use the native attention path. Failure to deliver that notice does not create another notice.
+
+Definite retry failures respect their delay hints and exhaust after five attempts; this never deletes the answer. Starting a configured adapter or restoring its authenticated connection can resume known-unaccepted exhausted work through the core recovery method. Retry deadlines remain in force. Unknown sends and permanent rejections are never automatically requeued.
 
 The local page receives no input while its server is stopped, and an unsent draft exists only in its current browser tab. A provider adapter must separately report its receive-outage limits. Seeker cannot recover a provider reply that expired before intake.
 
@@ -47,6 +49,10 @@ The store is SQLite with WAL, full synchronous commits, and exclusive writer own
 
 Keep `exchanges.sqlite` and its WAL sidecars together. Stop Seeker before copying the whole private data directory for backup. Restoring an older backup requires reconciliation with the real host and existing user decisions before relying on its state; restoration is not proof that an action remains unhandled.
 
-No automatic deletion is implemented. Bounds are 1,000 retained exchanges, 32 revisions per exchange, 128 replies, 128 contextual messages, 256 KiB per exchange, and 100,000 source event identities. Requests and replies are bounded before acceptance. Capacity errors preserve existing records and do not acknowledge input they could not save. Use the original manager conversation if intake cannot complete; do not delete open exchanges to clear a warning.
+No automatic deletion is implemented. At most 1,000 exchanges are active. Handled and cancelled records remain available without using active capacity. The inbox shows active work and 50 recent handled records; use **Older history** or a retained request link for earlier records. History is fetched in bounded, indexed pages. Source-event identities remain retained for replay protection.
+
+Each exchange admits at most 32 decision revisions, 128 replies, 128 contextual messages, and 256 KiB of decision/conversation content. Manager dispositions are stored separately so a full conversation can still be acknowledged, cancelled, or transferred. The view includes the current and previous owner disposition; older owner records remain stored. These are exchange receipts, not a mirror of an agent conversation.
+
+If one exchange fills, authenticated incoming text and conditions are saved as deferred input for its original manager, without applying a decision. Other exchanges and receiver progress continue. The UI distinguishes this state, and the manager explicitly reconciles the saved input against existing work. The pending deferred-input queue is bounded at 1,000; handled input remains retained history. A global storage/queue failure does not acknowledge an input batch. Use the original manager conversation while intake is unavailable; do not delete open exchanges to clear a warning.
 
 For an occupied port, choose another port. For `store_in_use`, stop the existing owner instead of opening another writer. For an unsafe directory/key error, repair the stated ownership/permissions while Seeker is stopped. Logs contain operational status, not message text, keys, or raw provider URLs.

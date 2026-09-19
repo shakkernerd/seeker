@@ -3,6 +3,8 @@ const views = new Map();
 const drafts = new Map();
 const rows = new Map();
 let session, selectedId, refreshing = false, detailKey = "", materialKey = "";
+let recentViews = [], olderViews = [], historyCursor, nextHistoryCursor;
+let historyStarted = false, historyEnded = false, historyBusy = false, historyRequested = false, historyGeneration = 0, selectedLoad;
 const kindNames = { approve: "Approval", decline: "Declined", answer: "Reply", question: "Question", acknowledge: "Acknowledged", correction: "Correction", stop: "Stop request" };
 
 function node(tag, className, text) {
@@ -23,11 +25,13 @@ function draftFor(view) {
   return drafts.get(view.exchange.id);
 }
 function time(value) { return new Date(value).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }); }
+function pendingDeferred(view) { return (view.deferredReplies || []).some((item) => item.disposition.status === "pending"); }
+function deferredStatus(item) { return item.disposition.status === "handled" ? "Manager reconciled saved input" : "Saved for manager review · no decision applied"; }
 function receiptStatus(receipt, view) {
   if (receipt.disposition.status === "handled") return "Response recorded · Manager handled";
   if (receipt.disposition.status === "received") return "Response recorded · Manager received";
   if (receipt.disposition.status === "unknown") return "Response recorded · Manager outcome unconfirmed";
-  const delivery = view.deliveries.find((item) => item.lane === "host" && item.receiptId === receipt.id && item.state !== "retired");
+  const delivery = view.deliveries.findLast((item) => item.lane === "host" && item.receiptId === receipt.id && item.state !== "retired" && item.ownerGeneration === view.exchange.origin.generation);
   if (delivery?.state === "accepted") return "Response recorded · Host accepted; waiting for the manager to confirm receipt";
   if (delivery?.state === "unknown") return "Response recorded · Delivery unconfirmed; awaiting reconciliation";
   if (delivery?.state === "rejected") return "Response recorded · Delivery needs attention; manager receipt unconfirmed";
@@ -35,6 +39,7 @@ function receiptStatus(receipt, view) {
 }
 function status(view) {
   const exchange = view.exchange;
+  if (pendingDeferred(view)) return "Saved input needs review";
   if (exchange.state === "cancelled") return "Cancelled";
   if (exchange.state === "handled") return "Manager handled";
   if (exchange.state === "reconcile") return "Follow-up needs review";
@@ -79,14 +84,15 @@ $("login-form").addEventListener("submit", async (event) => {
 });
 $("logout").addEventListener("click", async () => {
   $("logout").disabled = true;
-  try { await api("/api/logout", {}); drafts.clear(); views.clear(); rows.clear(); $("request-list").replaceChildren(); selectedId = undefined; detailKey = materialKey = ""; showLogin(); }
+  try { await api("/api/logout", {}); drafts.clear(); views.clear(); rows.clear(); recentViews = []; resetHistory(); selectedLoad = undefined; $("request-list").replaceChildren(); selectedId = undefined; detailKey = materialKey = ""; showLogin(); }
   catch { connection("Could not lock · retry", "offline"); }
   finally { $("logout").disabled = false; }
 });
 function renderList() {
-  const items = [...views.values()].sort((a, b) => b.exchange.createdAt - a.exchange.createdAt);
+  const listed = new Map([...olderViews, ...recentViews].map((view) => [view.exchange.id, views.get(view.exchange.id) || view]));
+  const items = [...listed.values()].sort((a, b) => b.exchange.createdAt - a.exchange.createdAt || a.exchange.id.localeCompare(b.exchange.id));
   $("count").textContent = String(items.length); $("inbox-empty").hidden = items.length > 0;
-  for (const [id, row] of rows) if (!views.has(id)) { row.remove(); rows.delete(id); }
+  for (const [id, row] of rows) if (!listed.has(id)) { row.remove(); rows.delete(id); }
   items.forEach((view, index) => {
     const exchange = view.exchange;
     let row = rows.get(exchange.id);
@@ -132,15 +138,24 @@ function renderMessages(view) {
   const events = [
     ...exchange.context.map((message) => ({ at: message.createdAt, sequence: message.sequence, message })),
     ...exchange.receipts.map((receipt) => ({ at: receipt.source.recordedAt, sequence: receipt.sequence, receipt })),
+    ...(view.deferredReplies || []).map((deferred) => ({ at: deferred.recordedAt, deferred })),
   ].sort((a, b) => a.sequence !== undefined && b.sequence !== undefined ? a.sequence - b.sequence || a.at - b.at : a.at - b.at);
-  $("messages").replaceChildren(...events.map(({ at, message, receipt }) => {
-    const item = node("li", `message${receipt ? " reply" : ""}${receipt?.classification === "correction" || receipt?.kind === "stop" ? " correction" : ""}`);
+  $("messages").replaceChildren(...events.map(({ at, message, receipt, deferred }) => {
+    const input = receipt || deferred?.event || message;
+    const revision = deferred?.revision ?? input.revision;
+    const item = node("li", `message${receipt || deferred ? " reply" : ""}${deferred || receipt?.classification === "correction" || receipt?.kind === "stop" ? " correction" : ""}${deferred ? " saved-input" : ""}`);
     const heading = node("div", "message-heading");
-    const label = receipt ? `You · ${kindNames[receipt.kind]}${receipt.classification === "correction" && !["stop", "correction"].includes(receipt.kind) ? " · Later change" : ""}` : exchange.managerLabel;
-    heading.append(node("span", "", `${label} · Revision ${(receipt || message).revision}`), node("time", "", time(at)));
-    item.append(heading, node("p", "", (receipt || message).text));
-    if (receipt?.conditions) item.append(node("p", "message-conditions", `Conditions: ${receipt.conditions}`));
+    const label = deferred ? `You · Saved input · ${kindNames[input.kind]}` : receipt ? `You · ${kindNames[receipt.kind]}${receipt.classification === "correction" && !["stop", "correction"].includes(receipt.kind) ? " · Later change" : ""}` : exchange.managerLabel;
+    heading.append(node("span", "", `${label} · Revision ${revision}`), node("time", "", time(at)));
+    item.append(heading);
+    if (input.text) item.append(node("p", "", input.text));
+    if (deferred?.event.optionId) {
+      const option = exchange.revisions.find((entry) => entry.number === revision)?.decision.options.find((entry) => entry.id === deferred.event.optionId);
+      item.append(node("p", "", `Requested choice: ${option ? `${option.label} — ${option.meaning}` : deferred.event.optionId}`));
+    }
+    if (input.conditions) item.append(node("p", "message-conditions", `Conditions: ${input.conditions}`));
     if (receipt) item.append(node("p", "message-status", receiptStatus(receipt, view) + (receipt.disposition.note ? ` · ${receipt.disposition.note}` : "")));
+    if (deferred) item.append(node("p", "message-status", deferredStatus(deferred) + (deferred.disposition.note ? ` · ${deferred.disposition.note}` : "")));
     return item;
   }));
 }
@@ -173,13 +188,21 @@ function renderComposer(view) {
 }
 function renderDetail(force = false) {
   const view = views.get(selectedId); $("empty").hidden = Boolean(view); $("exchange").hidden = !view;
-  if (!view) { emptyMessage(selectedId ? "This request is not available." : "Nothing needs your attention.", selectedId ? "Check the request link, or choose a request from your inbox." : "When your manager asks something, it will appear here. You can leave this inbox open.", selectedId ? "?" : "✓"); return; }
+  if (!view) {
+    if (selectedLoad?.status === "loading" && selectedLoad.id === selectedId) emptyMessage("Loading this request…", "Opening its saved conversation.", "…");
+    else if (selectedLoad?.status === "offline" && selectedLoad.id === selectedId) emptyMessage("This request is temporarily unavailable.", "Keep this tab open. Seeker will try again when the local service is available.", "…");
+    else emptyMessage(selectedId ? "This request is not available." : "Nothing needs your attention.", selectedId ? "Check the request link, or choose a request from your inbox." : "When your manager asks something, it will appear here. You can leave this inbox open.", selectedId ? "?" : "✓");
+    return;
+  }
+  $("history-origin").hidden = recentViews.some((item) => item.exchange.id === selectedId);
   const key = JSON.stringify(view); if (!force && key === detailKey) return; detailKey = key;
   $("manager").textContent = `FROM ${view.exchange.managerLabel}`;
   $("title").textContent = currentRevision(view).decision.title;
-  $("state").textContent = status(view); $("state").classList.toggle("attention", ["waiting", "reconcile"].includes(view.exchange.state));
+  $("state").textContent = status(view); $("state").classList.toggle("attention", pendingDeferred(view) || ["waiting", "reconcile"].includes(view.exchange.state));
   const latest = [...view.exchange.receipts].reverse().find((item) => item.revision === view.exchange.revision || (item.classification === "correction" && item.disposition.status !== "handled"));
-  $("receipt-status").textContent = latest ? receiptStatus(latest, view) : "Available locally · Your response will stay with this request.";
+  const pending = (view.deferredReplies || []).find((item) => item.disposition.status === "pending");
+  const latestSaved = [...(view.deferredReplies || [])].sort((a, b) => b.recordedAt - a.recordedAt)[0];
+  $("receipt-status").textContent = pending ? deferredStatus(pending) : latestSaved && (!latest || latestSaved.recordedAt >= latest.source.recordedAt) ? deferredStatus(latestSaved) : latest ? receiptStatus(latest, view) : "Available locally · Your response will stay with this request.";
   const newMaterialKey = JSON.stringify([view.exchange.id, view.exchange.revisions]);
   const focusedChoiceChanged = newMaterialKey !== materialKey && $("options").contains(document.activeElement);
   if (newMaterialKey !== materialKey) { materialKey = newMaterialKey; renderRequest(view); }
@@ -188,24 +211,99 @@ function renderDetail(force = false) {
   notice("cancellation", view.exchange.cancellation ? `Manager cancelled this request: ${view.exchange.cancellation.reason}` : "");
 }
 function select(id, updateHash = true) {
-  if (selectedId !== id) { selectedId = id; detailKey = ""; materialKey = ""; }
+  if (!id) id = recentViews.find((view) => pendingDeferred(view) || ["waiting", "reconcile"].includes(view.exchange.state))?.exchange.id || recentViews[0]?.exchange.id;
+  if (selectedId !== id) { selectedId = id; selectedLoad = undefined; detailKey = ""; materialKey = ""; }
   if (updateHash && id) history.replaceState(null, "", `#exchange=${encodeURIComponent(id)}`);
+  rebuildViews();
+  if (id && !views.has(id)) selectedLoad = { id, status: "loading" };
   renderList(); renderDetail(true);
+  if (id && !recentViews.some((item) => item.exchange.id === id)) refresh();
 }
 function emptyMessage(title, copy, mark) { $("empty-title").textContent = title; $("empty-copy").textContent = copy; $("empty-mark").textContent = mark; }
 function hashId() { try { return new URLSearchParams(location.hash.slice(1)).get("exchange"); } catch { return null; } }
-function recorded(draft) {
-  Object.assign(draft, { text: "", conditions: "", kind: "answer", optionId: undefined, attempt: undefined, sending: false, error: false, notice: "Your response is recorded. Its manager status appears in the conversation." });
+function hasDraft(draft) { return draft.attempt || draft.text.trim() || draft.conditions.trim() || draft.optionId; }
+function rebuildViews() {
+  // Keep one older page and the open record; discard other browsed history.
+  const opened = views.get(selectedId);
+  views.clear();
+  for (const view of [...olderViews, ...recentViews]) views.set(view.exchange.id, view);
+  if (opened && !views.has(selectedId)) views.set(selectedId, opened);
+  for (const [id, draft] of drafts) if (!views.has(id) && !hasDraft(draft)) drafts.delete(id);
+}
+function historyControls() {
+  $("older-history").disabled = historyBusy || historyEnded;
+  $("older-history").textContent = historyBusy ? "Loading…" : "Older history";
+  $("recent-only").disabled = historyBusy || !historyStarted;
+}
+function resetHistory() {
+  historyGeneration++;
+  olderViews = []; historyCursor = nextHistoryCursor = undefined;
+  historyStarted = historyEnded = historyBusy = historyRequested = false;
+  notice("history-note"); historyControls();
+}
+function historySummary() {
+  notice("history-note", olderViews.length ? historyEnded ? "Showing the oldest saved requests." : "Showing one page of older requests." : historyStarted ? "No older requests." : "");
+}
+$("older-history").addEventListener("click", () => {
+  if (!session || historyBusy || historyEnded) return;
+  historyBusy = historyRequested = true;
+  notice("history-note", "Opening older requests…"); historyControls(); refresh();
+});
+$("recent-only").addEventListener("click", () => {
+  resetHistory(); rebuildViews(); renderList(); renderDetail(); $("older-history").focus();
+});
+function recorded(draft, deferred = false) {
+  Object.assign(draft, { text: "", conditions: "", kind: "answer", optionId: undefined, attempt: undefined, sending: false, error: false, notice: deferred ? "Your input is saved for reconciliation. No decision was applied by this submission." : "Your response is recorded. Its manager status appears in the conversation." });
+}
+function reconcileAttempt(view) {
+  const draft = drafts.get(view.exchange.id);
+  if (!draft?.attempt) return;
+  if (view.exchange.receipts.some((item) => item.source.eventId === draft.attempt.eventId)) recorded(draft);
+  else if ((view.deferredReplies || []).some((item) => item.event.eventId === draft.attempt.eventId)) recorded(draft, true);
 }
 async function refresh() {
   if (!session || refreshing || document.hidden) return;
-  refreshing = true; const owner = session;
+  refreshing = true; const owner = session, browseOlder = historyRequested, browsingGeneration = historyGeneration;
+  historyRequested = false;
+  let checkedSelection = selectedId;
   try {
     const result = await api("/api/exchanges"); if (session !== owner) return;
-    views.clear(); for (const view of result) views.set(view.exchange.id, view);
-    for (const view of result) { const draft = drafts.get(view.exchange.id); if (draft?.attempt && view.exchange.receipts.some((item) => item.source.eventId === draft.attempt.eventId)) recorded(draft); }
+    recentViews = result;
+    if (!selectedId) selectedId = hashId() || result.find((view) => pendingDeferred(view) || ["waiting", "reconcile"].includes(view.exchange.state))?.exchange.id || result[0]?.exchange.id;
+    checkedSelection = selectedId;
+    if (browseOlder) {
+      const cursor = historyStarted ? nextHistoryCursor : (await api("/api/history")).nextCursor;
+      if (session !== owner) return;
+      if (cursor) {
+        const page = await api(`/api/history?cursor=${encodeURIComponent(cursor)}`); if (session !== owner) return;
+        if (historyGeneration === browsingGeneration) {
+          historyStarted = true; historyCursor = cursor; olderViews = page.items; nextHistoryCursor = page.nextCursor; historyEnded = !page.nextCursor;
+        }
+      } else if (historyGeneration === browsingGeneration) { historyStarted = true; historyEnded = true; }
+      if (historyGeneration === browsingGeneration) historySummary();
+    } else if (historyCursor) {
+      const page = await api(`/api/history?cursor=${encodeURIComponent(historyCursor)}`); if (session !== owner) return;
+      if (historyGeneration === browsingGeneration) { olderViews = page.items; nextHistoryCursor = page.nextCursor; historyEnded = !page.nextCursor; historySummary(); }
+    }
+    rebuildViews();
+    const target = selectedId;
+    checkedSelection = target;
+    if (target && ![...recentViews, ...olderViews].some((item) => item.exchange.id === target) && !(selectedLoad?.status === "missing" && selectedLoad.id === target)) {
+      selectedLoad = { id: target, status: "loading" }; if (!views.has(target)) renderDetail();
+      try {
+        const view = await api(`/api/exchanges/${encodeURIComponent(target)}`); if (session !== owner) return;
+        if (selectedId === target) { views.set(target, view); selectedLoad = undefined; }
+      } catch (error) {
+        if (session !== owner) return;
+        if (error.status === 401) throw error;
+        if (selectedId === target) {
+          if ([400, 403, 404].includes(error.status)) { views.delete(target); selectedLoad = { id: target, status: "missing" }; }
+          else { selectedLoad = { id: target, status: "offline" }; throw error; }
+        }
+      }
+    }
+    for (const view of views.values()) reconcileAttempt(view);
     connection("Connected", "online"); $("offline").hidden = true;
-    if (!selectedId) selectedId = hashId() || result.find((view) => ["waiting", "reconcile"].includes(view.exchange.state))?.exchange.id || result[0]?.exchange.id;
     renderList(); renderDetail();
   } catch (error) {
     if (session !== owner) return;
@@ -213,10 +311,15 @@ async function refresh() {
     else {
       connection("Offline · reconnecting", "offline"); $("offline").hidden = false;
       $("offline").textContent = views.size ? "Connection lost. Showing the last loaded requests while Seeker reconnects. Your drafts stay in this tab." : "Seeker is reconnecting to your inbox. Your drafts stay in this tab.";
-      if (!views.size) emptyMessage("Your inbox is temporarily unavailable.", "Keep this tab open. Seeker will reconnect automatically when the local service is available.", "…");
+      if (selectedLoad?.status === "offline" && selectedLoad.id === selectedId) renderDetail();
+      else if (!views.size) emptyMessage("Your inbox is temporarily unavailable.", "Keep this tab open. Seeker will reconnect automatically when the local service is available.", "…");
+      if (browseOlder) notice("history-note", "Older history is temporarily unavailable. Try again.", true);
     }
   }
-  finally { refreshing = false; }
+  finally {
+    refreshing = false; if (browseOlder) historyBusy = false; historyControls();
+    if (session && (session !== owner || historyRequested || selectedId !== checkedSelection)) refresh();
+  }
 }
 for (const id of ["reply", "conditions"]) $(id).addEventListener("input", () => { const view = views.get(selectedId); if (!view) return; const draft = draftFor(view); draft[id === "reply" ? "text" : "conditions"] = $(id).value; draft.notice = ""; renderComposer(view); });
 $("reply-kind").addEventListener("change", () => { const view = views.get(selectedId); if (!view) return; const draft = draftFor(view); if ($("reply-kind").value !== "choice") { draft.kind = $("reply-kind").value; draft.optionId = undefined; } draft.notice = ""; renderComposer(view); });
@@ -227,7 +330,8 @@ $("reply-form").addEventListener("submit", async (event) => {
   draft.attempt = attempt; draft.sending = true; draft.notice = ""; renderComposer(view);
   try {
     const result = await api("/api/replies", attempt);
-    if (result.status === "recorded" || (result.status === "duplicate" && result.receiptId)) recorded(draft);
+    if (result.status === "deferred") recorded(draft, true);
+    else if (result.status === "recorded" || (result.status === "duplicate" && result.receiptId)) recorded(draft);
     else { draft.attempt = undefined; draft.error = true; draft.notice = result.code?.includes("stale") ? "This request changed. Your draft is kept; review the current revision before sending." : "This response was not recorded. Your draft is kept; refresh and review the request."; }
   } catch (error) {
     if (draft.attempt !== attempt) return;
@@ -240,7 +344,7 @@ window.addEventListener("hashchange", () => select(hashId(), false));
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
 window.addEventListener("online", refresh);
 window.addEventListener("beforeunload", (event) => {
-  if ([...drafts.values()].some((draft) => draft.attempt || draft.text.trim() || draft.conditions.trim() || draft.optionId)) { event.preventDefault(); event.returnValue = ""; }
+  if ([...drafts.values()].some(hasDraft)) { event.preventDefault(); event.returnValue = ""; }
 });
 setInterval(refresh, 2000);
 api("/api/session").then(openSession).catch((error) => showLogin(error.status === 401 ? "" : "Cannot reach Seeker. Check that the local service is running, then try again."));

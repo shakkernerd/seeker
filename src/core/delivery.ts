@@ -1,5 +1,6 @@
 import type { Delivery, DeliveryResult, HostAdapter, MessagingChannel } from "../contracts.ts";
 import { SeekerCore } from "./seeker.ts";
+import { channelReadiness, routeFor } from "./attention.ts";
 
 /** One prompt, no reminders. Only a definite retryable failure may be retried. */
 export class DeliveryPump {
@@ -17,7 +18,9 @@ export class DeliveryPump {
   ) {}
 
   start(): void {
-    this.core.store.recoverInterruptedDeliveries();
+    this.core.store.recoverInterruptedDeliveries(this.core.clock());
+    for (const host of this.hosts) this.core.resumeHost(host.id);
+    for (const channel of this.channels) this.core.resumeChannel(channel.id);
     this.#stopped = false;
     this.#timer = setInterval(() => this.tick(), 200);
     this.#timer.unref();
@@ -45,7 +48,7 @@ export class DeliveryPump {
     const controller = new AbortController();
     const view = this.core.store.get(attempt.exchangeId)!;
     const exchange = view.exchange;
-    const active = { controller, route: `${attempt.lane}:${attempt.lane === "channel" ? exchange.recipient.channelId : exchange.origin.hostId}` };
+    const active = { controller, route: routeFor(exchange, attempt.lane) };
     this.#active.set(attempt.id, active);
     const binding = this.core.store.binding(exchange.origin);
     const revision = exchange.revisions[attempt.revision - 1]!;
@@ -69,7 +72,9 @@ export class DeliveryPump {
       this.core.store.binding(exchange.origin);
       if (controller.signal.aborted) return { status: "unknown", code: "aborted" };
       if (attempt.lane === "channel") {
-        if (latest.cancellation || latest.revision !== attempt.revision || (!attempt.contextId && latest.state !== "waiting")) return { status: "rejected", code: "superseded" };
+        const readiness = channelReadiness(latest, attempt);
+        if (readiness === "retire") return { status: "rejected", code: "superseded" };
+        if (readiness === "defer") return { status: "retry", code: "awaiting_reconciliation", retryAfterMs: 1_000 };
         const adapter = this.channels.find((item) => item.id === exchange.recipient.channelId);
         if (!adapter) return { status: "retry", retryAfterMs: 30_000, code: "channel_unavailable" };
         return adapter.send({
@@ -80,6 +85,17 @@ export class DeliveryPump {
       }
       const adapter = this.hosts.find((item) => item.id === binding.origin.hostId);
       if (!adapter) return { status: "retry", retryAfterMs: 30_000, code: "host_unavailable" };
+      if (attempt.noticeOf) {
+        const failed = view.deliveries.find((item) => item.id === attempt.noticeOf)!;
+        return adapter.deliver({ ...binding, origin: exchange.origin }, {
+          deliveryId: attempt.id, exchangeId: exchange.id, revision, requiresReconciliation: true,
+          notice: { deliveryId: failed.id, state: failed.state as "unknown" | "rejected", code: failed.code ?? "contact_unconfirmed" },
+        }, controller.signal);
+      }
+      if (attempt.deferredEventId) {
+        const deferred = view.deferredReplies!.find((item) => item.channelId === attempt.deferredChannelId && item.event.eventId === attempt.deferredEventId)!;
+        return adapter.deliver({ ...binding, origin: exchange.origin }, { deliveryId: attempt.id, exchangeId: exchange.id, revision, deferred, requiresReconciliation: true }, controller.signal);
+      }
       const receipt = exchange.receipts.find((item) => item.id === attempt.receiptId)!;
       return adapter.deliver({ ...binding, origin: exchange.origin }, {
         deliveryId: attempt.id, exchangeId: exchange.id, revision, receipt,

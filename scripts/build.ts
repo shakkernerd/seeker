@@ -1,4 +1,7 @@
 import { chmodSync, mkdirSync, rmSync } from "node:fs";
+import { runtimeVersion } from "../src/local/config.ts";
+
+if (Bun.version !== runtimeVersion) throw new Error(`Build with qualified Bun ${runtimeVersion}.`);
 
 rmSync("dist", { recursive: true, force: true });
 mkdirSync("dist", { recursive: true });

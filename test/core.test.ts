@@ -131,7 +131,7 @@ describe("durable exchange lifecycle", () => {
     const result = core.receiveNative(fixtureBinding.origin, "request-1", 1, event("native-answer", { actorId: "native-human", conversationId: "native-task", kind: "answer", optionId: undefined, text: "Keep it local; I answered here." }));
     let view = manager.get("request-1");
     expect(view.exchange.receipts[0]!.source.verification).toBe("native");
-    view = manager.update({ type: "acknowledge", requestId: "request-1", receiptId: result.receiptId!, status: "handled", expectedVersion: view.exchange.version, evidenceRef: "native:original-message" });
+    view = manager.update({ type: "acknowledge", requestId: "request-1", receiptId: result.receiptId!, status: "handled", resolvesExchange: true, expectedVersion: view.exchange.version, evidenceRef: "native:original-message" });
     expect(view.exchange.state).toBe("handled");
     expect(manager.listPending()).toHaveLength(0);
   });
@@ -140,13 +140,146 @@ describe("durable exchange lifecycle", () => {
     const { store, manager } = setup();
     const first = store.claimDeliveries(4, 1_000)[0]!;
     expect(first.state).toBe("sending");
-    expect(store.recoverInterruptedDeliveries()).toBe(1);
-    expect(store.claimDeliveries(4, 1_000_000)).toHaveLength(0);
+    expect(store.recoverInterruptedDeliveries(1_000)).toBe(1);
+    const notice = store.claimDeliveries(4, 1_000_000);
+    expect(notice).toHaveLength(1);
+    expect(notice[0]!.noticeOf).toBe(first.id);
+    store.completeDelivery(notice[0]!.id, notice[0]!.attemptId!, { status: "accepted", reference: "native:delivery-notice" }, 1_000_000);
     expect(manager.get("request-1").deliveries[0]!.state).toBe("unknown");
     manager.submit({ requestId: "request-2", decision: fixtureDecision });
     const second = store.claimDeliveries(4, 1_000)[0]!;
     store.completeDelivery(second.id, second.attemptId!, { status: "retry", retryAfterMs: 7_000, code: "rate_limited" }, 1_000);
     expect(store.claimDeliveries(4, 7_999)).toHaveLength(0);
     expect(store.claimDeliveries(4, 8_000)).toHaveLength(1);
+  });
+
+  for (const boundary of ["receipt count", "record bytes"]) test(`${boundary} overflow retains the reply and lets an unrelated event and cursor commit`, () => {
+    const { core, manager, channel, event } = setup();
+    const other = manager.submit({ requestId: "healthy-request", decision: fixtureDecision });
+    let blockedEvent: InboundReply | undefined;
+    for (let index = 0; index <= 128; index += 1) {
+      const input = event(`fill-${index}`, { kind: "question", optionId: undefined, text: boundary === "record bytes" ? "x".repeat(8_000) : `Question ${index}?` });
+      const result = channel.receive([input])[0]!;
+      if (result.status === "deferred") { blockedEvent = input; break; }
+    }
+    expect(blockedEvent).toBeDefined();
+    const overflow = event("important-correction", { kind: "correction", optionId: undefined, text: boundary === "record bytes" ? "Use the amended condition. ".padEnd(8_000, "x") : "Use the amended condition.", conditions: "Do not touch existing data." });
+    const results = channel.receive([overflow, event("healthy-answer", { replyHandle: other.exchange.revisions[0]!.replyHandle })], { cursor: "batch-complete", lastReceivedAt: 1_000, continuity: "continuous" });
+    expect(results.map((item) => item.status)).toEqual(["deferred", "recorded"]);
+    expect(channel.progress()!.cursor).toBe("batch-complete");
+    const view = manager.get("request-1");
+    expect(view.deferredReplies!.find((item) => item.event.eventId === "important-correction")!.event.conditions).toBe("Do not touch existing data.");
+    expect(view.deliveries.some((item) => item.deferredEventId === "important-correction" && item.lane === "host")).toBe(true);
+    expect(channel.receive([overflow])[0]!.status).toBe("deferred");
+    manager.update({ type: "reconcile-input", requestId: "request-1", expectedVersion: view.exchange.version, channelId: "local", eventId: "important-correction", evidenceRef: "native:reconciliation", note: "Applied the condition to the existing work." });
+    expect(core.inbox(fixtureBinding.recipient).find((item) => item.exchange.id === "request-1")!.deferredReplies!.find((item) => item.event.eventId === "important-correction")!.disposition.status).toBe("handled");
+    const receipt = manager.get("request-1").exchange.receipts[0]!;
+    expect(manager.update({ type: "acknowledge", requestId: "request-1", expectedVersion: view.exchange.version, receiptId: receipt.id,
+      status: "handled", evidenceRef: "native:capacity-recovery", note: "n".repeat(2_000) }).exchange.receipts[0]!.disposition.status).toBe("handled");
+    expect(manager.update({ type: "cancel", requestId: "request-1", expectedVersion: manager.get("request-1").exchange.version, reason: "x".repeat(2_000) }).exchange.cancellation).toBeDefined();
+  });
+
+  test("reconciliation defers the current prompt and handling the correction releases it", () => {
+    const { manager, channel, store, event } = setup();
+    const correction = channel.receive([event("correction", { kind: "correction", optionId: undefined, text: "Clarify the destination." })])[0]!;
+    let view = manager.get("request-1");
+    view = manager.update({ type: "revise", requestId: "request-1", expectedVersion: view.exchange.version, decision: { ...fixtureDecision, target: "the clarified directory" } });
+    store.claimDeliveries(4, 1_000);
+    expect(manager.get("request-1").deliveries.find((item) => item.lane === "channel" && item.revision === 2)!.state).toBe("queued");
+    manager.update({ type: "acknowledge", requestId: "request-1", expectedVersion: view.exchange.version, receiptId: correction.receiptId!, status: "handled", evidenceRef: "native:correction-clarified" });
+    expect(store.claimDeliveries(4, 2_000).some((item) => item.lane === "channel" && item.revision === 2)).toBe(true);
+  });
+
+  test("restored host retries only known-unaccepted work and preserves its delay", () => {
+    const { core, store, channel, event } = setup();
+    channel.receive([event("reply")]);
+    let now = 1_000;
+    for (let index = 0; index < 5; index += 1) {
+      const attempt = store.claimDeliveries(4, now).find((item) => item.lane === "host")!;
+      store.completeDelivery(attempt.id, attempt.attemptId!, { status: "retry", retryAfterMs: 3_000, code: "host_unavailable" }, now);
+      now += 3_000;
+    }
+    expect(core.resumeHost("fixture")).toBe(1);
+    expect(store.claimDeliveries(4, now - 1)).toHaveLength(0);
+    const resumed = store.claimDeliveries(4, now)[0]!;
+    store.completeDelivery(resumed.id, resumed.attemptId!, { status: "unknown", code: "io_timeout" }, now);
+    expect(core.resumeHost("fixture")).toBe(0);
+  });
+
+  test("late success after timeout and ownership transfer stays attached to the old fenced attempt", () => {
+    const { manager, core, store, channel, event } = setup();
+    channel.receive([event("reply")]);
+    const attempt = store.claimDeliveries(4, 1_000)[0]!;
+    store.completeDelivery(attempt.id, attempt.attemptId!, { status: "unknown", code: "io_timeout" }, 1_100);
+    store.transfer(fixtureBinding.id, 1, { ...fixtureBinding.origin, managerId: "successor", generation: 2 });
+    store.completeDelivery(attempt.id, attempt.attemptId!, { status: "accepted", reference: "old-owner-acceptance" }, 1_200);
+    expect(() => manager.get("request-1")).toThrow("not bound");
+    const view = core.manager({ ...fixtureBinding.origin, managerId: "successor", generation: 2 }).get("request-1");
+    expect(view.deliveries.find((item) => item.id === attempt.id)!.state).toBe("unknown");
+    expect(view.deliveries.find((item) => item.id === attempt.id)!.code).toBe("owner_transferred");
+    expect(view.deliveries.find((item) => item.id === attempt.id)!.reference).toBeUndefined();
+    expect(view.exchange.receipts[0]!.disposition.status).toBe("pending");
+  });
+
+  test("editing an old bare reply stays with its original exchange after another becomes pending", () => {
+    const { manager, channel, event } = setup();
+    const initial = channel.receive([event("original", { replyHandle: undefined, kind: "answer", optionId: undefined, text: "Use local." })])[0]!;
+    manager.update({ type: "acknowledge", requestId: "request-1", expectedVersion: manager.get("request-1").exchange.version, receiptId: initial.receiptId!, status: "handled", resolvesExchange: true, evidenceRef: "native:original" });
+    manager.submit({ requestId: "new-question", decision: fixtureDecision });
+    const edited = channel.receive([event("edited", { replyHandle: undefined, replyToRef: "message:original", sourceRef: "message:original", kind: "correction", optionId: undefined, text: "Stop that earlier change." })])[0]!;
+    expect(edited.exchangeId).toBe("request-1");
+    expect(manager.get("new-question").exchange.receipts).toHaveLength(0);
+  });
+
+  test("unchanged edits coalesce against the latest original message, while A/B/A edits survive", () => {
+    const { manager, channel, event } = setup();
+    const original = event("original-text", { kind: "answer", optionId: undefined, text: "A", sourceRef: "same-message" });
+    channel.receive([original]);
+    const edit = (eventId: string, text: string) => event(eventId, { kind: "correction", optionId: undefined, text, sourceRef: "same-message", replyToRef: "same-message", replyHandle: undefined });
+    expect(channel.receive([edit("metadata-only", "A")])[0]!.status).toBe("duplicate");
+    expect(channel.receive([edit("edit-b", "B")])[0]!.status).toBe("recorded");
+    expect(channel.receive([edit("edit-a", "A")])[0]!.status).toBe("recorded");
+    expect(channel.receive([edit("more-metadata", "A")])[0]!.status).toBe("duplicate");
+    expect(manager.get("request-1").exchange.receipts.map((item) => item.text)).toEqual(["A", "B", "A"]);
+  });
+
+  test("trusted future recipient selection preserves old-channel replies and fixed old routes", () => {
+    const { core, manager, channel, event, created } = setup();
+    const recipient = { channelId: "other", actorId: "paired-owner", conversationId: "private-chat" };
+    core.setRecipient(fixtureBinding.id, 1, recipient);
+    expect(manager.submit({ requestId: "new-route", decision: fixtureDecision }).exchange.recipient).toEqual(recipient);
+    expect(manager.get("request-1").exchange.recipient).toEqual(created.exchange.recipient);
+    expect(channel.receive([event("old-channel")])[0]!.status).toBe("recorded");
+    expect(core.channel("other").receive([event("wrong-channel", { actorId: "paired-owner", conversationId: "private-chat" })])[0]!.code).toBe("recipient_denied");
+  });
+
+  test("obsolete channel-failure notices retire, while a successor receives a current failure notice", () => {
+    const { manager, core, store } = setup();
+    const attempt = store.claimDeliveries(4, 1_000)[0]!;
+    store.completeDelivery(attempt.id, attempt.attemptId!, { status: "unknown", code: "io_timeout" }, 1_001);
+    store.transfer(fixtureBinding.id, 1, { ...fixtureBinding.origin, managerId: "successor", generation: 2 });
+    const view = core.manager({ ...fixtureBinding.origin, managerId: "successor", generation: 2 }).get("request-1");
+    expect(view.deliveries.filter((item) => item.noticeOf && item.state === "queued")).toHaveLength(1);
+    expect(view.deliveries.find((item) => item.noticeOf && item.state === "queued")!.ownerGeneration).toBe(2);
+    core.manager({ ...fixtureBinding.origin, managerId: "successor", generation: 2 }).update({ type: "cancel", requestId: "request-1", expectedVersion: view.exchange.version, reason: "No longer needed" });
+    expect(store.claimDeliveries(4, Date.now() + 1_000)).toHaveLength(0);
+    expect(() => manager.get("request-1")).toThrow("not bound");
+  });
+
+  test("handled history does not exhaust active capacity and is retrieved in bounded pages", () => {
+    const { manager, core } = setup();
+    manager.update({ type: "cancel", requestId: "request-1", expectedVersion: 1, reason: "History fixture" });
+    for (let index = 0; index < 1_000; index += 1) {
+      const requestId = `history-${String(index).padStart(4, "0")}`;
+      manager.submit({ requestId, decision: fixtureDecision });
+      manager.update({ type: "cancel", requestId, expectedVersion: 1, reason: "Handled history fixture" });
+    }
+    expect(manager.submit({ requestId: "still-usable", decision: fixtureDecision }).exchange.state).toBe("waiting");
+    expect(core.inbox(fixtureBinding.recipient)).toHaveLength(51);
+    const first = core.history(fixtureBinding.recipient);
+    const second = core.history(fixtureBinding.recipient, first.nextCursor);
+    expect(first.items).toHaveLength(50); expect(second.items).toHaveLength(50);
+    expect(first.items.some((item) => second.items.some((other) => other.exchange.id === item.exchange.id))).toBe(false);
+    expect(manager.get("history-0999").exchange.cancellation!.reason).toBe("Handled history fixture");
   });
 });

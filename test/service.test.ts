@@ -57,7 +57,7 @@ test("actual CLI serves authenticated questions, context, conditions and explici
   const read = async () => (await (await service.request("/api/exchanges")).json()) as ReturnType<SeekerCore["inbox"]>;
   let view = (await read())[0]!;
   const handle = view.exchange.revisions[0]!.replyHandle;
-  const question = await service.request("/api/replies", { eventId: "browser-question", replyHandle: handle, kind: "question", text: "Why is that needed?" });
+  const question = await service.request("/api/replies", { eventId: "browser-question", replyHandle: handle, kind: "answer", text: "Why is that needed?" });
   expect(question.status).toBe(200);
   view = (await until(read, (items) => items[0]!.exchange.context.length === 1 && items[0]!.exchange.receipts[0]!.disposition.status === "handled"))[0]!;
   expect(view.exchange.state).toBe("waiting");

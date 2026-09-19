@@ -16,7 +16,9 @@ const pending = manager.listPending();
 
 `requestId` is retained before the first call. Recover an uncertain create by reading or repeating that same request, never by creating a new identity. `assignmentId` references existing work rather than creating a second task ledger.
 
-Manager changes use an expected record version. `revise` changes the immutable decision; `context` adds an idempotent explanation; `cancel` preserves the record. An `acknowledge` names the exact receipt, current version, status, and evidence reference. Merely reading a receipt does not consume it. `store.transfer` is a separate trusted host operation that advances the owner generation for the same assignment and excludes the old owner.
+Manager changes use an expected record version. `revise` changes the immutable decision; `context` adds an idempotent explanation; `cancel` preserves the record. An `acknowledge` names the exact receipt, current version, status, and evidence reference. Merely reading a receipt does not consume it. Handling natural text does not itself close a decision: the manager supplies `resolvesExchange: true` only after interpreting a genuine answer to the current proposal. Handling a context question leaves it open. Declared choices and attention acknowledgments retain their declared endpoints.
+
+`store.transfer` is a separate trusted host operation that advances the owner generation for the same assignment and excludes the old owner. `core.setRecipient(bindingId, expectedGeneration, recipient)` is a privileged setup operation for future requests. Existing exchanges keep their original recipient and reply correlation. A model-facing manager port exposes neither operation. Application setup selects a configured recipient; a host adapter does not know which messaging provider implements it.
 
 ## Human channels
 
@@ -28,11 +30,15 @@ The channel normalizes only necessary text and provenance, never raw provider pa
 
 Declared choices use the corresponding `kind` and `optionId`. Free text uses `answer` or `question`; it does not manufacture explicit approval. Conditions remain intact. Stops and corrections can be recorded even against an earlier revision or cancelled request.
 
-Results distinguish recorded input, duplicate input, rejected stale/invalid scope, and unmatched input. A receiver must make unsupported or unmatched input visible through its supported channel response. A `possible-gap` continuity marker remains visible across subsequent successful polls; successful polling alone cannot prove missing input was recovered.
+Results distinguish recorded input, duplicate input, rejected stale/invalid scope, unmatched input, and deferred input. A per-exchange capacity limit returns `deferred`: normalized text, conditions, source and target are durably saved, but no decision is applied. Unrelated events and the batch cursor can still commit. The original manager receives a `DeferredEnvelope` and uses `reconcile-input` with current version and evidence to record handling outside the full conversation. Global storage/queue failure still aborts the batch.
+
+A receiver must make unsupported, unmatched, or deferred input visible through its supported channel response. Corrections that edit an existing message use its original `sourceRef` and reply correlation; unchanged metadata-only edits coalesce against that message's latest content, while A/B/A edits remain distinct. A `possible-gap` continuity marker remains visible across subsequent successful polls; successful polling alone cannot prove missing input was recovered.
 
 ## Manager return
 
-`HostAdapter.deliver` receives an immutable receipt envelope addressed through the trusted binding. Stable receipt IDs support reconciliation after reconnect. Host acceptance does not mark manager receipt or handling. Only the current manager's explicit acknowledgment changes those dispositions.
+`HostAdapter.deliver` receives a `HostEnvelope` addressed through the trusted binding: a human receipt, saved deferred input, or an operational delivery notice. The latter two are explicitly distinguished from a human decision. Stable identities support reconciliation after reconnect. Host acceptance does not mark manager receipt or handling. Only the current manager's explicit acknowledgment changes those dispositions.
+
+After restoring a genuine authenticated transport connection, call `core.resumeHost(hostId)` once to resume only known-unaccepted retry exhaustion; do not call it every poll. Configured adapters receive the same recovery at runtime startup. The corresponding channel method is `resumeChannel`. These methods retain retry deadlines and never replay unknown or permanent failures.
 
 Verified original native human messages use `core.receiveNative`, which is separate from the manager tool port. A quoted answer, forwarded text, or a caller-selected user role is not a verified native source. Native and channel receipts preserve their distinct provenance.
 

@@ -1,4 +1,4 @@
-import type { Decision, HostAdapter, ManagerBinding, ReceiptEnvelope } from "../contracts.ts";
+import type { Decision, HostAdapter, HostEnvelope, ManagerBinding } from "../contracts.ts";
 import { SeekerCore } from "../core/seeker.ts";
 import { localRecipient } from "./channel.ts";
 
@@ -27,21 +27,29 @@ export class FixtureHost implements HostAdapter {
   readonly id = "fixture";
   constructor(private readonly core: SeekerCore) {}
 
-  async deliver(binding: ManagerBinding, envelope: ReceiptEnvelope, signal: AbortSignal) {
+  async deliver(binding: ManagerBinding, envelope: HostEnvelope, signal: AbortSignal) {
     if (signal.aborted) return { status: "unknown" as const, code: "aborted" };
     const manager = this.core.manager(binding.origin);
     let view = manager.get(envelope.exchangeId);
+    if ("notice" in envelope) return { status: "accepted" as const, reference: `fixture-notice:${envelope.notice.deliveryId}` };
+    if ("deferred" in envelope) {
+      manager.update({ type: "reconcile-input", requestId: envelope.exchangeId, expectedVersion: view.exchange.version,
+        channelId: envelope.deferred.channelId, eventId: envelope.deferred.event.eventId,
+        evidenceRef: `fixture:${envelope.deferred.event.eventId}`, note: "Deferred input reviewed by the controlled fixture; no decision or external action applied." });
+      return { status: "accepted" as const, reference: `fixture:${envelope.deferred.event.eventId}` };
+    }
     manager.update({ type: "acknowledge", requestId: envelope.exchangeId, receiptId: envelope.receipt.id,
       status: "received", evidenceRef: `fixture:${envelope.receipt.id}`, expectedVersion: view.exchange.version });
     view = manager.get(envelope.exchangeId);
-    if (envelope.receipt.kind === "question" || envelope.receipt.text.trim().endsWith("?")) {
+    const question = envelope.receipt.kind === "question" || envelope.receipt.text.trim().endsWith("?");
+    if (question) {
       manager.update({ type: "context", requestId: envelope.exchangeId, expectedVersion: view.exchange.version,
         messageId: `explain:${envelope.receipt.id}`,
         text: "The sample stays on this machine so you can try a complete conversation without connecting a bot or an agent. Your choice only changes this demonstration's receipt. A real manager supplies its own explanation in a connected exchange." });
       view = manager.get(envelope.exchangeId);
     }
     manager.update({ type: "acknowledge", requestId: envelope.exchangeId, receiptId: envelope.receipt.id,
-      status: "handled", evidenceRef: `fixture:${envelope.receipt.id}`, note: "Handled by the controlled demo fixture; no external action occurred.", expectedVersion: view.exchange.version });
+      status: "handled", resolvesExchange: !question, evidenceRef: `fixture:${envelope.receipt.id}`, note: "Handled by the controlled demo fixture; no external action occurred.", expectedVersion: view.exchange.version });
     return { status: "accepted" as const, reference: `fixture:${envelope.receipt.id}` };
   }
 }

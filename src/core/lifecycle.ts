@@ -1,5 +1,5 @@
-import { randomBytes, randomUUID } from "node:crypto";
-import type { Delivery, Exchange, InboundReply, ManagerBinding, ManagerCommand, Receipt, Revision } from "../contracts.ts";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import type { DeferredReply, Delivery, Exchange, InboundReply, ManagerBinding, ManagerCommand, Receipt, Revision } from "../contracts.ts";
 import { decision, fail, id, integer, limits, text } from "./validation.ts";
 
 export interface Change {
@@ -7,6 +7,11 @@ export interface Change {
   deliveries: Delivery[];
   changed: boolean;
   retireChannel?: boolean;
+}
+
+/** Metadata-only edits to one physical human message do not change its meaning. */
+export function replyContentKey(input: Pick<InboundReply, "actorId" | "text" | "conditions" | "optionId">): string {
+  return createHash("sha256").update(JSON.stringify([input.actorId, input.text, input.conditions ?? "", input.optionId ?? null])).digest("hex");
 }
 
 export function revision(snapshot: Revision["decision"], number: number, now: number): Revision {
@@ -30,8 +35,9 @@ export function current(exchange: Exchange): Revision {
   return exchange.revisions[exchange.revision - 1]!;
 }
 
-function isAnswer(receipt: Receipt, exchange: Exchange): boolean {
-  return ["approve", "decline", "answer"].includes(receipt.kind) ||
+export function isAnswer(receipt: Receipt, exchange: Exchange): boolean {
+  return receipt.disposition.resolvesExchange === true ||
+    ["approve", "decline"].includes(receipt.kind) || (receipt.kind === "answer" && receipt.optionId !== undefined) ||
     (receipt.kind === "acknowledge" && current(exchange).decision.kind === "attention");
 }
 
@@ -46,10 +52,24 @@ export function refreshState(exchange: Exchange): void {
   }
   const receipts = exchange.receipts.filter((item) => item.revision === exchange.revision);
   const answered = receipts.some((item) => isAnswer(item, exchange));
-  exchange.state = answered ? (receipts.every((item) => item.disposition.status === "handled") ? "handled" : "answered") : "waiting";
+  const pendingAnswer = receipts.some((item) => item.kind === "answer" && item.disposition.status !== "handled");
+  exchange.state = answered ? (receipts.every((item) => item.disposition.status === "handled") ? "handled" : "answered") : pendingAnswer ? "answered" : "waiting";
 }
 
-export function mutate(exchange: Exchange, command: Exclude<ManagerCommand, { type: "submit" }>, now: number): Change {
+export function reconcileInput(exchange: Exchange, deferred: DeferredReply, command: Extract<ManagerCommand, { type: "reconcile-input" }>): DeferredReply {
+  if (deferred.exchangeId !== exchange.id) fail("origin_denied", "This input belongs to another exchange.", 403);
+  text(command.evidenceRef, "Reconciliation evidence", 500);
+  if (command.note !== undefined) text(command.note, "Reconciliation note", 2_000, true);
+  if (deferred.disposition.status === "handled") {
+    if (deferred.disposition.evidenceRef !== command.evidenceRef) fail("already_handled", "This input already has a recorded disposition.", 409);
+    return deferred;
+  }
+  if (command.expectedVersion !== exchange.version) fail("version_conflict", "The exchange changed; reconcile its current state first.", 409);
+  deferred.disposition = { status: "handled", generation: exchange.origin.generation, evidenceRef: command.evidenceRef, ...(command.note === undefined ? {} : { note: command.note }) };
+  return deferred;
+}
+
+export function mutate(exchange: Exchange, command: Exclude<ManagerCommand, { type: "submit" | "reconcile-input" }>, now: number): Change {
   const result: Change = { exchange, deliveries: [], changed: false };
   integer(command.expectedVersion, "Expected version");
   if (command.type === "context") {
@@ -67,8 +87,10 @@ export function mutate(exchange: Exchange, command: Exclude<ManagerCommand, { ty
     if (!["received", "handled", "unknown"].includes(command.status)) fail("invalid_input", "Unknown manager disposition.");
     text(command.evidenceRef, "Manager evidence reference", 500);
     if (command.note !== undefined) text(command.note, "Manager note", 2_000, true);
+    if (command.resolvesExchange !== undefined && typeof command.resolvesExchange !== "boolean") fail("invalid_input", "Resolution must be explicit.");
+    if (command.resolvesExchange && (command.status !== "handled" || existing.kind === "question" || existing.revision !== exchange.revision)) fail("invalid_resolution", "Only a handled response to the current decision may resolve it.", 409);
     if (existing.disposition.status === command.status && existing.disposition.generation === exchange.origin.generation &&
-      existing.disposition.evidenceRef === command.evidenceRef && existing.disposition.note === command.note) return result;
+      existing.disposition.evidenceRef === command.evidenceRef && existing.disposition.note === command.note && existing.disposition.resolvesExchange === command.resolvesExchange) return result;
     if (existing.disposition.status === "handled" && command.status !== "handled") fail("already_handled", "A handled receipt cannot be downgraded; record a correction separately.", 409);
   }
   if (exchange.version !== command.expectedVersion) fail("version_conflict", "The exchange changed. Read its current state before updating.", 409);
@@ -104,6 +126,7 @@ export function mutate(exchange: Exchange, command: Exclude<ManagerCommand, { ty
       receipt.disposition = {
         status: command.status, generation: exchange.origin.generation, evidenceRef: command.evidenceRef,
         ...(command.note === undefined ? {} : { note: command.note }), updatedAt: now,
+        ...(command.resolvesExchange === undefined ? {} : { resolvesExchange: command.resolvesExchange }),
       };
       break;
     }

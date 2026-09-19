@@ -15,6 +15,7 @@
     "start": "bun src/cli.ts start",
     "demo": "bun src/cli.ts demo",
     "build": "bun scripts/build.ts",
+    "verify:package": "bun scripts/verify-package.ts",
     "pack": "bun run build && bun pm pack --destination .artifacts/packages",
     "check": "tsc --noEmit",
     "test": "bun test",

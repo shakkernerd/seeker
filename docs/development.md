@@ -7,6 +7,7 @@ bun install --frozen-lockfile --ignore-scripts
 bun run check
 bun test
 bun run build
+bun run verify:package
 bun run pack
 ```
 

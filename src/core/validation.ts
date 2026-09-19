@@ -12,7 +12,7 @@ export const limits = {
   revisions: 32,
   receipts: 128,
   context: 128,
-  inboundEvents: 100_000,
+  deferredInputs: 1_000,
   batch: 100,
   recordBytes: 262_144,
 } as const;
