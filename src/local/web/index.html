@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="description" content="A quiet, durable inbox for the questions that need you.">
+    <title>Seeker · Your attention, in one place</title>
+    <link rel="stylesheet" href="/style.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <header class="app-header">
+      <a class="brand" href="/" aria-label="Seeker home"><span class="brand-mark" aria-hidden="true">s</span>seeker<span class="local-badge">local inbox</span></a>
+      <div class="header-actions"><span id="connection" class="connection" role="status">Connecting</span><button id="logout" class="quiet-button" hidden>Lock inbox</button></div>
+    </header>
+    <p id="fixture" class="fixture-banner" hidden><strong>Practice inbox.</strong> This uses a controlled host fixture. Replies do not go to a real manager.</p>
+    <p id="offline" class="offline-banner" role="status" hidden></p>
+    <section id="login" class="login-panel" hidden aria-labelledby="login-title">
+      <span class="welcome-mark" aria-hidden="true">↗</span>
+      <p class="eyebrow">A LITTLE CLARITY GOES A LONG WAY</p>
+      <h1 id="login-title">Your attention,<br>in one place.</h1>
+      <p class="intro">Read the request. Ask what you need.<br>Make the next step clear.</p>
+      <form id="login-form">
+        <label for="access-key">Local access key</label>
+        <input id="access-key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" required aria-describedby="key-help">
+        <p id="key-help" class="hint">Use the key from your local Seeker setup.</p>
+        <button id="unlock" type="submit" class="primary-button">Open your inbox <span aria-hidden="true">→</span></button>
+        <p id="login-error" class="form-notice error" role="alert" hidden></p>
+      </form>
+      <p class="local-note">On this device. Connected to your work.</p>
+    </section>
+    <div id="workspace" class="workspace" hidden>
+      <aside class="inbox" aria-labelledby="inbox-title">
+        <div class="inbox-heading"><h2 id="inbox-title">Inbox</h2><span id="count" class="count">0</span></div>
+        <p class="inbox-description">A question. A decision. A next step.</p>
+        <nav id="request-list" class="request-list" aria-label="Requests"></nav>
+        <p id="inbox-empty" class="inbox-empty" hidden>No requests yet.</p>
+        <p class="inbox-footnote">Every reply stays with its original request.</p>
+      </aside>
+      <main class="conversation" id="conversation">
+        <section id="empty" class="empty-state">
+          <span id="empty-mark" class="empty-mark" aria-hidden="true">…</span>
+          <p class="eyebrow">ROOM TO FOCUS</p>
+          <h1 id="empty-title">Loading your inbox…</h1>
+          <p id="empty-copy">Seeker is checking for your requests.</p>
+        </section>
+        <article id="exchange" hidden>
+          <header class="exchange-heading">
+            <p id="manager" class="eyebrow"></p>
+            <div class="title-row"><h1 id="title"></h1><span id="state" class="status-badge"></span></div>
+            <p id="receipt-status" class="receipt-status" role="status"></p>
+          </header>
+          <section class="request-card" aria-label="Current request">
+            <div class="section-kicker"><span id="request-kind"></span><span id="revision"></span></div>
+            <h2 id="question"></h2>
+            <p id="context" class="request-context"></p>
+            <dl id="decision-details" class="decision-details"></dl>
+            <p id="recommendation" class="recommendation" hidden></p>
+            <div id="options" class="choices" role="group" aria-label="Decision choices"></div>
+          </section>
+          <div id="history" class="history"></div>
+          <ol id="messages" class="messages" aria-label="Conversation"></ol>
+          <p id="cancellation" class="form-notice" hidden></p>
+          <form id="reply-form" class="composer">
+            <div id="revised" class="revision-notice" hidden><p id="revision-message"></p><button id="use-current" class="quiet-button" type="button">Review current request</button></div>
+            <div class="compose-heading"><label for="reply-kind">Your response</label><select id="reply-kind" aria-label="Response type"><option value="answer">Write a reply</option><option value="question">Ask a question</option><option value="correction">Send a correction</option><option value="stop">Ask to stop</option><option id="selected-choice" value="choice" hidden>Selected decision</option></select></div>
+            <p id="choice-note" class="choice-note" hidden></p>
+            <label for="reply" class="sr-only">Your reply</label>
+            <textarea id="reply" rows="3" aria-describedby="reply-limit" placeholder="Add your reply or ask for more context…"></textarea>
+            <p id="reply-limit" class="field-count">0 / 8,000 characters</p>
+            <label for="conditions" class="conditions-label">Conditions <span>(optional)</span></label>
+            <textarea id="conditions" rows="1" aria-describedby="conditions-limit" placeholder="Anything this response depends on"></textarea>
+            <p id="conditions-limit" class="field-count">0 / 2,000 characters</p>
+            <div class="compose-footer"><p id="compose-hint" class="hint">A written reply is not an approval. Choose a decision above to approve or decline.</p><button id="send" class="primary-button" type="submit">Send response <span aria-hidden="true">↑</span></button></div>
+            <p id="reply-notice" class="form-notice" role="status" hidden></p>
+          </form>
+        </article>
+      </main>
+    </div>
+    <noscript><p class="form-notice">Enable JavaScript to open the local inbox.</p></noscript>
+  </body>
+</html>

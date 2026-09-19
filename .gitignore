@@ -1,0 +1,8 @@
+node_modules/
+.artifacts/
+.seeker/
+coverage/
+dist/
+*.sqlite*
+*.key
+.DS_Store
