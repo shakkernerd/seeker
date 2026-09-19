@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { isRecord, TelegramApi, TelegramError, telegramId } from "./api";
 import { validId, type TelegramOwner } from "./enrollment";
 import { claimReceiver } from "./receiver-lock";
+import { pollUpdates } from "./updates";
 
 type Feedback = { updateId: string; messageId?: string; callbackId?: string; text?: string };
 type Runtime = {
@@ -98,22 +99,11 @@ export class TelegramChannel implements MessagingChannel {
 
   async pollOnce(ingress: ChannelIngress, signal: AbortSignal): Promise<void> {
     const previous = ingress.progress();
-    const offset = previous?.cursor === undefined ? undefined : Number(previous.cursor);
-    if (offset !== undefined && (!Number.isSafeInteger(offset) || offset < 0)) throw new Error("Invalid stored Telegram polling cursor");
-    const updates = await this.#api.call("getUpdates", {
-      ...(offset === undefined ? {} : { offset }),
-      limit: 100, timeout: 30, allowed_updates: ["message", "edited_message", "callback_query"],
-    }, signal);
-    if (!Array.isArray(updates) || updates.length > 100 || updates.some((update) => !isRecord(update) || !Number.isSafeInteger(update.update_id) || Number(update.update_id) < 0)) {
-      throw new TelegramError("invalid-response", "unknown");
-    }
+    const batch = await pollUpdates(this.#api, previous?.cursor, ["message", "edited_message", "callback_query"], signal);
     const events: InboundReply[] = [];
     const feedback: Feedback[] = [];
-    let nextOffset = offset;
-    for (const value of [...updates].sort((left, right) => left.update_id - right.update_id)) {
-      const update = value as Record<string, unknown>;
+    for (const update of batch.updates) {
       const updateId = String(update.update_id);
-      nextOffset = Math.max(nextOffset ?? 0, Number(update.update_id) + 1);
       const parsed = this.#parse(update, ingress);
       const eventId = isRecord(update.callback_query) && typeof update.callback_query.id === "string" ? callbackReference(update.callback_query.id) : updateId;
       if (parsed.event) events.push({ ...parsed.event, eventId });
@@ -122,7 +112,7 @@ export class TelegramChannel implements MessagingChannel {
     const now = this.#runtime.now();
     const continuity = previous?.continuity === "possible-gap" || (previous && now - previous.lastReceivedAt > 24 * 60 * 60_000) ? "possible-gap" : "continuous";
     const results = ingress.receive(events, {
-      ...(nextOffset === undefined ? {} : { cursor: String(nextOffset) }),
+      ...(batch.cursor === undefined ? {} : { cursor: batch.cursor }),
       lastReceivedAt: now, continuity,
     });
     if (continuity === "possible-gap" && previous?.continuity !== "possible-gap") this.#runtime.report("Telegram receiver was offline beyond update retention; some input may be missing");

@@ -3,6 +3,7 @@ import { isRecord, TelegramApi, TelegramError, telegramId } from "./api";
 import { delay, verifyBot } from "./channel";
 import { TelegramEnrollment, type TelegramOwner } from "./enrollment";
 import { claimReceiver } from "./receiver-lock";
+import { pollUpdates } from "./updates";
 
 export interface PairingInteraction {
   invitation(url: string, expiresAt: number): void;
@@ -35,24 +36,19 @@ export async function pairTelegram(
     interaction.invitation(invitation.url, invitation.expiresAt);
     while (!lifetime.aborted && now() < invitation.expiresAt) {
       const previous = ingress.progress();
-      const offset = previous?.cursor === undefined ? undefined : Number(previous.cursor);
-      if (offset !== undefined && (!Number.isSafeInteger(offset) || offset < 0)) throw new Error("Invalid stored Telegram polling cursor");
-      let value: unknown;
+      let batch: Awaited<ReturnType<typeof pollUpdates>>;
       try {
-        value = await api.call("getUpdates", { ...(offset === undefined ? {} : { offset }), timeout: 30, limit: 100, allowed_updates: ["message"] }, lifetime);
+        batch = await pollUpdates(api, previous?.cursor, ["message"], lifetime);
       } catch (error) {
         if (error instanceof TelegramError && error.retryAfterSeconds !== undefined) { await sleep(error.retryAfterSeconds * 1_000, lifetime); continue; }
         throw error;
       }
-      if (!Array.isArray(value) || value.length > 100 || value.some((update) => !isRecord(update) || !Number.isSafeInteger(update.update_id) || Number(update.update_id) < 0)) throw new TelegramError("invalid-response", "unknown");
-      let nextOffset = offset;
       let candidate: TelegramOwner | undefined;
-      for (const update of value) {
-        nextOffset = Math.max(nextOffset ?? 0, Number(update.update_id) + 1);
+      for (const update of batch.updates) {
         candidate ??= enrollment.match(update.message, now());
       }
       const progress: ReceiveProgress = {
-        ...(nextOffset === undefined ? {} : { cursor: String(nextOffset) }), lastReceivedAt: now(),
+        ...(batch.cursor === undefined ? {} : { cursor: batch.cursor }), lastReceivedAt: now(),
         continuity: previous?.continuity === "possible-gap" || (previous && now() - previous.lastReceivedAt > 24 * 60 * 60_000) ? "possible-gap" : "continuous",
       };
       if (!candidate) {

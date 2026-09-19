@@ -63,7 +63,8 @@ export function saveTelegramConfig(dataDir: string, recipient: Recipient, tokenF
 }
 
 function readPrivateFile(path: string, maxBytes: number): string {
-  const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  // Nonblocking open lets fstat reject FIFOs/devices before they can stall startup.
+  const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const stat = fstatSync(descriptor);
     if (!stat.isFile() || stat.size > maxBytes || (stat.mode & 0o077) !== 0 || (process.getuid && stat.uid !== process.getuid())) throw new Error("Unsafe Telegram configuration file");

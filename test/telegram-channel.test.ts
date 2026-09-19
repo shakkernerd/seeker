@@ -98,6 +98,18 @@ test("durability failure prevents offset advancement and callback acknowledgemen
   expect(calls.map((call) => call.method)).toEqual(["getUpdates"]);
 });
 
+test("a lower update ID after a quiet week replaces the old cursor and can be acknowledged", async () => {
+  let progress: ReceiveProgress = { cursor: "900000001", lastReceivedAt: 0, continuity: "continuous" };
+  const received: InboundReply[] = [];
+  const { channel, calls } = setup((method, body) => method === "getUpdates" ? Response.json({ ok: true, result: body.offset === 300000001 ? [] : [{ update_id: 300000000, message: { message_id: 99, from: { id: 42, is_bot: false }, chat: { id: 42, type: "private" }, text: "Why?" } }] }) : undefined);
+  const ingress: ChannelIngress = { progress: () => progress, receive: (events, next) => { received.push(...events); progress = next!; return events.map((event) => ({ eventId: event.eventId, status: "recorded" })); }, pending: () => [], resolveMessage: () => undefined };
+  await channel.pollOnce(ingress, new AbortController().signal);
+  await channel.pollOnce(ingress, new AbortController().signal);
+  expect(progress.cursor).toBe("300000001");
+  expect(received).toHaveLength(1);
+  expect(calls.filter((call) => call.method === "getUpdates").map((call) => call.body.offset)).toEqual([900000001, 300000001]);
+});
+
 test("unsupported media gets an honest text path, never a human decision", async () => {
   const { channel, calls } = setup((method) => method === "getUpdates" ? Response.json({ ok: true, result: [{ update_id: 3, message: { message_id: 3, from: { id: 42, is_bot: false }, chat: { id: 42, type: "private" }, voice: { file_id: "fake" } } }] }) : undefined);
   const events: InboundReply[] = [];

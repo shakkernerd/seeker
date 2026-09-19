@@ -96,3 +96,24 @@ test("private config stores only fixed owner and credential path; invalid or cha
   await symlink(tokenFile, linked);
   expect(() => readTelegramToken(linked)).toThrow("private regular file");
 });
+
+test.skipIf(process.platform === "win32")("nonregular token files fail promptly instead of blocking receiver startup", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "seeker-telegram-fifo-"));
+  closes.push(() => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, "token-pipe");
+  expect(Bun.spawnSync(["mkfifo", "-m", "600", path]).exitCode).toBe(0);
+  const script = `import {readTelegramToken} from ${JSON.stringify(new URL("../src/channels/telegram/config.ts", import.meta.url).pathname)};try{readTelegramToken(process.argv[1]);process.exitCode=2;}catch{console.log("rejected");}`;
+  const child = Bun.spawn([process.execPath, "-e", script, path], { stdout: "pipe", stderr: "pipe" });
+  let timer: ReturnType<typeof setTimeout>;
+  const deadline = new Promise<"timed-out">((resolve) => { timer = setTimeout(() => resolve("timed-out"), 1_000); });
+  try {
+    const result = await Promise.race([child.exited, deadline]);
+    if (result === "timed-out") child.kill("SIGKILL");
+    expect(result).toBe(0);
+    expect((await new Response(child.stdout).text()).trim()).toBe("rejected");
+  } finally {
+    clearTimeout(timer!);
+    child.kill("SIGKILL");
+    await child.exited;
+  }
+});

@@ -7,11 +7,12 @@ const TOKEN = "123456789:TEST_TOKEN_NOT_REAL_0123456789ABCDE";
 const servers: ReturnType<typeof Bun.serve>[] = [];
 afterEach(() => { for (const server of servers.splice(0)) server.stop(true); });
 
-async function attempt(confirm: boolean, rejectSave = false) {
+async function attempt(confirm: boolean, rejectSave = false, priorCursor?: string) {
   let nonce = "";
   let sentCode = "";
   let saved: Recipient | undefined;
-  let progress: ReceiveProgress | undefined;
+  const initialProgress: ReceiveProgress | undefined = priorCursor ? { cursor: priorCursor, lastReceivedAt: 0, continuity: "continuous" } : undefined;
+  let progress = initialProgress;
   let released = false;
   const statuses: string[] = [];
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
@@ -22,7 +23,7 @@ async function attempt(confirm: boolean, rejectSave = false) {
     if (method === "getUpdates") return Response.json({ ok: true, result: [{ update_id: 1, message: { message_id: 10, from: { id: 42, is_bot: false }, chat: { id: 42, type: "private" }, text: `/start ${nonce}` } }] });
     if (method === "sendMessage") {
       expect(saved).toBeUndefined();
-      expect(progress).toBeUndefined();
+      expect(progress).toEqual(initialProgress);
       expect(body.chat_id).toBe("42");
       sentCode = String(body.text).match(/code: (\d{6})/)![1]!;
       return Response.json({ ok: true, result: { message_id: 11, chat: { id: 42, type: "private" } } });
@@ -69,4 +70,10 @@ test("failed durable binding prevents pairing completion and polling ACK", async
   expect(result.saved).toBeUndefined();
   expect(result.progress).toBeUndefined();
   expect(result.released).toBe(true);
+});
+
+test("pairing commits a new lower update ID after the provider resets its sequence", async () => {
+  const result = await attempt(true, false, "900000001");
+  expect(result.saved).toBeDefined();
+  expect(result.progress?.cursor).toBe("2");
 });
