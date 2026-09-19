@@ -5,7 +5,7 @@ import { dirname } from "node:path";
 import type { ManagerBinding } from "../../contracts.ts";
 import { privateDirectory, readPrivateFile } from "./config.ts";
 import { inspectDesktop, parseDesktopOwner, sameDesktopProcess, type DesktopOwner, type DesktopProfile } from "./desktop-owner.ts";
-import { readDesktopCodeHome } from "./desktop-selectors.ts";
+import { readDesktopCodeHome, readDesktopUserData } from "./desktop-selectors.ts";
 import type { CodexHostLifecycle } from "./host.ts";
 import { ConnectorError, onlyKeys, record } from "./protocol.ts";
 
@@ -19,7 +19,7 @@ export class CodexDesktopLifecycle implements CodexHostLifecycle {
   readonly #qualified = new Map<string, DesktopOwner>();
   #registered?: DesktopOwner;
 
-  constructor(private readonly statePath: string, private readonly operations: DesktopOperations = { inspect: (profile, signal) => inspectDesktop(profile, signal, readDesktopCodeHome), open: openDesktop }) {
+  constructor(private readonly statePath: string, private readonly operations: DesktopOperations = { inspect: (profile, signal) => inspectDesktop(profile, signal, readDesktopCodeHome, readDesktopUserData), open: openDesktop }) {
     privateDirectory(dirname(statePath));
     let present = false;
     try { lstatSync(statePath); present = true; } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }

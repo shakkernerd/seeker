@@ -187,11 +187,23 @@ function unchanged(before: DesktopProcess[], after: DesktopProcess[]): void {
   const current = new Map(after.map((entry) => [entry.pid, entry]));
   if (before.length !== after.length || before.some((entry) => !current.has(entry.pid) || !sameDesktopProcess(entry, current.get(entry.pid)!))) throw failure("desktop_owner_changed", "Desktop processes changed during ownership inspection. Retry after startup settles.");
 }
-async function userData(children: DesktopProcess[], signal?: AbortSignal): Promise<string | undefined> {
+async function userData(children: DesktopProcess[], signal?: AbortSignal, exactArgument?: (child: DesktopProcess) => string | undefined): Promise<string | undefined> {
   if (!children.length) return undefined;
   if (children.length > 128) throw failure("desktop_owner_ambiguous", "Desktop has too many framework processes to qualify safely.");
+  const selectors = new Set<string>();
+  if (exactArgument) {
+    for (const child of children) {
+      checkSignal(signal);
+      const selected = exactArgument(child);
+      if (selected) selectors.add(await directory(selected, signal));
+    }
+    if (selectors.size > 1) throw failure("desktop_profile_ambiguous", "The Desktop application has conflicting active profile directories.");
+    return [...selectors][0];
+  }
+  // The connector can offer a hint when the explicit host selector is absent.
+  // Service qualification must compare it with actual OS argv boundaries.
   const output = await command("/bin/ps", ["-ww", "-p", children.map(({ pid }) => pid).join(","), "-o", "pid=,command="], signal);
-  const seen = new Set<number>(), selectors = new Set<string>();
+  const seen = new Set<number>();
   for (const line of output.split("\n")) {
     if (!line.trim()) continue;
     const match = /^\s*(\d+)\s+(.*)$/.exec(line), pid = Number(match?.[1]);
@@ -220,7 +232,9 @@ export async function captureDesktopOwner(signal?: AbortSignal): Promise<Desktop
   const before = await processes(signal), server = before.find((entry) => entry.pid === process.ppid);
   const app = server && before.find((entry) => entry.pid === server.parentPid);
   if (!server || !app || server.executable !== serverPath(appPath) || app.executable !== metadata.executable || directServer(before, app, appPath)?.pid !== server.pid) throw failure("native_host_required", "The connector was not launched directly by this Desktop app-server.");
-  const children = frameworkChildren(before, app, appPath), userDataPath = await userData(children, signal);
+  const children = frameworkChildren(before, app, appPath);
+  const userDataPath = process.env.CODEX_ELECTRON_USER_DATA_PATH === undefined
+    ? await userData(children, signal) : await directory(process.env.CODEX_ELECTRON_USER_DATA_PATH, signal);
   if (!userDataPath) throw failure("desktop_profile_unavailable", "Desktop has not exposed its active profile directory yet.");
   // MCP forwards CODEX_HOME explicitly; HOME is its ordinary host-provided
   // default. Neither value is read from tool arguments or another process.
@@ -234,8 +248,8 @@ export async function captureDesktopOwner(signal?: AbortSignal): Promise<Desktop
   return parseDesktopOwner({ profile: { appPath, appVersion: metadata.appVersion, appBuild: metadata.appBuild, userDataPath, codexHome, ...(sqliteHome ? { sqliteHome } : {}) }, app, server });
 }
 
-/** Code-home discovery stays inside the stable-process inspection; absent an accessor, no home is asserted. */
-export async function inspectDesktop(profile: DesktopProfile, signal?: AbortSignal, codeHome?: (server: DesktopProcess) => string): Promise<Inspection[]> {
+/** Selector discovery stays inside stable-process inspection; absent an accessor, that location is not asserted. */
+export async function inspectDesktop(profile: DesktopProfile, signal?: AbortSignal, codeHome?: (server: DesktopProcess) => string, userDataArgument?: (child: DesktopProcess) => string | undefined): Promise<Inspection[]> {
   requireMac(); checkSignal(signal);
   const registered = parseProfile(profile), metadata = await bundle(registered.appPath, signal);
   await Promise.all([registered.userDataPath, registered.codexHome, ...(registered.sqliteHome ? [registered.sqliteHome] : [])].map(async (entry) => {
@@ -244,7 +258,8 @@ export async function inspectDesktop(profile: DesktopProfile, signal?: AbortSign
   const before = await processes(signal), apps = before.filter((entry) => entry.executable === metadata.executable);
   const result: Inspection[] = [];
   for (const app of apps) {
-    const server = directServer(before, app, registered.appPath), userDataPath = await userData(frameworkChildren(before, app, registered.appPath), signal);
+    const server = directServer(before, app, registered.appPath);
+    const userDataPath = userDataArgument ? await userData(frameworkChildren(before, app, registered.appPath), signal, userDataArgument) : undefined;
     let codexHome: string | undefined;
     if (server && codeHome) {
       checkSignal(signal);

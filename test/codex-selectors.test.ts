@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { codeHomeFromProcessRecord } from "../src/hosts/codex/desktop-selectors.ts";
+import { codeHomeFromProcessRecord, userDataFromProcessRecord } from "../src/hosts/codex/desktop-selectors.ts";
 
 const executable = "/Applications/Registered.app/Contents/Resources/codex";
 function execRecord(environment: string[], arguments_ = [executable, "app-server", "CODEX_HOME=/argument-decoy"]): Uint8Array {
@@ -31,4 +31,22 @@ test("ambiguous, missing or malformed selectors fail without disclosing or retai
   const truncated = execRecord(["HOME=/Users/example"]).slice(0, -3);
   expect(() => codeHomeFromProcessRecord(truncated, executable)).toThrow();
   expect(truncated.every((byte) => byte === 0)).toBe(true);
+});
+
+test("native profile arguments keep switch-like directory text inside its actual argv boundary", () => {
+  const selected = "/Users/example/Profile --flag=value";
+  const bytes = execRecord(["PRIVATE_VALUE=--user-data-dir=/environment-decoy"], [executable, `--user-data-dir=${selected}`, "--lang=en-US"]);
+  expect(userDataFromProcessRecord(bytes, executable)).toBe(selected);
+  expect(bytes.every((byte) => byte === 0)).toBe(true);
+  const absent = execRecord(["PRIVATE_VALUE=--user-data-dir=/environment-decoy"]);
+  expect(userDataFromProcessRecord(absent, executable)).toBeUndefined();
+  expect(absent.every((byte) => byte === 0)).toBe(true);
+  for (const arguments_ of [["--user-data-dir=/a", "--user-data-dir=/b"], ["--user-data-dir", "/a"], ["--user-data-dir="], ["--user-data-dir=relative"], ["--user-data-dir=/a\nprivate-marker"]]) {
+    const malformed = execRecord(["PRIVATE_VALUE=private-marker"], [executable, ...arguments_]);
+    let error: unknown;
+    try { userDataFromProcessRecord(malformed, executable); } catch (caught) { error = caught; }
+    expect(error).toBeInstanceOf(Error);
+    expect(String(error)).not.toContain("private-marker");
+    expect(malformed.every((byte) => byte === 0)).toBe(true);
+  }
 });

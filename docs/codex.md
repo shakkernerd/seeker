@@ -108,6 +108,11 @@ number: the refreshed receiver qualifies its live input capability before it
 receives a reply. Seeker does not update the application. Keep one Desktop
 profile per Seeker data directory.
 
+Profile qualification reads the actual native process argument boundaries, so
+spaces and switch-like text in directory names cannot identify a shorter path.
+The connector's forwarded profile selector or process-list hint must match that
+independent service check before the host can register or receive input.
+
 An unavailable host leaves replies in Seeker. When input might already have
 reached Codex but its result was lost, delivery remains **unknown**; Seeker does
 not blindly submit the same native input again. The receipt and manager's later
