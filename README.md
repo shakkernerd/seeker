@@ -36,6 +36,6 @@ The local channel is available immediately. [Codex Desktop setup](docs/codex.md)
 
 [Local setup and recovery](docs/local.md) covers authentication, data, startup, and operating limits. [Architecture](docs/architecture.md) explains the component boundaries. [Adapter contracts](docs/adapters.md) describes authenticated origin, reply correlation, and receipts. [Development and packaging](docs/development.md) covers verification and the installable tarball.
 
-Seeker runs as one Bun process with one local SQLite store. It listens on loopback and uses grammY for its optional Telegram adapter. It does not contain an LLM or agent executor.
+Seeker runs as one Bun service with one local SQLite store. It listens on loopback and uses grammY for its optional Telegram adapter. Desktop delivery supervises a bounded native Codex notification helper; existing managers continue to own project work and its permissions.
 
 MIT licensed.
