@@ -37,6 +37,7 @@ function connectHelper(profile: DesktopProfile, pipePath: string, workspace: str
     'features.plugins=false', 'features.apps=false',
     'features.tool_call_mcp_elicitation=true', 'model_reasoning_effort="low"',
     'features.multi_agent=false', 'features.multi_agent_v2=false', 'features.shell_tool=false',
+    'features.shell_snapshot=false', 'features.shell_snapshot_v2=false',
     'features.browser_use=false', 'features.computer_use=false', 'features.image_generation=false', 'features.view_image=false',
     'features.memories=false', 'features.skill_search=false', 'features.hooks=false',
     'features.goals=false', 'features.sleep_tool=false', 'features.tool_suggest=false',
