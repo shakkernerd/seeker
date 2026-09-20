@@ -7,6 +7,8 @@ import { binding as validateBinding } from "../../core/validation.ts";
 import { ensureDataDir } from "../../local/config.ts";
 import { privateDirectory, readConnectorConfig, readConnectorCredential, readPrivateFile } from "./config.ts";
 import { CodexHostAdapter } from "./host.ts";
+import { DesktopHelperDelivery } from "./helper-delivery.ts";
+import { NativeDesktopHelper } from "./helper-runtime.ts";
 import { CodexDesktopLifecycle } from "./desktop.ts";
 import { ConnectorError } from "./protocol.ts";
 import { installSection } from "../codex-common/install.ts";
@@ -84,12 +86,16 @@ export async function loadCodexHost(core: SeekerCore, dataDir: string) {
   if (!statIfPresent(path)) return;
   const config = readConnectorConfig(path);
   const lifecycle = new CodexDesktopLifecycle(join(dataDir, "codex-desktop.json"));
-  const host = new CodexHostAdapter(config.hostId, readConnectorCredential(config.credentialFile), { binding: (managerId) => core.managerBinding(config.hostId, managerId), manager: (origin) => core.manager(origin) }, 4_500, () => { core.resumeHost(config.hostId); }, lifecycle);
+  const input = new DesktopHelperDelivery(core, new NativeDesktopHelper(lifecycle, dataDir));
+  const host = new CodexHostAdapter(config.hostId, readConnectorCredential(config.credentialFile), { binding: (managerId) => core.managerBinding(config.hostId, managerId), manager: (origin) => core.manager(origin) }, lifecycle, input);
   try {
     const listener = await listenPrivate(config.socketPath, async (request) => await host.handle(request) ?? new Response(null, { status: 404 }));
     let closing: Promise<void> | undefined;
-    return { host, close: () => closing ??= (async () => { host.close(); await listener.close(); })() };
-  } catch (error) { host.close(); throw error; }
+    return { host, close: () => closing ??= (async () => {
+      const results = await Promise.allSettled([host.close(), listener.close()]);
+      for (const result of results) if (result.status === "rejected") throw result.reason;
+    })() };
+  } catch (error) { await host.close().catch(() => {}); throw error; }
 }
 
 function statIfPresent(path: string): Stats | undefined {

@@ -2,16 +2,16 @@ import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { linkSync, lstatSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import type { ManagerBinding } from "../../contracts.ts";
 import { privateDirectory, readPrivateFile } from "./config.ts";
 import { inspectDesktop, parseDesktopOwner, sameDesktopProcess, type DesktopOwner, type DesktopProfile } from "./desktop-owner.ts";
-import { readDesktopCodeHome, readDesktopUserData } from "./desktop-selectors.ts";
+import { readDesktopCodeHome, readDesktopUserData, readDesktopToolsPipe } from "./desktop-selectors.ts";
 import type { CodexHostLifecycle } from "./host.ts";
 import { ConnectorError, onlyKeys, record } from "./protocol.ts";
 
 interface DesktopOperations {
   inspect: typeof inspectDesktop;
-  open(profile: DesktopProfile, taskId: string, signal: AbortSignal): Promise<void>;
+  start(profile: DesktopProfile, signal: AbortSignal): Promise<void>;
+  pipe(server: DesktopOwner["server"]): string;
 }
 
 /** A native manager's first admitted call pins the host that may resume it later. */
@@ -19,7 +19,7 @@ export class CodexDesktopLifecycle implements CodexHostLifecycle {
   readonly #qualified = new Map<string, DesktopOwner>();
   #registered?: DesktopOwner;
 
-  constructor(private readonly statePath: string, private readonly operations: DesktopOperations = { inspect: (profile, signal) => inspectDesktop(profile, signal, readDesktopCodeHome, readDesktopUserData), open: openDesktop }) {
+  constructor(private readonly statePath: string, private readonly operations: DesktopOperations = { inspect: (profile, signal) => inspectDesktop(profile, signal, readDesktopCodeHome, readDesktopUserData), start: startDesktop, pipe: readDesktopToolsPipe }) {
     privateDirectory(dirname(statePath));
     let present = false;
     try { lstatSync(statePath); present = true; } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
@@ -63,23 +63,33 @@ export class CodexDesktopLifecycle implements CodexHostLifecycle {
     if (ownerKey(owner) !== ownerKey(this.#registered)) throw new ConnectorError("desktop_owner_changed", "Reconnect this receiver to the registered Desktop owner.", 409);
   }
 
-  async resume(binding: ManagerBinding, signal: AbortSignal, isCurrent: () => boolean): Promise<void> {
+  /** Preparation only: starting an absent host never selects a task or sends input. */
+  async prepare(signal: AbortSignal, isCurrent: () => boolean): Promise<{ owner: DesktopOwner; pipePath: string }> {
     const registered = this.#registered;
-    if (!registered) throw new ConnectorError("desktop_registration_required", "Reload the updated connector and use Seeker from the registered manager once to enable recovery.");
-    if (!registered.profile.sqliteHome) throw new ConnectorError("desktop_storage_unqualified", "Qualify the original native storage directory before allowing Desktop to restart.");
-    if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(binding.origin.managerId)) throw new ConnectorError("invalid_task", "Resume requires the exact registered native task ID.");
-    signal.throwIfAborted();
-    const instances = await this.operations.inspect(registered.profile, signal);
-    if (instances.length > 1) throw new ConnectorError("desktop_owner_ambiguous", "More than one Desktop instance is running. Preserve the registered owner.");
-    const current = instances[0];
-    if (current && (!current.server || current.userDataPath !== registered.profile.userDataPath || current.codexHome !== registered.profile.codexHome || current.sqliteHome !== registered.profile.sqliteHome)) {
-      throw new ConnectorError("desktop_owner_unqualified", "The running Desktop instance does not have the registered native profile and storage.");
+    if (!registered) throw new ConnectorError("desktop_registration_required", "Use Seeker from the original Desktop manager once to qualify its native host.");
+    if (!registered.profile.sqliteHome) throw new ConnectorError("desktop_storage_unqualified", "Qualify the original native storage directory before allowing Desktop recovery.");
+    let started = false;
+    for (;;) {
+      signal.throwIfAborted();
+      const instances = await this.operations.inspect(registered.profile, signal);
+      if (instances.length > 1) throw new ConnectorError("desktop_owner_ambiguous", "More than one Desktop instance is running. Preserve the registered owner.");
+      const current = instances[0];
+      if (current?.server && current.userDataPath === registered.profile.userDataPath && current.codexHome === registered.profile.codexHome && current.sqliteHome === registered.profile.sqliteHome) {
+        const pipePath = this.operations.pipe(current.server);
+        signal.throwIfAborted();
+        if (!isCurrent()) throw new ConnectorError("owner_changed", "The manager assignment changed during Desktop preparation.");
+        return { owner: { profile: registered.profile, app: current.app, server: current.server }, pipePath };
+      }
+      if (current?.server) throw new ConnectorError("desktop_owner_unqualified", "The running Desktop instance does not have the registered native profile and storage.");
+      if (!isCurrent()) throw new ConnectorError("owner_changed", "The manager assignment changed during Desktop preparation.");
+      if (!current && !started) { signal.throwIfAborted(); await this.operations.start(registered.profile, signal); started = true; }
+      await new Promise<void>((resolve, reject) => {
+        const finish = () => { clearTimeout(timer); signal.removeEventListener("abort", abort); resolve(); };
+        const abort = () => { clearTimeout(timer); signal.removeEventListener("abort", abort); reject(new Error("Desktop preparation cancelled")); };
+        const timer = setTimeout(finish, 250); timer.unref(); signal.addEventListener("abort", abort, { once: true });
+        if (signal.aborted) abort();
+      });
     }
-    signal.throwIfAborted();
-    if (!isCurrent()) throw new ConnectorError("owner_changed", "The manager assignment changed before Desktop could be resumed.");
-    // No prompt or model setting is passed. The host loads the original saved
-    // task; its qualified MCP receiver alone can deliver the retained receipt.
-    await this.operations.open(registered.profile, binding.origin.managerId, signal);
   }
 
   #save(owner: DesktopOwner): void {
@@ -102,11 +112,10 @@ function sameProfile(first: DesktopProfile, second: DesktopProfile): boolean {
 }
 function ownerKey(owner: DesktopOwner): string { return JSON.stringify(owner); }
 
-function openDesktop(profile: DesktopProfile, taskId: string, signal: AbortSignal): Promise<void> {
+function startDesktop(profile: DesktopProfile, signal: AbortSignal): Promise<void> {
   if (process.platform !== "darwin") return Promise.reject(new ConnectorError("desktop_platform", "Desktop recovery requires its registered local macOS host."));
-  const args = ["-a", profile.appPath, "--env", `CODEX_HOME=${profile.codexHome}`, "--env", `CODEX_ELECTRON_USER_DATA_PATH=${profile.userDataPath}`];
+  const args = ["-g", "-a", profile.appPath, "--env", `CODEX_HOME=${profile.codexHome}`, "--env", `CODEX_ELECTRON_USER_DATA_PATH=${profile.userDataPath}`];
   if (profile.sqliteHome) args.push("--env", `CODEX_SQLITE_HOME=${profile.sqliteHome}`);
-  args.push("--url", `codex://threads/${encodeURIComponent(taskId)}`);
   const environment = { ...process.env };
   delete environment.CODEX_HOME; delete environment.CODEX_ELECTRON_USER_DATA_PATH; delete environment.CODEX_SQLITE_HOME;
   return new Promise((resolve, reject) => {

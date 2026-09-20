@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { codeHomeFromProcessRecord, userDataFromProcessRecord } from "../src/hosts/codex/desktop-selectors.ts";
+import { codeHomeFromProcessRecord, toolsPipeFromProcessRecord, userDataFromProcessRecord } from "../src/hosts/codex/desktop-selectors.ts";
 
 const executable = "/Applications/Registered.app/Contents/Resources/codex";
 function execRecord(environment: string[], arguments_ = [executable, "app-server", "CODEX_HOME=/argument-decoy"]): Uint8Array {
@@ -47,6 +47,17 @@ test("native profile arguments keep switch-like directory text inside its actual
     try { userDataFromProcessRecord(malformed, executable); } catch (caught) { error = caught; }
     expect(error).toBeInstanceOf(Error);
     expect(String(error)).not.toContain("private-marker");
+    expect(malformed.every((byte) => byte === 0)).toBe(true);
+  }
+});
+
+test("the current native tool socket comes only from its exact environment selector and erases unrelated data", () => {
+  const bytes = execRecord(["PRIVATE_VALUE=CODEX_APP_TOOLS_PIPE_PATH=/decoy", "CODEX_APP_TOOLS_PIPE_PATH=/private/tmp/native tools.sock"], [executable, "CODEX_APP_TOOLS_PIPE_PATH=/argument-decoy"]);
+  expect(toolsPipeFromProcessRecord(bytes, executable)).toBe("/private/tmp/native tools.sock");
+  expect(bytes.every((byte) => byte === 0)).toBe(true);
+  for (const environment of [[], ["CODEX_APP_TOOLS_PIPE_PATH="], ["CODEX_APP_TOOLS_PIPE_PATH=relative"], ["CODEX_APP_TOOLS_PIPE_PATH=/a", "CODEX_APP_TOOLS_PIPE_PATH=/b"], ["CODEX_APP_TOOLS_PIPE_PATH=/a/../b"]]) {
+    const malformed = execRecord([...environment, "PRIVATE_VALUE=private-marker"]);
+    expect(() => toolsPipeFromProcessRecord(malformed, executable)).toThrow("could not be verified");
     expect(malformed.every((byte) => byte === 0)).toBe(true);
   }
 });

@@ -1,4 +1,4 @@
-import type { DeliveryResult, HostEnvelope, ManagerBinding } from "../../contracts.ts";
+import type { HostEnvelope, ManagerBinding } from "../../contracts.ts";
 import { SeekerError } from "../../core/validation.ts";
 
 export const codexRoute = "/api/hosts/codex";
@@ -55,17 +55,6 @@ export function parseInvocation(value: unknown): NativeInvocation {
   const input = record(value);
   onlyKeys(input, ["threadId", "turnId", "callId"]);
   return { threadId: identifier(input.threadId), turnId: identifier(input.turnId), callId: identifier(input.callId) };
-}
-
-export function parseDeliveryResult(value: unknown): DeliveryResult {
-  const result = record(value);
-  if (result.status === "accepted") return { status: "accepted", reference: identifier(result.reference) };
-  if (result.status === "retry") {
-    if (!Number.isSafeInteger(result.retryAfterMs) || (result.retryAfterMs as number) < 100 || (result.retryAfterMs as number) > 60_000) throw new ConnectorError("invalid_result", "Invalid retry delay.");
-    return { status: "retry", code: identifier(result.code), retryAfterMs: result.retryAfterMs as number };
-  }
-  if (result.status === "rejected" || result.status === "unknown") return { status: result.status, code: identifier(result.code) };
-  throw new ConnectorError("invalid_result", "Invalid native delivery result.");
 }
 
 export function nativeWakeup(delivery: NativeDelivery): string {
