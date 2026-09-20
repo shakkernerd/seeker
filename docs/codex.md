@@ -1,21 +1,26 @@
 # Codex Desktop
 
 Seeker connects an existing Codex Desktop manager to your local inbox. The manager
-asks through a small MCP connector; your later reply returns to that same task,
-including while it is idle or already working. The task keeps its workspace,
-model, history, permissions and native execution owner.
-After native registration, Seeker can also resume a task that Desktop has
-unloaded, or start its registered Desktop host when it is stopped.
+asks through a small MCP connector; your later reply returns to that same task in
+the background, including while it is idle, working or unloaded. Your selected
+task and window focus stay in place. The manager keeps its workspace, model,
+history, permissions and native execution owner.
 
 The connector runs in the runtime supplied by Codex Desktop. Seeker's service,
-store and messaging channels run on Bun. No additional model or agent executor
-is involved.
+store and messaging channels run on Bun. Background return also uses a private
+Codex helper to prepare a native notification. This preparation incurs model
+usage through the registered native profile; the original manager continues to
+own the conversation and work.
 
 ## Set up a manager
 
 Install the built Seeker package and the qualified Bun version described in the
-[local setup guide](local.md). With Seeker stopped, register the existing task and
-its project:
+[local setup guide](local.md). Background return requires the official
+`@openai/codex` npm CLI, available as `codex` on the Seeker service's `PATH`.
+Seeker runs its unmodified launcher with the Node runtime supplied by the
+registered Desktop application. Keep both installations available and compatible.
+
+With Seeker stopped, register the existing task and its project:
 
 ```sh
 seeker codex setup --project "$PWD" --task NATIVE_TASK_ID --label "Project manager"
@@ -84,29 +89,48 @@ a separate delivery state. None of these statuses
 means the underlying project work is complete or grants native execution
 permission.
 
-When a saved reply has no receiving connector, Seeker allows normal polling gaps
-and in-flight native input to finish before requesting one host wake. It uses the
-registered application's existing-task link without adding a model prompt or
-overriding task settings. Desktop may come to the foreground and show that task.
-If the app is stopped, it starts with the registered profile and native storage
-locations. The authentic connector must qualify again before receiving input.
-Starting the app is separate from delivering the reply: slow startup leaves the
-reply saved and retryable, and receiver readiness restores known-undelivered
-work even after its ordinary retries have ended. If the app appears before its
-native server and profile are ready, Seeker rechecks startup for up to 15 seconds
-with increasing delays. A successful wake request is coalesced while the
-connector starts.
+## Background delivery and recovery
+
+For each notification, a private Codex CLI app-server helper prepares one normal
+`send_message_to_thread` call addressed to the original Desktop task. This is the
+helper's only enabled MCP tool, and each call requires its own native approval.
+The helper model has no shell or filesystem execution environment.
+Seeker grants that single call only after matching its target and notification
+to the current exchange, pending input and manager generation. Cancellation,
+owner changes and obsolete notices invalidate a prepared call. Manager admission
+and Seeker's conversation tools remain on the original Desktop task.
+
+Model preparation happens outside the delivery pump's five-second send budget.
+Preparation cannot send while its approval is pending. When it becomes ready,
+Seeker restores known-undelivered retries, including work whose ordinary retry
+budget ended during preparation. The next current delivery attempt grants the
+call and waits briefly for its correlated native tool receipt. That receipt must
+confirm the original target; the helper's final answer is never delivery evidence.
+
+The helper uses the registered profile's existing native authentication and
+storage. Its workspace and lifecycle record live in the private
+`<data-dir>/codex-helper` directory, and its separate native history is bounded.
+Seeker supervises its process lifetime and can resume it after service restart.
+It does not copy credentials or the manager's conversation into the helper.
+Preparation failures have bounded retries; an unavailable native interface does
+not start an unlimited sequence of model turns.
+
+Background input works without an existing Seeker receiver in the target task.
+If the registered application is absent, Seeker can open it in the background
+with its registered profile and native storage locations. It never restarts a
+running Desktop app. Recovery uses no task URI or navigation operation. The
+original manager's connector qualifies again when its Seeker tools reconnect.
 
 An ordinary manual app restart can change the process IDs. Seeker verifies the
 running application's actual Desktop profile, code home and native database
 location before resuming the original task; a matching process ID alone is not
-the host identity. The connector then qualifies again before receiving input.
+the host identity. The helper qualifies its native input tool, and the manager's
+connector qualifies again when it reconnects.
 A different or unreadable profile, ambiguous instances, missing storage evidence,
 or an incompatible native interface remains blocked. Discovery is limited to
 the service's effective OS user. A compatible app update can change its build
-number: the refreshed receiver qualifies its live input capability before it
-receives a reply. Seeker does not update the application. Keep one Desktop
-profile per Seeker data directory.
+number: the native interfaces must qualify again before use. Seeker does not
+update the application. Keep one Desktop profile per Seeker data directory.
 
 Profile qualification reads the actual native process argument boundaries, so
 spaces and switch-like text in directory names cannot identify a shorter path.
@@ -114,10 +138,11 @@ The connector's forwarded profile selector or process-list hint must match that
 independent service check before the host can register or receive input.
 
 An unavailable host leaves replies in Seeker. When input might already have
-reached Codex but its result was lost, delivery remains **unknown**; Seeker does
-not blindly submit the same native input again. The receipt and manager's later
-acknowledgement remain available for reconciliation. Restarting Seeker does not
-create a replacement manager.
+reached Codex after the one-call approval was written but its result was lost,
+delivery remains **unknown**. Seeker does not replay that input after helper or
+service restart. The receipt and manager's later acknowledgement remain
+available for reconciliation. Restarting Seeker does not create a replacement
+manager.
 
 If channel delivery fails or becomes uncertain after submission, a separate
 service notice returns to the original manager. It reads the current state and
@@ -130,10 +155,11 @@ original scope and conditions before using `reconcile-input`.
 
 The initial native path is for a local macOS Codex Desktop host that provides
 native task tools and per-invocation MCP metadata. The connector checks those
-capabilities at startup. A standalone CLI, an ACP adapter that starts another
-server, and a saved task record in a different daemon are not attachment to the
-Desktop task. Requalify native behavior after host updates; the host integration
-interfaces are version-sensitive.
+capabilities at startup. The helper's genuine CLI invokes the registered Desktop
+host's native tool; the target remains the Desktop task. A saved task record in a
+different daemon or an ACP adapter that starts another server does not establish
+that return path. Requalify native behavior after host updates; the host
+integration interfaces are version-sensitive.
 
 [CLI managers](codex-cli.md) use their own explicitly registered native Unix
 app-server. Both hosts share the same project MCP entry and tool definitions;
@@ -162,7 +188,7 @@ service on loopback and keep connector credentials out of prompts and logs.
 | The task is denied | Verify the exact registered task ID. A lead should report to its manager. |
 | Native runtime is unavailable | Launch the connector through Desktop; do not replace its runtime with a PATH CLI or change host authentication. |
 | Replies are waiting | Start Seeker with the registered data directory and restore the native connector. |
-| Automatic Desktop recovery is unavailable | Repeat setup after upgrading, reload the connector, and use `pending` from the original manager once. Keep the registered application and profile available. |
+| Automatic Desktop recovery is unavailable | Check that the official `@openai/codex` npm CLI is available as `codex` on Seeker's service `PATH`. After an upgrade, repeat setup, reload the connector and use `pending` from the original manager once. Keep the registered application and profile available. |
 | A different Desktop profile or incompatible interface is running | Restore the registered profile and a compatible native connector; saved replies remain available. |
 | Delivery is unknown | Read the retained exchange and native receipt before attempting another delivery. |
 | Setup reports conflicting settings | Preserve the existing configuration and reconcile the specifically named Seeker section. |

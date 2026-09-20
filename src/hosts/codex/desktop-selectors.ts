@@ -9,7 +9,7 @@ const wanted = ["HOME=", "CODEX_HOME="] as const;
 const userDataArgument = "--user-data-dir=";
 const invalid = () => new ConnectorError("desktop_selectors_unavailable", "The native host's original profile selectors could not be verified.", 503);
 
-function selectorFromProcessRecord(bytes: Uint8Array, expectedExecutable: string, selector: "codeHome" | "userData"): string | undefined {
+function selectorFromProcessRecord(bytes: Uint8Array, expectedExecutable: string, selector: "codeHome" | "userData" | "toolsPipe"): string | undefined {
   try {
     if (bytes.length < 8 || bytes.length > maximumRecordBytes) throw invalid();
     const argc = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getInt32(0, true);
@@ -38,12 +38,18 @@ function selectorFromProcessRecord(bytes: Uint8Array, expectedExecutable: string
     const selected: Record<string, string> = {};
     while (offset < bytes.length && bytes[offset] !== 0) {
       const [start, end] = next();
-      for (const prefix of wanted) {
+      const prefixes: readonly string[] = selector === "toolsPipe" ? ["CODEX_APP_TOOLS_PIPE_PATH="] : wanted;
+      for (const prefix of prefixes) {
         if (!startsWith(start, end, prefix)) continue;
         const key = prefix.slice(0, -1);
         if (selected[key] !== undefined || end - start - prefix.length > 4_096) throw invalid();
         selected[key] = decoder.decode(bytes.subarray(start + prefix.length, end));
       }
+    }
+    if (selector === "toolsPipe") {
+      const value = selected.CODEX_APP_TOOLS_PIPE_PATH;
+      if (!value) throw invalid();
+      return selectedPath(value);
     }
     const home = selected.CODEX_HOME ?? (selected.HOME ? join(selected.HOME, ".codex") : undefined);
     if (!home) throw invalid();
@@ -68,7 +74,7 @@ export function userDataFromProcessRecord(bytes: Uint8Array, expectedExecutable:
 }
 
 /** Service-only macOS inspection; the Node MCP connector never loads this module. */
-function readDesktopSelector(nativeProcess: DesktopProcess, selector: "codeHome" | "userData"): string | undefined {
+function readDesktopSelector(nativeProcess: DesktopProcess, selector: "codeHome" | "userData" | "toolsPipe"): string | undefined {
   if (process.platform !== "darwin" || !["arm64", "x64"].includes(process.arch) || !Number.isSafeInteger(nativeProcess.pid) || nativeProcess.pid <= 1 || nativeProcess.pid > 0x7fffffff) throw invalid();
   const library = dlopen("/usr/lib/libSystem.B.dylib", { sysctl: { args: ["ptr", "u32", "ptr", "ptr", "ptr", "u64"], returns: "i32" } });
   // CTL_KERN / KERN_PROCARGS2: the OS exec record for this verified native PID.
@@ -80,6 +86,10 @@ function readDesktopSelector(nativeProcess: DesktopProcess, selector: "codeHome"
     if (library.symbols.sysctl(ptr(mib), 3, ptr(bytes), ptr(length), null, 0) !== 0 || length[0]! > BigInt(bytes.length)) throw invalid();
     const value = selectorFromProcessRecord(bytes.subarray(0, Number(length[0]!)), nativeProcess.executable, selector);
     if (value === undefined) return;
+    if (selector === "toolsPipe") {
+      if (!statSync(value).isSocket()) throw invalid();
+      return value;
+    }
     const directory = realpathSync(value);
     if (!statSync(directory).isDirectory()) throw invalid();
     return directory;
@@ -89,3 +99,9 @@ function readDesktopSelector(nativeProcess: DesktopProcess, selector: "codeHome"
 
 export function readDesktopCodeHome(server: DesktopProcess): string { return readDesktopSelector(server, "codeHome")!; }
 export function readDesktopUserData(child: DesktopProcess): string | undefined { return readDesktopSelector(child, "userData"); }
+
+/** Recover only the native tool socket selector from the verified current server. */
+export function toolsPipeFromProcessRecord(bytes: Uint8Array, expectedExecutable: string): string {
+  return selectorFromProcessRecord(bytes, expectedExecutable, "toolsPipe")!;
+}
+export function readDesktopToolsPipe(server: DesktopProcess): string { return readDesktopSelector(server, "toolsPipe")!; }

@@ -5,20 +5,11 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { CodexNativeClient } from "../src/hosts/codex/native.ts";
 import { installSection } from "../src/hosts/codex/setup.ts";
-import type { NativeDelivery } from "../src/hosts/codex/protocol.ts";
 
 const cleanup: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
 
-function delivery(): NativeDelivery {
-  return {
-    attemptId: "attempt-one",
-    binding: { id: "binding-one", label: "Manager", origin: { hostId: "native", managerId: "task-one", assignmentId: "assignment", generation: 1, turnId: "original-turn", callId: "original-call" }, recipient: { channelId: "local", actorId: "owner", conversationId: "inbox" } },
-    envelope: { deliveryId: "delivery-one", exchangeId: "request-one", revision: { number: 1, replyHandle: "handle-one", createdAt: 1, decision: { kind: "information", title: "A question", question: "A or B?", context: "", target: "", effect: "", scope: "", conditions: "", options: [] } }, receipt: { id: "receipt-one", revision: 1, kind: "question", text: "Explain B", conditions: "", classification: "response", source: { channelId: "local", actorId: "owner", conversationId: "inbox", eventId: "event-one", reference: "local:event", recordedAt: 2, verification: "channel" }, disposition: { status: "pending" } }, requiresReconciliation: false },
-  };
-}
-
-async function nativeFixture(mode: "accepted" | "drop" | "wrong-target" | "bad-frame" | "extra-required" | "wrong-input-type" = "accepted") {
+async function nativeFixture(mode: "compatible" | "drop" | "bad-frame" | "extra-required" | "wrong-input-type" = "compatible") {
   const path = join(tmpdir(), `sk-${randomUUID().slice(0, 8)}.sock`);
   const requests: Record<string, any>[] = [], sockets = new Set<Socket>();
   const server = createServer((socket) => {
@@ -29,11 +20,9 @@ async function nativeFixture(mode: "accepted" | "drop" | "wrong-target" | "bad-f
       if (pending.length < 4 || pending.length < pending.readUInt32LE(0) + 4) return;
       const request = JSON.parse(pending.subarray(4, pending.readUInt32LE(0) + 4).toString());
       requests.push(request);
-      if (request.method === "tools/call" && mode === "drop") { socket.destroy(); return; }
-      if (request.method === "tools/call" && mode === "bad-frame") { const header = Buffer.alloc(4); header.writeUInt32LE(0xffffffff); socket.end(header); return; }
-      const result = request.method === "tools/list"
-        ? { tools: [{ name: "send_message_to_thread", namespace: "codex_app", inputSchema: { type: "object", properties: { threadId: { type: mode === "wrong-input-type" ? "number" : "string" }, prompt: { type: "string" } }, ...(mode === "extra-required" ? { required: ["threadId", "prompt", "newRequiredField"] } : {}) } }] }
-        : { success: true, contentItems: [{ type: "inputText", text: JSON.stringify({ threadId: mode === "wrong-target" ? "different-task" : request.params.arguments.threadId }) }] };
+      if (mode === "drop") { socket.destroy(); return; }
+      if (mode === "bad-frame") { const header = Buffer.alloc(4); header.writeUInt32LE(0xffffffff); socket.end(header); return; }
+      const result = { tools: [{ name: "send_message_to_thread", namespace: "codex_app", inputSchema: { type: "object", properties: { threadId: { type: mode === "wrong-input-type" ? "number" : "string" }, prompt: { type: "string" } }, ...(mode === "extra-required" ? { required: ["threadId", "prompt", "newRequiredField"] } : {}) } }] };
       const body = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }));
       const frame = Buffer.alloc(4 + body.length); frame.writeUInt32LE(body.length); body.copy(frame, 4);
       socket.write(frame.subarray(0, 2)); socket.write(frame.subarray(2, 9)); socket.end(frame.subarray(9));
@@ -44,59 +33,28 @@ async function nativeFixture(mode: "accepted" | "drop" | "wrong-target" | "bad-f
   return { path, requests };
 }
 
-describe("native input boundary", () => {
-  test("an incompatible refreshed input capability receives no owner notification", async () => {
+describe("native catalogue qualification", () => {
+  test("rejects an incompatible refreshed input capability", async () => {
     for (const mode of ["extra-required", "wrong-input-type"] as const) {
       const fixture = await nativeFixture(mode);
-      expect(await new CodexNativeClient(fixture.path).deliver(delivery())).toMatchObject({ status: "retry", code: "native_input_unavailable" });
+      await expect(new CodexNativeClient(fixture.path).qualify()).rejects.toMatchObject({ code: "native_incompatible" });
       expect(fixture.requests.map((request) => request.method)).toEqual(["tools/list"]);
     }
   });
 
-  test("uses the exact existing target and supplies no execution setting overrides", async () => {
+  test("qualifies the fragmented catalogue response without sending native input", async () => {
     const fixture = await nativeFixture();
-    const result = await new CodexNativeClient(fixture.path).deliver(delivery());
-    expect(result).toEqual({ status: "accepted", reference: "codex:delivery-one" });
-    const call = fixture.requests.find((request) => request.method === "tools/call")!;
-    expect(call.params.tool).toBe("send_message_to_thread");
-    expect(call.params.threadId).toBe("task-one");
-    expect(call.params.turnId).toBe("original-turn");
-    expect(Object.keys(call.params.arguments).sort()).toEqual(["prompt", "threadId"]);
-    expect(call.params.arguments.prompt).toContain("receipt-one");
-    expect(call.params.arguments.prompt).toContain('"collection":"receipts","itemId":"receipt-one"');
-    expect(call.params.arguments.prompt).toContain("not an approval");
-    expect(fixture.requests.some((request) => /thread\/(start|resume|fork)|approval/.test(request.method))).toBe(false);
+    await new CodexNativeClient(fixture.path).qualify();
+    expect(fixture.requests).toEqual([{ jsonrpc: "2.0", id: 1, method: "tools/list", params: { threadStartKind: "all" } }]);
   });
 
-  test("uncertain writes, wrong targets and oversized frames never become retryable success", async () => {
-    for (const mode of ["drop", "wrong-target", "bad-frame"] as const) {
+  test("dropped connections and oversized frames cannot qualify a connector", async () => {
+    for (const mode of ["drop", "bad-frame"] as const) {
       const fixture = await nativeFixture(mode);
-      expect((await new CodexNativeClient(fixture.path).deliver(delivery())).status).toBe("unknown");
-      expect(fixture.requests.filter((request) => request.method === "tools/call")).toHaveLength(1);
+      await expect(new CodexNativeClient(fixture.path).qualify()).rejects.toMatchObject({ code: mode === "drop" ? "native_disconnected" : "native_invalid_frame" });
+      expect(fixture.requests.map((request) => request.method)).toEqual(["tools/list"]);
     }
-    expect((await new CodexNativeClient(join(tmpdir(), `missing-${randomUUID()}.sock`)).deliver(delivery())).status).toBe("retry");
-  });
-
-  test("missing original provenance cannot invent a native caller", async () => {
-    const value = delivery(); delete value.binding.origin.turnId;
-    expect(await new CodexNativeClient("unused").deliver(value)).toMatchObject({ status: "retry", code: "native_origin_required" });
-  });
-
-  test("saved input and service failure notices use native input without impersonating an owner decision", async () => {
-    const fixture = await nativeFixture(), native = new CodexNativeClient(fixture.path), value = delivery();
-    const shared = { deliveryId: "deferred-delivery", exchangeId: value.envelope.exchangeId, revision: value.envelope.revision, requiresReconciliation: true as const };
-    value.envelope = { ...shared, deferred: { channelId: "local", event: { eventId: "saved-event", actorId: "owner", conversationId: "inbox", sourceRef: "local:event", kind: "answer", text: "Only for the demo", conditions: "No real work" }, exchangeId: shared.exchangeId, revision: 1, recordedAt: 1, verification: "channel", disposition: { status: "pending" } } };
-    expect((await native.deliver(value)).status).toBe("accepted");
-    value.envelope = { ...shared, deliveryId: "notice-delivery", notice: { deliveryId: "failed-channel-delivery", state: "unknown", code: "transport_lost" } };
-    expect((await native.deliver(value)).status).toBe("accepted");
-    const messages = fixture.requests.filter((request) => request.method === "tools/call").map((request) => request.params.arguments.prompt as string);
-    expect(messages[0]).toContain("reconcile-input");
-    expect(messages[0]).toContain('"collection":"deferred","itemId":"saved-event","channelId":"local"');
-    expect(messages[0]).toContain("not an accepted approval");
-    expect(messages[1]).toContain("not a human reply");
-    expect(messages[1]).toContain("native attention path");
-    expect(messages[1]).toContain('"collection":"deliveries","itemId":"failed-channel-delivery"');
-    expect(messages[1]).not.toContain("acknowledge this receipt");
+    await expect(new CodexNativeClient(join(tmpdir(), `missing-${randomUUID()}.sock`)).qualify()).rejects.toMatchObject({ code: "native_unavailable" });
   });
 });
 
