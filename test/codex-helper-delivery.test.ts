@@ -47,7 +47,7 @@ function fixture(hold = false, readyMs = 1_000) {
   cleanups.push(async () => { prepared.resolve(); await sender.close(); store.close(); });
   const deliver = (signal = new AbortController().signal) => sender.deliver(binding, envelope, signal);
   const nativeResult = (overrides: Record<string, unknown> = {}) => events.notice("item/completed", { threadId: "helper", turnId: "helper-turn", item: { ...item(), status: "completed", result: { content: [{ type: "text", text: JSON.stringify({ threadId: binding.origin.managerId }) }] }, ...overrides } });
-  return { sender, core, store, binding, manager, envelope, view, deliver, nativeResult, approval, replies, prepared,
+  return { sender, runtime, core, store, binding, manager, envelope, view, deliver, nativeResult, approval, replies, prepared,
     now: (value: number) => { now = value; }, preparations: () => preparations, resets: () => resets,
     ready: async () => { await until(() => Boolean(expected)); await Bun.sleep(2); },
     failPreparation: () => { failPrepare = true; }, holdReset: (promise: Promise<void>) => { resetGate = promise; },
@@ -125,6 +125,67 @@ test("known prewrite failure can prepare again, but cannot reuse a still-settlin
   reset.resolve(); await Bun.sleep(1_020);
   await f.deliver(); await f.ready(); expect(f.preparations()).toBe(2);
   const result = f.deliver(); f.nativeResult(); expect((await result).status).toBe("accepted");
+});
+
+test("a second failed preparation releases exhausted work for another manager without retrying uncertain input", async () => {
+  const f = fixture(), failures = [deferred(), deferred()], prepare = f.runtime.prepare;
+  f.runtime.prepare = async (...args) => {
+    const helper = await prepare(...args), failure = failures[f.preparations() - 1];
+    if (failure) { await failure.promise; throw new Error("known prewrite preparation failure"); }
+    return helper;
+  };
+  cleanups.push(async () => { for (const failure of failures) failure.resolve(); });
+  const binding = { ...f.binding, id: "other-binding", origin: { ...f.binding.origin, managerId: "other-manager", assignmentId: "other-assignment" } };
+  f.core.bind(binding);
+  const initial = f.core.manager(binding.origin).submit({ requestId: "other-request", decision: fixtureDecision });
+  const received = f.core.channel("local").receive([{ eventId: "other-reply", actorId: "owner", conversationId: "inbox", sourceRef: "local:other-reply", replyHandle: initial.current.replyHandle, kind: "question", text: "What about my request?" }])[0]!;
+  const view = f.store.get(initial.exchange.id)!;
+  const envelope: ReceiptEnvelope = {
+    deliveryId: view.deliveries.find((item) => item.receiptId === received.receiptId)!.id, exchangeId: initial.exchange.id,
+    revision: view.exchange.revisions[0]!, receipt: view.exchange.receipts[0]!, requiresReconciliation: false,
+  };
+  const saved = (value: ReceiptEnvelope) => f.store.get(value.exchangeId)!.deliveries.find((item) => item.id === value.deliveryId)!;
+  let now = 1_000;
+  const attemptRound = async (loseResponse = false) => {
+    f.now(now);
+    for (const attempt of f.store.claimDeliveries(4, now)) {
+      let result: DeliveryResult = { status: "accepted", reference: `shown:${attempt.id}` };
+      if (attempt.lane === "host") {
+        const other = attempt.id === envelope.deliveryId;
+        const delivery = f.sender.deliver(other ? binding : f.binding, other ? envelope : f.envelope, new AbortController().signal);
+        if (other && loseResponse) {
+          expect(f.replies.filter((entry) => entry.result.action === "accept")).toHaveLength(1);
+          f.lost();
+        }
+        result = await delivery;
+        if (other && !loseResponse && f.preparations() <= 2) expect(result).toMatchObject({ status: "retry", code: "desktop_helper_busy" });
+      }
+      f.store.completeDelivery(attempt.id, attempt.attemptId!, result, now);
+    }
+    now += 1_000;
+  };
+  for (let failure = 0; failure < 2; failure++) {
+    for (let attempt = 0; attempt < 5; attempt++) await attemptRound();
+    expect(f.preparations()).toBe(failure + 1);
+    expect(saved(f.envelope)).toMatchObject({ state: "rejected", code: "retry_exhausted", attempts: 5 });
+    expect(saved(envelope)).toMatchObject({ state: "rejected", code: "retry_exhausted", attempts: 5 });
+    expect(f.replies).toHaveLength(0);
+    failures[failure]!.resolve();
+    await until(() => saved(envelope).state === "retry");
+    expect(f.resets()).toBe(failure + 1);
+  }
+  expect(await f.deliver()).toMatchObject({ status: "retry", code: "desktop_helper_preparation_failed" });
+  await attemptRound(); await f.ready();
+  expect(f.preparations()).toBe(3);
+  await attemptRound(true);
+  expect(saved(envelope)).toMatchObject({ state: "unknown", code: "desktop_input_uncertain" });
+  expect(f.core.resumeHost(binding.origin.hostId)).toBe(0);
+  await attemptRound();
+  expect((await f.sender.deliver(binding, envelope, new AbortController().signal)).status).toBe("unknown");
+  expect(await f.deliver()).toMatchObject({ status: "retry", code: "desktop_helper_preparation_failed" });
+  expect(f.preparations()).toBe(3);
+  expect(f.replies.filter((entry) => entry.result.action === "accept")).toHaveLength(1);
+  expect(saved(envelope).state).toBe("unknown");
 });
 
 test("shutdown cancels pending preparation and late callbacks cannot access a closed store", async () => {

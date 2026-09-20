@@ -199,7 +199,10 @@ export class DesktopHelperDelivery {
     // cannot reuse a thread while its previous native turn could still act.
     this.#track(this.runtime.reset().then(() => {
       if (this.#job === job) this.#job = undefined;
-      if (!this.#closed && (result.status !== "retry" || retryPreparation)) {
+      // Other managers may have exhausted their pump attempts while this one
+      // occupied the helper. Releasing it restores their known-unsent work too;
+      // this delivery's own preparation cap remains in #failed.
+      if (!this.#closed) {
         clearTimeout(this.#readyTimer);
         this.#readyTimer = setTimeout(() => { if (!this.#closed) this.core.resumeHost(job.binding.origin.hostId); }, retryPreparation ? 1_000 : 0);
         this.#readyTimer.unref();
