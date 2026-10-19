@@ -249,3 +249,20 @@ test("reset owns a connecting helper and closes a connection returned after canc
   expect(f.connections[0]!.connected).toBe(false);
   expect(requests(f.calls, "initialize")).toHaveLength(0);
 });
+
+test("runtime close aborts and joins event metadata reads without creating a helper", async () => {
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), "seeker-reader-close-")));
+  let entered!: () => void, aborted = false, settled = false;
+  const started = new Promise<void>((resolve) => { entered = resolve; });
+  const runtime = new NativeDesktopHelper({ prepare: async () => { throw new Error("A metadata read cannot prepare a helper"); } }, directory,
+    () => { throw new Error("A metadata read cannot connect a helper"); },
+    async (_owner, readSignal) => {
+      entered();
+      await new Promise<void>((resolve) => { readSignal.addEventListener("abort", () => { aborted = true; queueMicrotask(resolve); }, { once: true }); });
+      settled = true; throw new Error("Owned read stopped");
+    });
+  cleanups.push(async () => { await runtime.close(); rmSync(directory, { recursive: true, force: true }); });
+  const reading = runtime.readEventState({ hostId: "codex-desktop", taskId: "owner", turnId: "turn", callId: "call" }, signal()).catch(() => undefined);
+  await started; await runtime.close(); await reading;
+  expect(aborted).toBe(true); expect(settled).toBe(true);
+});

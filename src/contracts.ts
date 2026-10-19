@@ -1,3 +1,4 @@
+import type { EventEnvelope, EventStore } from "./events.ts";
 /** Host-produced identity. Never construct this from model tool arguments. */
 export interface ManagerOrigin {
   hostId: string;
@@ -234,9 +235,11 @@ export interface DeliveryNoticeEnvelope {
 
 export type HostEnvelope = ReceiptEnvelope | DeferredEnvelope | DeliveryNoticeEnvelope;
 
+export interface NativeReturnTarget { id: string; origin: ManagerOrigin }
+export type NativeEnvelope = HostEnvelope | EventEnvelope;
 export interface HostAdapter {
   id: string;
-  deliver(binding: ManagerBinding, envelope: HostEnvelope, signal: AbortSignal): Promise<DeliveryResult>;
+  deliver(binding: NativeReturnTarget, envelope: NativeEnvelope, signal: AbortSignal): Promise<DeliveryResult>;
 }
 
 export type ManagerCommand =
@@ -289,6 +292,7 @@ export interface ChannelIngress {
 
 /** Domain transactions: creation/outbox, reply/dedup/cursor and owner fencing are atomic. */
 export interface ExchangeStore {
+  readonly events: EventStore;
   bind(binding: ManagerBinding): void;
   setRecipient(bindingId: string, expectedGeneration: number, recipient: Recipient): void;
   binding(origin: ManagerOrigin): ManagerBinding;

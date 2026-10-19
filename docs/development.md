@@ -18,3 +18,6 @@ Install that tarball into a separate consumer directory with `bun add /absolute/
 The focused tests exercise actual SQLite transactions, immutable revisions, event/choice deduplication, correction chronology, generation fencing, receiver progress, and recovery. Service-level checks use real commands and authenticated HTTP. Controlled host fixtures are labelled and establish only the core/local contract; a real host adapter needs its own native manager-origin and return-path proof.
 
 Keep adapters thin: authenticate and normalize at their boundary, then use the shared core ports. Add coverage only for a distinct failure or protected behavior, preferably through the actual owner/caller path. Never put credentials, raw provider payloads, whole agent conversations, or local operational evidence in the public repository.
+
+
+Background events add focused store, producer and native-owner cases in `test/events.test.ts`, `test/event-producer.test.ts` and `test/event-native.test.ts`. The producer case runs the actual private-file CLI against an authenticated ordinary signal endpoint. Native fixture tests establish admission, pre-grant generation/Stop fences and uncertain-send handling; a real Desktop idle-return scenario remains separate platform proof. Do not infer actual native deployment readiness from controlled fixtures.

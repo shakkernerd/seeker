@@ -8,6 +8,7 @@ import { SeekerCore } from "../src/core/seeker.ts";
 import { SqliteExchangeStore } from "../src/store/sqlite.ts";
 import { CodexHostAdapter, type CodexHostLifecycle } from "../src/hosts/codex/host.ts";
 import { codexRoute, invocationFromMetadata } from "../src/hosts/codex/protocol.ts";
+import { eventDigest } from "../src/core/events.ts";
 import { localRecipient } from "../src/local/channel.ts";
 
 const credential = "a".repeat(64), humanCredential = "b".repeat(64);
@@ -21,7 +22,7 @@ function fixture(clock: () => number = Date.now, lifecycle?: CodexHostLifecycle)
   let restorations = 0;
   const bindings = ["manager-one", "manager-two"].map((managerId): ManagerBinding => ({ id: managerId, label: managerId, origin: { hostId: "codex-test", managerId, assignmentId: `assignment-${managerId}`, generation: 1 }, recipient: localRecipient }));
   bindings.forEach((binding) => core.bind(binding));
-  const host = new CodexHostAdapter("codex-test", credential, { binding: (id) => core.managerBinding("codex-test", id), manager: (origin) => core.manager(origin) }, lifecycle, { deliver: async () => ({ status: "retry", retryAfterMs: 1_000, code: "helper_preparing" }), restored: () => { restorations += 1; core.resumeHost("codex-test"); }, close: async () => {} });
+  const host = new CodexHostAdapter("codex-test", credential, { binding: (id) => core.managerBinding("codex-test", id), manager: (origin) => core.manager(origin), events: (origin) => core.events({ hostId: "codex-test", taskId: origin.threadId, turnId: origin.turnId, callId: origin.callId }) }, lifecycle, { deliver: async () => ({ status: "retry", retryAfterMs: 1_000, code: "helper_preparing" }), restored: () => { restorations += 1; core.resumeHost("codex-test"); }, close: async () => {} });
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: async (request) => await host.handle(request) ?? new Response(null, { status: 404 }) });
   cleanups.push(async () => { await host.close(); await server.stop(true); store.close(); rmSync(directory, { recursive: true, force: true }); });
   const send = (path: string, body: unknown, token = credential, signal?: AbortSignal) => fetch(`http://127.0.0.1:${server.port}${codexRoute}/${path}`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body), signal });
@@ -111,4 +112,20 @@ describe("native input ownership", () => {
     expect((await f.invoke(qualified, "manager-one", "pending", {})).status).toBe(200);
     expect((await f.invoke(old, "manager-one", "pending", {})).status).toBe(400);
   });
+});
+
+
+test("native machine tools admit an individual worker without granting human manager authority", async () => {
+  const f = fixture(), session = await f.connect();
+  const address = { waitId: "worker-dependency", generation: "worker-generation", revision: "release-one" };
+  const input = { ...address, title: "Wait for release", expiresAt: Date.now() + 60_000, capabilityDigest: eventDigest("c".repeat(64)) };
+  const armed = await f.invoke(session, "individual-worker", "event_arm", input);
+  expect(armed.status).toBe(200);
+  expect((await armed.json()).owner).toMatchObject({ taskId: "individual-worker", turnId: "native-turn", callId: "native-call" });
+  expect(f.core.managerBinding("codex-test", "individual-worker")).toBeUndefined();
+  expect((await f.invoke(session, "individual-worker", "submit", { requestId: "forbidden", decision })).status).toBe(403);
+  expect((await f.invoke(session, "individual-worker", "get", { requestId: "forbidden" })).status).toBe(403);
+  expect((await f.invoke(session, "individual-worker", "event_arm", { ...input, taskId: "manager-one" })).status).toBe(400);
+  expect((await f.invoke(session, "other-worker", "event_get", address)).status).toBe(403);
+  expect((await f.invoke(session, "individual-worker", "event_get", address)).status).toBe(200);
 });

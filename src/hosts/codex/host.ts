@@ -1,13 +1,16 @@
+import type { EventPort } from "../../events.ts";
+import { isEventOperation, invokeEvent } from "./event-tools.ts";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import type { DeliveryResult, HostAdapter, HostEnvelope, ManagerBinding, ManagerOrigin, ManagerPort } from "../../contracts.ts";
-import { ConnectorError, codexRoute, connectorProtocol, identifier, maxWireBytes, onlyKeys, parseInvocation, record } from "./protocol.ts";
-import { connectHelperBridge, parseHelperEndpoint, type HelperEndpoint } from "./helper-bridge.ts";
+import type { DeliveryResult, HostAdapter, NativeEnvelope, NativeReturnTarget, ManagerBinding, ManagerOrigin, ManagerPort } from "../../contracts.ts";
+import { ConnectorError, codexRoute, connectorProtocol, identifier, maxWireBytes, onlyKeys, parseInvocation, record, type NativeInvocation } from "./protocol.ts";
+import { connectHelperBridge, readEventStateBridge, parseHelperEndpoint, type HelperEndpoint } from "./helper-bridge.ts";
 import type { DesktopOwner, DesktopProfile } from "./desktop-owner.ts";
 import { invokeManager } from "./tools.ts";
 
 export interface CodexManagerAccess {
   binding(managerId: string): ManagerBinding | undefined;
   manager(origin: ManagerOrigin): ManagerPort;
+  events?(origin: NativeInvocation): EventPort;
 }
 export interface CodexHostLifecycle {
   connected(registration: unknown): Promise<void>;
@@ -24,7 +27,7 @@ interface Connection {
   helper?: HelperEndpoint;
 }
 export interface DesktopHostInput {
-  deliver(binding: ManagerBinding, envelope: HostEnvelope, signal: AbortSignal): Promise<DeliveryResult>;
+  deliver(binding: NativeReturnTarget, envelope: NativeEnvelope, signal: AbortSignal): Promise<DeliveryResult>;
   restored?(): void;
   close(): Promise<void>;
 }
@@ -82,7 +85,16 @@ export class CodexHostAdapter implements HostAdapter {
       }
       if (path === `${codexRoute}/invoke`) {
         const body = await bodyObject(request); onlyKeys(body, ["origin", "operation", "arguments"]);
-        const invocation = parseInvocation(body.origin);
+        const invocation = parseInvocation(body.origin), operation = identifier(body.operation);
+        if (isEventOperation(operation)) {
+          if (!this.access.events) throw new ConnectorError("event_unavailable", "This native host does not admit machine waits.", 403);
+          await this.lifecycle?.admitted?.(connection.desktop);
+          if (this.#closed || request.signal.aborted || this.#connections.get(connection.token) !== connection) throw new ConnectorError("host_closed", "The native event connection ended.", 503);
+          this.lifecycle?.ready?.(connection.desktop);
+          const result = invokeEvent(this.access.events(invocation), operation, body.arguments);
+          this.input?.restored?.();
+          return privateJson(result);
+        }
         const binding = this.access.binding(invocation.threadId);
         if (!binding || binding.origin.hostId !== this.id) throw new ConnectorError("origin_denied", "This native task is not a registered manager. Report to your manager.", 403);
         const epoch = ownerEpoch(binding);
@@ -151,7 +163,19 @@ export class CodexHostAdapter implements HostAdapter {
     throw new ConnectorError("desktop_connector_unavailable", "Restore the qualified Desktop MCP connector; saved replies remain pending.", 503);
   }
 
-  async deliver(binding: ManagerBinding, envelope: HostEnvelope, signal: AbortSignal): Promise<DeliveryResult> {
+  async readEventState(dataDir: string, origin: NativeInvocation, signal: AbortSignal) {
+    if (this.#closed || signal.aborted) throw new ConnectorError("host_closed", "The native event connection ended.", 503);
+    this.#prune();
+    const candidates = [...this.#connections.values()].filter((connection) => {
+      if (!connection.helper || !connection.desktop) return false;
+      try { this.lifecycle?.ready?.(connection.desktop); return true; } catch { return false; }
+    }).sort((first, second) => second.lastSeen - first.lastSeen);
+    const connection = candidates[0];
+    if (!connection) throw new ConnectorError("desktop_connector_unavailable", "Restore the original qualified connector; the event remains retained.", 503);
+    return readEventStateBridge(connection.helper!, dataDir, origin, signal);
+  }
+
+  async deliver(binding: NativeReturnTarget, envelope: NativeEnvelope, signal: AbortSignal): Promise<DeliveryResult> {
     if (this.#closed || signal.aborted || !this.input) return { status: "retry", retryAfterMs: 1_000, code: "host_unavailable" };
     return this.input.deliver(binding, envelope, signal);
   }

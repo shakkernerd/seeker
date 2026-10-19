@@ -213,3 +213,10 @@ service on loopback and keep connector credentials out of prompts and logs.
 Use `seeker codex setup --help` for the command contract. No credentials, native
 session databases, screenshots or conversation transcripts are required for
 setup.
+
+
+## Background completion and dependency events
+
+The same connector exposes separate [machine event tools](events.md) to host-authenticated native task owners, including ordinary workers. These do not register workers as human-decision managers. Existing human conversation tools and native approval/filter choices retain their current gates; conversation-permission setup still concerns only its four human tools.
+
+Prepare a private per-wait producer file with `seeker event prepare`, pass only its digest/identity to `event_arm`, and let the existing job/dependency owner signal through `seeker event signal`. Each new owner turn, including another event wake, reconciles retained waits once and explicitly reanchors still-needed waiting/paused waits before ending again. Current human stops/instructions remain authoritative. Unavailable native metadata cannot authorize a send; retain the result and restore the original qualified connector instead of polling with models or replaying uncertain input.

@@ -55,3 +55,16 @@ The Desktop adapter keeps manager admission and conversation tools on the origin
 The helper incurs model usage and has a bounded native history and supervised process lifetime. Its private workspace and lifecycle record live under `codex-helper` in the Seeker data directory; credentials and manager conversations are not copied. Known-unaccepted failures remain retryable within their bounds, while a lost result after approval is uncertain and cannot be replayed on restart. See [Desktop setup and recovery](codex.md) for prerequisites and profile qualification.
 
 The CLI adapter directs input to its registered native app-server, with startup and same-UUID resumption outside `deliver`'s short I/O budget. Preparation never sends a notification. The next delivery attempt rechecks the full binding generation, cancellation and receipt before writing. Native server requests are ignored without a JSON-RPC response so the original CLI's approval callbacks remain available. See [CLI setup and recovery](codex-cli.md) for the native host and permission boundaries.
+
+
+## Machine event ports
+
+`SeekerCore.events` binds a host-produced native task/turn/call identity to a separate `EventPort`. It does not create a `ManagerBinding` or expose human decision tools. The host authenticates invocation metadata and admits only the calling task; model arguments and producer capabilities cannot choose the return target. Preserve any existing manager-assignment generation independently of the wait's producer generation/source revision.
+
+The store's `events` port commits one immutable signal/result and native outbox intent atomically, shares the existing single-writer connection, and retains explicit receipt/delivery evidence. Custom stores must implement that contract; an in-memory fallback is not equivalent. See [event lifetime, limits and clearing](events.md).
+
+`HostAdapter.deliver` receives a minimal `NativeReturnTarget` and a `NativeEnvelope`: either the existing human envelope or a distinct `EventEnvelope`. An event carries only saved wait/receipt lookup identities, never a human `Receipt` or producer instructions. An adapter that admits event owners must implement the native event variant and its current-anchor fences. Existing human-only adapters should explicitly reject an event variant if supplied; they must not interpret it as a human decision.
+
+The event owner checks its native anchor before helper model preparation and again before input grant. An active original turn defers without another helper model request. Observed newer/interrupted/failed turns pause and retain the result for explicit current-owner reconciliation. A native read and send are not an atomic operation; cancellation after grant does not retract accepted input. Exact approval arguments and native target/receipt correlation still govern the sole sender.
+
+A resume can overlap an older sending attempt. Pause is version-fenced; stale metadata cannot revoke a fresh anchor. Only an old attempt's definite unsent outcome may release a fresh delivery intent after explicit resume. Accepted and unknown outcomes remain attached for reconciliation and never replay. Producer identity and saved receipt remain unchanged.

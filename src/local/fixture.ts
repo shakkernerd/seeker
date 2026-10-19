@@ -1,4 +1,4 @@
-import type { Decision, HostAdapter, HostEnvelope, ManagerBinding } from "../contracts.ts";
+import type { Decision, HostAdapter, NativeEnvelope, NativeReturnTarget, ManagerBinding } from "../contracts.ts";
 import { SeekerCore } from "../core/seeker.ts";
 import { localRecipient } from "./channel.ts";
 
@@ -27,8 +27,9 @@ export class FixtureHost implements HostAdapter {
   readonly id = "fixture";
   constructor(private readonly core: SeekerCore) {}
 
-  async deliver(binding: ManagerBinding, envelope: HostEnvelope, signal: AbortSignal) {
+  async deliver(binding: NativeReturnTarget, envelope: NativeEnvelope, signal: AbortSignal) {
     if (signal.aborted) return { status: "unknown" as const, code: "aborted" };
+    if ("event" in envelope) return { status: "rejected" as const, code: "fixture_event_unsupported" };
     const manager = this.core.manager(binding.origin);
     let view = manager.get(envelope.exchangeId);
     if ("notice" in envelope) return { status: "accepted" as const, reference: `fixture-notice:${envelope.notice.deliveryId}` };

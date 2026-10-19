@@ -1,3 +1,4 @@
+import { eventSignalPath } from "../core/event-client.ts";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import type { Server } from "bun";
 import type { InboundReply } from "../contracts.ts";
@@ -102,6 +103,11 @@ export function createLocalServer(options: LocalServerOptions): Server<undefined
           return json({ authenticated: true, csrf: session.csrf, mode: options.mode ?? "local" }, 200, {
             "Set-Cookie": `seeker_session=${key}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200`,
           });
+        }
+        if (path === eventSignalPath && request.method === "POST") {
+          if (request.headers.has("origin") || request.headers.get("sec-fetch-site") === "cross-site") fail("origin_denied", "Use an authorized ordinary event producer.", 403);
+          const capability = request.headers.get("authorization")?.replace(/^Bearer /, "") ?? "";
+          return json(options.core.store.events.signal(capability, await body(request) as unknown as import("../events.ts").EventSignal, options.core.clock()));
         }
         const session = authorized(request, request.method !== "GET");
         if (path === "/api/session" && request.method === "GET") return json({ authenticated: true, csrf: session?.csrf ?? "", mode: options.mode ?? "local" });

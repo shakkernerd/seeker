@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, 
 import { createConnection } from "node:net";
 import { join } from "node:path";
 import type { DesktopOwner } from "../src/hosts/codex/desktop-owner.ts";
-import { connectHelperBridge, listenHelperBridge } from "../src/hosts/codex/helper-bridge.ts";
+import { connectHelperBridge, listenHelperBridge, readEventStateBridge } from "../src/hosts/codex/helper-bridge.ts";
 import type { HelperConnection } from "../src/hosts/codex/helper-rpc.ts";
 
 const cleanup: (() => Promise<void>)[] = [];
@@ -135,4 +135,18 @@ test("only a verified helper root is archived by its own server before child set
   await remote.request("thread/start", {}, AbortSignal.timeout(1_000));
   await remote.request("turn/start", { threadId: "owned-helper" }, AbortSignal.timeout(1_000));
   await remote.close(); expect(order).toEqual(["retired:owned-helper:owned-turn", "child-settled"]);
+});
+
+
+test("existing connector bridge returns only event metadata without starting or replacing a helper", async () => {
+  const directory = realpathSync(mkdtempSync("/tmp/seeker-event-reader-"));
+  let created = 0, reads = 0;
+  const bridge = await listenHelperBridge(directory, owner, "/private/native.sock", () => { created += 1; throw new Error("A read cannot create a helper"); }, undefined, async (origin) => {
+    reads += 1; return { taskId: origin.threadId, turnId: "armed-turn", status: "interrupted" };
+  });
+  cleanup.push(async () => { await bridge.close(); rmSync(directory, { recursive: true, force: true }); });
+  expect(await readEventStateBridge(bridge.endpoint, directory, { threadId: "native-task", turnId: "armed-turn", callId: "armed-call" }, AbortSignal.timeout(1000))).toEqual({ taskId: "native-task", turnId: "armed-turn", status: "interrupted" });
+  expect(created).toBe(0); expect(reads).toBe(1);
+  await expect(readEventStateBridge({ ...bridge.endpoint, credential: "f".repeat(64) }, directory, { threadId: "native-task", turnId: "armed-turn", callId: "armed-call" }, AbortSignal.timeout(1000))).rejects.toThrow();
+  expect(reads).toBe(1);
 });

@@ -1,3 +1,5 @@
+import { parseNativeEventState, type NativeEventState } from "./event-state.ts";
+import { randomUUID } from "node:crypto";
 import { createConnection } from "node:net";
 import { identifier, maxWireBytes, record, type NativeInvocation } from "./protocol.ts";
 
@@ -7,6 +9,7 @@ class NativeFailure extends Error {
 
 /** Qualifies a native connector through the registered app's read-only tool catalogue. */
 export class CodexNativeClient {
+  #eventNamespace?: string;
   constructor(private readonly pipePath: string, private readonly timeoutMs = 4_000) {}
 
   async qualify(signal?: AbortSignal): Promise<void> {
@@ -19,9 +22,27 @@ export class CodexNativeClient {
     identifier(tool.namespace);
   }
 
-  #request(signal?: AbortSignal): Promise<unknown> {
+  /** Read only this admitted task's newest native generation; never return message contents. */
+  async eventState(origin: NativeInvocation, signal?: AbortSignal): Promise<NativeEventState> {
+    if (!this.#eventNamespace) {
+      const list = record(await this.#request(signal));
+      if (!Array.isArray(list.tools)) throw new NativeFailure("event_native_state_unavailable");
+      const tool = list.tools.map(record).find((item) => item.name === "read_thread");
+      if (!tool) throw new NativeFailure("event_native_state_unavailable");
+      this.#eventNamespace = identifier(tool.namespace);
+    }
+    const result = await this.#request(signal, "tools/call", {
+      arguments: { threadId: origin.threadId, turnLimit: 1, includeOutputs: false, maxOutputCharsPerItem: 50 },
+      callerSource: "codex", namespace: this.#eventNamespace, tool: "read_thread",
+      // Each read is a new native invocation; the saved arm call remains provenance.
+      threadId: origin.threadId, turnId: origin.turnId, callId: randomUUID(),
+    });
+    return parseNativeEventState(result, origin.threadId);
+  }
+
+  #request(signal?: AbortSignal, method = "tools/list", params: unknown = { threadStartKind: "all" }): Promise<unknown> {
     if (signal?.aborted) return Promise.reject(new NativeFailure("native_aborted"));
-    const payload = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: { threadStartKind: "all" } }));
+    const payload = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }));
     return new Promise((resolve, reject) => {
       const socket = createConnection(this.pipePath);
       let settled = false, pending = Buffer.alloc(0);

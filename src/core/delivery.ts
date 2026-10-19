@@ -1,24 +1,29 @@
 import type { Delivery, DeliveryResult, HostAdapter, MessagingChannel } from "../contracts.ts";
+import type { EventWait } from "../events.ts";
 import { SeekerCore } from "./seeker.ts";
 import { channelReadiness, routeFor } from "./attention.ts";
+import { eventEnvelope, eventReturnCurrent, eventReturnTarget } from "./event-return.ts";
+import { eventRoute } from "./events.ts";
 
-/** One prompt, no reminders. Only a definite retryable failure may be retried. */
+/** One notice, no reminders. Only a definite retryable failure may be retried. */
 export class DeliveryPump {
   readonly #active = new Map<string, { controller: AbortController; route: string }>();
   readonly #abandoned = new Map<string, { controller: AbortController; route: string }>();
   #timer?: ReturnType<typeof setInterval>;
   #stopped = false;
+  #eventsFirst = false;
   lastError?: "store_write_failed";
 
   constructor(
     private readonly core: SeekerCore,
     private readonly channels: readonly MessagingChannel[],
     private readonly hosts: readonly HostAdapter[],
-    private readonly timeoutMs = 5_000,
+    private readonly timeoutMs = 5_000
   ) {}
 
   start(): void {
     this.core.store.recoverInterruptedDeliveries(this.core.clock());
+    this.core.store.events.recover(this.core.clock());
     for (const host of this.hosts) this.core.resumeHost(host.id);
     for (const channel of this.channels) this.core.resumeChannel(channel.id);
     this.#stopped = false;
@@ -32,47 +37,72 @@ export class DeliveryPump {
     const capacity = Math.min(4 - this.#active.size, 32 - this.#active.size - this.#abandoned.size);
     if (capacity <= 0) return;
     try {
-      const excluded = [...this.#active.values(), ...this.#abandoned.values()].map((item) => item.route);
-      for (const attempt of this.core.store.claimDeliveries(capacity, this.core.clock(), excluded)) this.#dispatch(attempt);
+      const claim = (events: boolean) => {
+        const remaining = Math.min(4 - this.#active.size, 32 - this.#active.size - this.#abandoned.size);
+        if (remaining <= 0) return;
+        const excluded = [...this.#active.values(), ...this.#abandoned.values()].map((item) => item.route);
+        if (events) for (const wait of this.core.store.events.claim(remaining, this.core.clock(), excluded)) this.#dispatchEvent(wait);
+        else for (const attempt of this.core.store.claimDeliveries(remaining, this.core.clock(), excluded)) this.#dispatch(attempt);
+      };
+      // Neither family may monopolize slots under a sustained backlog.
+      claim(this.#eventsFirst);
+      claim(!this.#eventsFirst);
+      this.#eventsFirst = !this.#eventsFirst;
     } catch { this.lastError = "store_write_failed"; }
   }
-
   stop(): void {
     this.#stopped = true;
     clearInterval(this.#timer);
     for (const { controller } of [...this.#active.values(), ...this.#abandoned.values()]) controller.abort();
-    // Pending I/O may already have escaped. A restart will mark these attempts unknown.
+    // Pending I/O may already have escaped. Restart marks interrupted attempts unknown.
   }
 
   get inFlight(): number { return this.#active.size; }
 
-  #dispatch(attempt: Delivery): void {
-    const controller = new AbortController();
-    const view = this.core.store.get(attempt.exchangeId)!;
-    const exchange = view.exchange;
-    const active = { controller, route: routeFor(exchange, attempt.lane) };
-    this.#active.set(attempt.id, active);
-    const binding = this.core.store.binding(exchange.origin);
-    const revision = exchange.revisions[attempt.revision - 1]!;
+  #run(id: string, route: string, send: (signal: AbortSignal) => Promise<DeliveryResult> | DeliveryResult, complete: (result: DeliveryResult) => void): void {
+    const controller = new AbortController(), active = { controller, route };
+    this.#active.set(id, active);
     const commit = (result: DeliveryResult) => {
       if (this.#stopped) return;
-      try { this.core.store.completeDelivery(attempt.id, attempt.attemptId!, result, this.core.clock()); }
+      try { complete(result); }
       catch { this.lastError = "store_write_failed"; }
     };
     const timeout = setTimeout(() => {
       controller.abort();
       commit({ status: "unknown", code: "io_timeout" });
-      this.#active.delete(attempt.id);
-      this.#abandoned.set(attempt.id, active);
+      this.#active.delete(id);
+      this.#abandoned.set(id, active);
       this.tick();
     }, this.timeoutMs);
     timeout.unref();
+    // The attempt is durable before this promise boundary. A timed-out operation
+    // stays quarantined until it settles; no replacement may reuse its route.
+    Promise.resolve().then(() => controller.signal.aborted ? { status: "unknown", code: "aborted" } as const : send(controller.signal))
+      .then(commit, () => commit({ status: "unknown", code: "adapter_error" })).finally(() => {
+        clearTimeout(timeout);
+        this.#active.delete(id);
+        this.#abandoned.delete(id);
+        this.tick();
+      });
+  }
 
-    // Start only after committing the attempt. No transaction crosses this promise boundary.
-    const operation = Promise.resolve().then((): Promise<DeliveryResult> | DeliveryResult => {
+  #dispatchEvent(wait: EventWait): void {
+    const delivery = wait.delivery!, target = eventReturnTarget(wait), envelope = eventEnvelope(wait);
+    this.#run(delivery.id, eventRoute(wait), (signal) => {
+      if (!eventReturnCurrent(this.core, target, envelope)) return { status: "rejected", code: "event_owner_changed" };
+      const adapter = this.hosts.find((host) => host.id === wait.owner.hostId);
+      return adapter ? adapter.deliver(target, envelope, signal) : { status: "retry", retryAfterMs: 30_000, code: "host_unavailable" };
+    }, (result) => this.core.store.events.complete(wait.waitId, wait.generation, delivery.attemptId!, result, this.core.clock()));
+  }
+
+  #dispatch(attempt: Delivery): void {
+    const view = this.core.store.get(attempt.exchangeId)!;
+    const exchange = view.exchange;
+    const binding = this.core.store.binding(exchange.origin);
+    const revision = exchange.revisions[attempt.revision - 1]!;
+    this.#run(attempt.id, routeFor(exchange, attempt.lane), (signal) => {
       const latest = this.core.store.get(attempt.exchangeId)!.exchange;
       this.core.store.binding(exchange.origin);
-      if (controller.signal.aborted) return { status: "unknown", code: "aborted" };
       if (attempt.lane === "channel") {
         const readiness = channelReadiness(latest, attempt);
         if (readiness === "retire") return { status: "rejected", code: "superseded" };
@@ -83,7 +113,7 @@ export class DeliveryPump {
           deliveryId: attempt.id, exchangeId: exchange.id, managerLabel: exchange.managerLabel,
           recipient: exchange.recipient, revision,
           ...(attempt.contextId ? { context: exchange.context.find((item) => item.id === attempt.contextId)! } : {}),
-        }, controller.signal);
+        }, signal);
       }
       const adapter = this.hosts.find((item) => item.id === binding.origin.hostId);
       if (!adapter) return { status: "retry", retryAfterMs: 30_000, code: "host_unavailable" };
@@ -92,25 +122,17 @@ export class DeliveryPump {
         return adapter.deliver({ ...binding, origin: exchange.origin }, {
           deliveryId: attempt.id, exchangeId: exchange.id, revision, requiresReconciliation: true,
           notice: { deliveryId: failed.id, state: failed.state as "unknown" | "rejected", code: failed.code ?? "contact_unconfirmed" },
-        }, controller.signal);
+        }, signal);
       }
       if (attempt.deferredEventId) {
         const deferred = view.deferredReplies!.find((item) => item.channelId === attempt.deferredChannelId && item.event.eventId === attempt.deferredEventId)!;
-        return adapter.deliver({ ...binding, origin: exchange.origin }, { deliveryId: attempt.id, exchangeId: exchange.id, revision, deferred, requiresReconciliation: true }, controller.signal);
+        return adapter.deliver({ ...binding, origin: exchange.origin }, { deliveryId: attempt.id, exchangeId: exchange.id, revision, deferred, requiresReconciliation: true }, signal);
       }
       const receipt = exchange.receipts.find((item) => item.id === attempt.receiptId)!;
       return adapter.deliver({ ...binding, origin: exchange.origin }, {
         deliveryId: attempt.id, exchangeId: exchange.id, revision, receipt,
         requiresReconciliation: exchange.state === "reconcile" || receipt.revision !== exchange.revision || Boolean(receipt.dispositionHistory?.length),
-      }, controller.signal);
-    });
-    operation.then(commit, () => commit({ status: "unknown", code: "adapter_error" })).finally(() => {
-      clearTimeout(timeout);
-      this.#active.delete(attempt.id);
-      this.#abandoned.delete(attempt.id);
-      this.tick();
-    });
-    // At most one unsettled operation per configured adapter is quarantined after timeout.
-    // It cannot create replacements or occupy the shared slots needed by healthy adapters.
+      }, signal);
+    }, (result) => this.core.store.completeDelivery(attempt.id, attempt.attemptId!, result, this.core.clock()));
   }
 }

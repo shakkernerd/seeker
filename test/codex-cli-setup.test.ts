@@ -8,7 +8,7 @@ import { prepareCliReload } from "../src/hosts/codex-cli/reload.ts";
 import { setupCodexCli } from "../src/hosts/codex-cli/setup.ts";
 import { readConnectorConfig, readConnectorCredential } from "../src/hosts/codex/config.ts";
 import { setupCodex } from "../src/hosts/codex/setup.ts";
-import { seekerTools } from "../src/hosts/codex/tools.ts";
+import { conversationTools, seekerTools } from "../src/hosts/codex/tools.ts";
 import { localRecipient } from "../src/local/channel.ts";
 import { SqliteExchangeStore } from "../src/store/sqlite.ts";
 
@@ -144,7 +144,8 @@ test("verified reload waits for this task's connected Seeker runtime and complet
   const connected = { name: "seeker", runtimeStatus: "connected", toolsError: null, tools: fullTools };
   const notReady = [
     { ...connected, name: "another-server" },
-    { ...connected, tools: Object.fromEntries(seekerTools.slice(0, -1).map((tool) => [tool.name, tool])) },
+    { ...connected, tools: { ...fullTools, unrelated: {} } },
+    { ...connected, tools: Object.fromEntries(conversationTools.slice(0, -1).map((tool) => [tool.name, tool])) },
     { name: "seeker", tools: fullTools },
     { ...connected, runtimeStatus: null },
     { ...connected, runtimeStatus: "starting" },
@@ -180,4 +181,16 @@ test("verified reload waits for this task's connected Seeker runtime and complet
     ...inventoryRequests.map(() => "mcpServerStatus/list"),
   ]);
   prepared.close(); await f.closed.promise;
+});
+
+
+test("reload preserves readiness when explicit filters expose only the four existing conversation tools", async () => {
+  const f = nativeFixture();
+  f.behavior.request = (pending) => {
+    if (pending.message.method === "config/mcpServer/reload") respond(pending, {});
+    else if (pending.message.method === "mcpServerStatus/list") respond(pending, { data: [{ name: "seeker", runtimeStatus: "connected", toolsError: null, tools: Object.fromEntries(conversationTools.map((tool) => [tool.name, tool])) }] });
+  };
+  const prepared = await prepareCliReload(f.socketPath, taskId, f.project); cleanups.push(() => prepared.close());
+  await prepared.reload(); prepared.close(); await f.closed.promise;
+  expect(f.messages.filter((message) => message.method === "mcpServerStatus/list")).toHaveLength(1);
 });

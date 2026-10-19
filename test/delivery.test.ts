@@ -102,6 +102,7 @@ test("a verified successor progresses while the predecessor's aborted operation 
       return new Promise((resolve) => { settle = () => resolve({ status: "accepted", reference: "predecessor" }); });
     }
     successorCalls += 1;
+    if ("event" in envelope) throw new Error("Unexpected machine event in human transfer fixture");
     expect(envelope.requiresReconciliation).toBe(true);
     return Promise.resolve({ status: "accepted", reference: "successor" });
   } }], 20);

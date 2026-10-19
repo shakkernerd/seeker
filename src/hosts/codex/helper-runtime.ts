@@ -1,3 +1,5 @@
+import type { EventOwner } from "../../events.ts";
+import type { NativeEventState } from "./event-state.ts";
 import { randomUUID } from "node:crypto";
 import { accessSync, constants, existsSync, linkSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -13,6 +15,7 @@ export interface PreparedHelper {
   start(prompt: string, signal: AbortSignal): Promise<string>;
 }
 export interface DesktopHelperRuntime {
+  readEventState?(owner: EventOwner, signal: AbortSignal): Promise<NativeEventState>;
   prepare(events: HelperEvents, signal: AbortSignal, current: () => boolean): Promise<PreparedHelper>;
   reset(): Promise<void>;
   close(): Promise<void>;
@@ -88,10 +91,12 @@ export class NativeDesktopHelper implements DesktopHelperRuntime {
   #rpc?: HelperConnection;
   #opening?: Promise<HelperConnection>;
   #closed = false;
+  readonly #readLifetime = new AbortController();
+  readonly #reads = new Set<Promise<NativeEventState>>();
   #generation = 0;
   #resetting?: Promise<void>;
 
-  constructor(private readonly lifecycle: Pick<CodexDesktopLifecycle, "prepare">, dataDir: string, private readonly connect: ConnectHelper) {
+  constructor(private readonly lifecycle: Pick<CodexDesktopLifecycle, "prepare">, dataDir: string, private readonly connect: ConnectHelper, private readonly eventReader?: (owner: EventOwner, signal: AbortSignal) => Promise<NativeEventState>) {
     mkdirSync(join(privateDirectory(dataDir), "codex-helper"), { mode: 0o700, recursive: true });
     this.#workspace = privateDirectory(join(dataDir, "codex-helper"));
     this.#statePath = join(this.#workspace, "session.json");
@@ -101,6 +106,14 @@ export class NativeDesktopHelper implements DesktopHelperRuntime {
       if (value.version !== 1 || !Number.isSafeInteger(value.turns) || (value.turns as number) < 0 || (value.turns as number) > 16) throw unavailable("The helper lifecycle record needs reconciliation.");
       this.#state = { version: 1, threadId: identifier(value.threadId), turns: value.turns as number };
     }
+  }
+
+  async readEventState(owner: EventOwner, signal: AbortSignal): Promise<NativeEventState> {
+    if (this.#closed || !this.eventReader) throw unavailable("The native event metadata reader is unavailable.");
+    const reading = this.eventReader(owner, AbortSignal.any([signal, this.#readLifetime.signal]));
+    this.#reads.add(reading);
+    try { return await reading; }
+    finally { this.#reads.delete(reading); }
   }
 
   async prepare(events: HelperEvents, signal: AbortSignal, current: () => boolean): Promise<PreparedHelper> {
@@ -192,7 +205,7 @@ export class NativeDesktopHelper implements DesktopHelperRuntime {
     void closing.finally(() => { if (this.#resetting === closing) this.#resetting = undefined; }).catch(() => {});
     return closing;
   }
-  async close(): Promise<void> { this.#closed = true; await this.reset(); }
+  async close(): Promise<void> { this.#closed = true; this.#readLifetime.abort(); await Promise.allSettled([...this.#reads]); await this.reset(); }
 
   #save(value: HelperState | undefined): void {
     if (this.#closed) throw unavailable("The helper is closed.");
