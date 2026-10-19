@@ -13,7 +13,7 @@ const unavailable = () => new ConnectorError("desktop_helper_unavailable", "The 
 
 export function parseHelperEndpoint(value: unknown): HelperEndpoint {
   const item = record(value); onlyKeys(item, ["socketPath", "credential"]);
-  if (typeof item.socketPath !== "string" || !/^\.h[a-f0-9]{16}\.sock$/.test(item.socketPath.slice(item.socketPath.lastIndexOf("/") + 1)) || typeof item.credential !== "string" || !/^[a-f0-9]{64}$/.test(item.credential)) throw unavailable();
+  if (typeof item.socketPath !== "string" || !/^\.h[a-f0-9]{8}$/.test(item.socketPath.slice(item.socketPath.lastIndexOf("/") + 1)) || typeof item.credential !== "string" || !/^[a-f0-9]{64}$/.test(item.credential)) throw unavailable();
   return { socketPath: item.socketPath, credential: item.credential };
 }
 
@@ -21,26 +21,37 @@ export function parseHelperEndpoint(value: unknown): HelperEndpoint {
 export async function listenHelperBridge(dataDir: string, owner: DesktopOwner, pipePath: string, connect = connectDesktopHelper) {
   const directory = privateDirectory(dataDir), workspace = join(directory, "codex-helper");
   mkdirSync(workspace, { recursive: true, mode: 0o700 }); privateDirectory(workspace);
-  const endpoint = { socketPath: join(directory, `.h${randomBytes(8).toString("hex")}.sock`), credential: randomBytes(32).toString("hex") };
+  const endpoint = { socketPath: join(directory, `.h${randomBytes(4).toString("hex")}`), credential: randomBytes(32).toString("hex") };
   const sockets = new Set<Socket>(), settling = new Set<Promise<void>>();
+  const sessions = new Map<Socket, () => Promise<void>>();
+  let cleanupError: unknown;
   let active = false, closed = false;
   const server = createServer((socket) => {
     sockets.add(socket);
-    let rpc: HelperConnection | undefined, buffer = "", authenticated = false;
+    let rpc: HelperConnection | undefined, buffer = "", authenticated = false, stopping = false;
+    let closing: Promise<void> | undefined;
     const timer = setTimeout(() => socket.destroy(), 2_000); timer.unref();
     const write = (value: unknown) => {
       const line = JSON.stringify(value);
       if (Buffer.byteLength(line) > maxWireBytes || socket.writableLength > maxWireBytes * 4) { socket.destroy(); return; }
       socket.write(`${line}\n`);
     };
-    const close = () => {
-      clearTimeout(timer); sockets.delete(socket);
-      if (!rpc) return;
+    const settle = (): Promise<void> => {
+      if (closing) return closing;
+      stopping = true; clearTimeout(timer);
       const owned = rpc; rpc = undefined;
-      const pending = owned.close().finally(() => { active = false; settling.delete(pending); });
-      settling.add(pending); void pending.catch(() => {});
+      const pending = (async () => {
+        await owned?.close();
+        if (owned) active = false;
+        if (!socket.destroyed) { write({ method: "seeker/settled", params: true }); socket.end(); }
+      })();
+      closing = pending; settling.add(pending);
+      void pending.finally(() => settling.delete(pending)).catch((error) => { cleanupError ??= error; socket.destroy(); });
+      return pending;
     };
-    socket.setEncoding("utf8"); socket.on("error", () => socket.destroy()); socket.once("close", close);
+    sessions.set(socket, settle);
+    const close = () => { sockets.delete(socket); sessions.delete(socket); void settle().catch(() => {}); };
+    socket.setEncoding("utf8"); socket.on("error", () => socket.destroy()); socket.once("close", close); socket.once("end", () => { void settle().catch(() => {}); });
     socket.on("data", (chunk: string) => {
       buffer += chunk;
       for (;;) {
@@ -48,7 +59,7 @@ export async function listenHelperBridge(dataDir: string, owner: DesktopOwner, p
         if (end < 0) { if (Buffer.byteLength(buffer) > maxWireBytes) socket.destroy(); return; }
         const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
         try {
-          if (closed || Buffer.byteLength(line) > maxWireBytes) throw unavailable();
+          if (closed || stopping || Buffer.byteLength(line) > maxWireBytes) throw unavailable();
           const message = record(JSON.parse(line));
           if (!authenticated) {
             onlyKeys(message, ["credential"]);
@@ -58,11 +69,12 @@ export async function listenHelperBridge(dataDir: string, owner: DesktopOwner, p
             rpc.events = {
               notice: (method, params) => write({ method, params }),
               request: (id, method, params) => write({ id, method, params }),
-              lost: () => socket.destroy(),
+              lost: () => { if (!stopping) void settle().catch(() => {}); },
             };
             write({ ready: true });
             continue;
           }
+          if (message.method === "seeker/close") { void settle().catch(() => {}); return; }
           if (!rpc?.connected) throw unavailable();
           if (typeof message.method === "string") {
             if (typeof message.id === "string") {
@@ -88,13 +100,17 @@ export async function listenHelperBridge(dataDir: string, owner: DesktopOwner, p
   let closing: Promise<void> | undefined;
   return { endpoint, close: () => closing ??= (async () => {
     closed = true;
-    for (const socket of sockets) socket.destroy();
+    // End each authenticated connection through its settlement path, not a raw
+    // socket destroy that could let the service reuse a still-running helper.
+    const results = await Promise.allSettled([...sessions.values()].map((settle) => settle()));
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    await Promise.all([...settling]);
+    await Promise.allSettled([...settling]);
+    for (const result of results) if (result.status === "rejected") cleanupError ??= result.reason;
     try {
       const current = lstatSync(endpoint.socketPath);
       if (current.dev === inode.dev && current.ino === inode.ino) unlinkSync(endpoint.socketPath);
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    if (cleanupError) throw cleanupError;
   })() };
 }
 

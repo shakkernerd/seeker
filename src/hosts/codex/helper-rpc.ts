@@ -37,6 +37,7 @@ export class HelperRpc {
   #closing?: Promise<void>;
   #exit: Promise<void>;
   #settled = false;
+  #remoteSettled = false;
   events?: HelperEvents;
 
   constructor(executable: string | Socket, args: string[], cwd: string, env: NodeJS.ProcessEnv) {
@@ -92,7 +93,16 @@ export class HelperRpc {
     this.#lost();
     void (async () => {
       // EOF lets the official launcher/native server settle their own MCP children.
-      if (this.#socket) { this.#socket.destroy(); await this.#exit; return; }
+      if (this.#socket) {
+        // A local socket close does not prove that the connector settled its child.
+        // Keep reading only the explicit settlement acknowledgment until its EOF.
+        if (!this.#socket.destroyed) this.#socket.write(JSON.stringify({ method: "seeker/close" }) + "\n");
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([this.#exit, new Promise<void>((resolve) => { timer = setTimeout(resolve, 5_000); })]);
+        clearTimeout(timer); this.#socket.destroy();
+        if (!this.#settled || !this.#remoteSettled) throw new ConnectorError("desktop_helper_cleanup_failed", "The Desktop connector did not confirm native child settlement.", 503);
+        return;
+      }
       const child = this.#child!;
       child.stdin.end();
       child.kill("SIGTERM");
@@ -120,7 +130,7 @@ export class HelperRpc {
     this.#input.write(`${line}\n`);
   }
   #read(chunk: string): void {
-    if (this.#closed) return;
+    if (this.#closed && !this.#socket) return;
     this.#buffer += chunk;
     for (;;) {
       const end = this.#buffer.indexOf("\n");
@@ -133,6 +143,8 @@ export class HelperRpc {
       if (!line.trim()) continue;
       try {
         const message = record(JSON.parse(line));
+        if (this.#socket && message.method === "seeker/settled") { this.#remoteSettled = message.params === true; continue; }
+        if (this.#closed) continue;
         if (typeof message.method === "string") {
           if (typeof message.id === "string" || typeof message.id === "number") {
             if (this.events) this.events.request(message.id, message.method, message.params);
@@ -147,7 +159,7 @@ export class HelperRpc {
           else if (Object.hasOwn(message, "result")) pending?.finish(undefined, message.result);
         }
       } catch { void this.close().catch(() => {}); return; }
-      if (this.#closed) return;
+      if (this.#closed && !this.#socket) return;
     }
   }
   #lost(): void {

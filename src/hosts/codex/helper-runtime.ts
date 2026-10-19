@@ -86,6 +86,7 @@ export class NativeDesktopHelper implements DesktopHelperRuntime {
   #state?: HelperState;
   #saved?: string;
   #rpc?: HelperConnection;
+  #opening?: Promise<HelperConnection>;
   #closed = false;
   #generation = 0;
   #resetting?: Promise<void>;
@@ -114,9 +115,15 @@ export class NativeDesktopHelper implements DesktopHelperRuntime {
     check();
     const { owner, pipePath } = await this.lifecycle.prepare(signal, current);
     check();
-    const rpc = await this.connect(owner.profile, pipePath, this.#workspace, signal);
-    check();
-    this.#rpc = rpc; rpc.events = events;
+    const opening = Promise.resolve().then(() => this.connect(owner.profile, pipePath, this.#workspace, signal));
+    this.#opening = opening;
+    let rpc: HelperConnection | undefined;
+    try {
+      rpc = await opening; check();
+      this.#rpc = rpc;
+    } catch (error) { await rpc?.close(); throw error; }
+    finally { if (this.#opening === opening) this.#opening = undefined; }
+    rpc.events = events;
     await rpc.request("initialize", { clientInfo: { name: "seeker_desktop_helper", version: "0.1.0" }, capabilities: { experimentalApi: true } }, signal);
     check(); rpc.notify("initialized", {});
     const config = record(record(await rpc.request("config/read", { cwd: this.#workspace, includeLayers: false }, signal)).config);
@@ -174,8 +181,12 @@ export class NativeDesktopHelper implements DesktopHelperRuntime {
   reset(): Promise<void> {
     if (this.#resetting) return this.#resetting;
     this.#generation += 1;
-    const rpc = this.#rpc;
-    const closing = (async () => { await rpc?.close(); if (this.#rpc === rpc) this.#rpc = undefined; })();
+    const rpc = this.#rpc, opening = this.#opening;
+    const closing = (async () => {
+      const results = await Promise.allSettled([rpc?.close(), opening?.then((connection) => connection.close(), () => {})]);
+      for (const result of results) if (result.status === "rejected") throw result.reason;
+      if (this.#rpc === rpc) this.#rpc = undefined;
+    })();
     this.#resetting = closing;
     void closing.finally(() => { if (this.#resetting === closing) this.#resetting = undefined; }).catch(() => {});
     return closing;

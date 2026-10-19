@@ -69,3 +69,42 @@ test("connector shutdown closes its helper transport and never creates a replace
   await expect(remote.request("initialize", {}, AbortSignal.timeout(1_000))).rejects.toThrow();
   expect(f.creations()).toBe(1);
 });
+
+test("remote close waits for child settlement before releasing the runtime", async () => {
+  const directory = realpathSync(mkdtempSync("/tmp/seeker-settle-")), entered = deferred<void>(), release = deferred<void>();
+  const bridge = await listenHelperBridge(directory, owner, "/private/native.sock", () => ({
+    connected: true, request: async () => ({}), notify() {}, respond() {}, reject() {},
+    async close() { entered.resolve(); await release.promise; },
+  }));
+  const remote = await connectHelperBridge(bridge.endpoint, directory);
+  cleanup.push(async () => { release.resolve(); await remote.close(); await bridge.close(); rmSync(directory, { recursive: true, force: true }); });
+  let settled = false;
+  const closing = remote.close().then(() => { settled = true; });
+  await bounded(entered.promise); await Bun.sleep(10); expect(settled).toBe(false);
+  await expect(connectHelperBridge(bridge.endpoint, directory)).rejects.toThrow();
+  release.resolve(); await bounded(closing); expect(settled).toBe(true);
+});
+
+test("helper paths fit every data directory accepted by the existing native socket budget", async () => {
+  const root = realpathSync(mkdtempSync("/tmp/seeker-path-"));
+  const directory = join(root, "x".repeat(103 - Buffer.byteLength(root) - 12));
+  const { mkdirSync } = await import("node:fs"); mkdirSync(directory, { mode: 0o700 });
+  const bridge = await listenHelperBridge(directory, owner, "/private/native.sock", () => { throw new Error("No helper requested"); });
+  cleanup.push(async () => { await bridge.close(); rmSync(root, { recursive: true, force: true }); });
+  expect(Buffer.byteLength(join(directory, "codex.sock"))).toBe(103);
+  expect(Buffer.byteLength(bridge.endpoint.socketPath)).toBe(103);
+});
+
+
+test("an unconfirmed child cleanup fails the remote close and quarantines the bridge", async () => {
+  const directory = realpathSync(mkdtempSync("/tmp/seeker-failed-close-"));
+  const bridge = await listenHelperBridge(directory, owner, "/private/native.sock", () => ({
+    connected: true, request: async () => ({}), notify() {}, respond() {}, reject() {},
+    async close() { throw new Error("fixture settlement failed"); },
+  }));
+  const remote = await connectHelperBridge(bridge.endpoint, directory);
+  cleanup.push(async () => { await remote.close().catch(() => {}); await bridge.close().catch(() => {}); rmSync(directory, { recursive: true, force: true }); });
+  await expect(remote.close()).rejects.toMatchObject({ code: "desktop_helper_cleanup_failed" });
+  await expect(connectHelperBridge(bridge.endpoint, directory)).rejects.toThrow();
+  await expect(bridge.close()).rejects.toThrow("fixture settlement failed");
+});

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DesktopOwner } from "../src/hosts/codex/desktop-owner.ts";
 import { HelperRpcError, type HelperConnection, type HelperEvents } from "../src/hosts/codex/helper-rpc.ts";
-import { NativeDesktopHelper } from "../src/hosts/codex/helper-runtime.ts";
+import { NativeDesktopHelper, type ConnectHelper } from "../src/hosts/codex/helper-runtime.ts";
 
 type ObjectValue = Record<string, unknown>;
 interface State { version: 1; threadId: string; turns: number }
@@ -17,6 +17,7 @@ interface NativePlan {
   inventory?: unknown;
   after?: (method: string) => void;
   close?: () => Promise<void>;
+  connect?: () => Promise<void>;
 }
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -36,7 +37,7 @@ function fixture(plans: NativePlan[] = [{}], state?: State) {
     server: { pid: 102, parentPid: 101, executable: "/Applications/Fixture.app/Contents/Resources/codex", startedAt: "Sat Sep 19 10:00:01 2026" },
   };
   const calls: Call[] = [], connections: HelperConnection[] = [], order: string[] = [], runtimes: NativeDesktopHelper[] = [];
-  const factory = (profile: DesktopOwner["profile"], pipe: string, cwd: string): HelperConnection => {
+  const factory: ConnectHelper = (profile, pipe, cwd) => {
     expect({ profile, pipe, cwd }).toEqual({ profile: owner.profile, pipe: "/private/fixture/native.sock", cwd: workspace });
     const connection = connections.length, plan = plans[connection] ?? {};
     let closed = false;
@@ -71,7 +72,7 @@ function fixture(plans: NativePlan[] = [{}], state?: State) {
       reject: () => {},
       close: async () => { if (!closed) { await plan.close?.(); closed = true; order.push(connection + ":closed"); } },
     };
-    connections.push(rpc); return rpc;
+    connections.push(rpc); return plan.connect ? plan.connect().then(() => rpc) : rpc;
   };
   const createRuntime = () => {
     const runtime = new NativeDesktopHelper({ prepare: async () => ({ owner, pipePath: "/private/fixture/native.sock" }) }, directory, factory);
@@ -231,4 +232,18 @@ test("an externally replaced lifecycle file is preserved before starting a model
   await expect(ready.start("Must not replace another owner's state", signal())).rejects.toThrow("changed outside this service");
   expect(readFileSync(f.statePath, "utf8")).toBe("externally replaced private lifecycle\n");
   expect(requests(f.calls, "turn/start")).toHaveLength(0);
+});
+
+
+test("reset owns a connecting helper and closes a connection returned after cancellation", async () => {
+  const connecting = deferred(), release = deferred(), f = fixture([{ connect: async () => { connecting.resolve(); await release.promise; } }]);
+  const abort = new AbortController();
+  const preparing = f.prepare(abort.signal).then(() => { throw new Error("cancelled helper was adopted"); }, () => {});
+  await connecting.promise;
+  abort.abort(); let settled = false;
+  const resetting = f.runtime.reset().then(() => { settled = true; });
+  await Bun.sleep(10); expect(settled).toBe(false);
+  release.resolve(); await Promise.all([preparing, resetting]);
+  expect(f.connections[0]!.connected).toBe(false);
+  expect(requests(f.calls, "initialize")).toHaveLength(0);
 });
