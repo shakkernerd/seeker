@@ -1,8 +1,11 @@
+import { eventReturnCurrent } from "../../core/event-return.ts";
+import { eventAnchorState, parseNativeEventTurn } from "../codex/event-state.ts";
+import { isEventOperation, invokeEvent } from "../codex/event-tools.ts";
 import { randomUUID, timingSafeEqual } from "node:crypto";
-import type { DeliveryResult, HostAdapter, HostEnvelope, ManagerBinding } from "../../contracts.ts";
+import type { DeliveryResult, HostAdapter, NativeEnvelope, NativeReturnTarget, ManagerBinding } from "../../contracts.ts";
 import { SeekerCore } from "../../core/seeker.ts";
 import { SeekerError } from "../../core/validation.ts";
-import { ConnectorError, envelopeReference, identifier, nativeWakeup, onlyKeys, parseInvocation, record, type NativeInvocation } from "../codex/protocol.ts";
+import { ConnectorError, envelopeIdentity, envelopeReference, identifier, nativeWakeup, onlyKeys, parseInvocation, record, type NativeInvocation } from "../codex/protocol.ts";
 import { invokeManager } from "../codex/tools.ts";
 import { parseCliOwner, sameCliProcess, sameCliProfile, type CliOwner, type RegisteredCliOwner } from "./owner.ts";
 import { NativeRpcError } from "./rpc.ts";
@@ -10,7 +13,7 @@ import { nativeCliRuntime, type CliRuntime, type NativeCliConnection } from "./r
 import { readCliRegistration, saveCliRegistration } from "./state.ts";
 import { cliHostId, cliRoute } from "./config.ts";
 
-const epoch = (binding: ManagerBinding) => JSON.stringify([binding.id, binding.origin.hostId, binding.origin.managerId, binding.origin.assignmentId, binding.origin.generation]);
+const epoch = (binding: NativeReturnTarget) => JSON.stringify([binding.id, binding.origin.hostId, binding.origin.managerId, binding.origin.assignmentId, binding.origin.generation]);
 const retry = (code: string): DeliveryResult => ({ status: "retry", retryAfterMs: 1_000, code });
 function mode(value: unknown): RegisteredCliOwner["remoteControl"] {
   const status = record(value).status;
@@ -54,7 +57,8 @@ export class CodexCliHost implements HostAdapter {
       const text = await request.text();
       if (Buffer.byteLength(text) > 65_536) throw new ConnectorError("too_large", "The native invocation is too large.", 413);
       const body = record(JSON.parse(text)); onlyKeys(body, ["owner", "origin", "operation", "arguments"]);
-      const origin = parseInvocation(body.origin), binding = this.#binding(origin);
+      const origin = parseInvocation(body.origin), operation = identifier(body.operation), event = isEventOperation(operation);
+      const binding = event ? undefined : this.#binding(origin);
       const owner = parseCliOwner(body.owner), signal = AbortSignal.any([request.signal, this.#lifetime.signal, AbortSignal.timeout(4_000)]);
       await this.#admit(owner, signal);
       const rpc = this.#rpc!;
@@ -62,7 +66,11 @@ export class CodexCliHost implements HostAdapter {
       const thread = record(current.thread);
       if (thread.id !== origin.threadId || record(thread.status).type === "notLoaded") throw new ConnectorError("origin_denied", "The original CLI owner has not loaded this manager.", 403);
       signal.throwIfAborted();
-      if (epoch(this.#binding(origin)) !== epoch(binding)) throw new ConnectorError("owner_changed", "The manager assignment changed during admission.", 409);
+      if (event) {
+        const result = invokeEvent(this.core.events({ hostId: this.id, taskId: origin.threadId, turnId: origin.turnId, callId: origin.callId }), operation, body.arguments);
+        this.#restored(); return json(result);
+      }
+      if (!binding || epoch(this.#binding(origin)) !== epoch(binding)) throw new ConnectorError("owner_changed", "The manager assignment changed during admission.", 409);
       const port = this.core.manager({ ...binding.origin, turnId: origin.turnId, callId: origin.callId });
       const result = invokeManager(port, identifier(body.operation), body.arguments, origin);
       const key = epoch(binding);
@@ -77,17 +85,17 @@ export class CodexCliHost implements HostAdapter {
     }
   }
 
-  async deliver(binding: ManagerBinding, envelope: HostEnvelope, signal: AbortSignal): Promise<DeliveryResult> {
+  async deliver(binding: NativeReturnTarget, envelope: NativeEnvelope, signal: AbortSignal): Promise<DeliveryResult> {
     if (this.#closed || signal.aborted || this.#stateFailed) return retry("cli_unavailable");
     if (!this.#current(binding, envelope)) return { status: "rejected", code: "owner_or_exchange_changed" };
-    const identity = JSON.stringify([epoch(binding), envelope.exchangeId, envelopeReference(envelope)]);
+    const identity = JSON.stringify([epoch(binding), envelopeIdentity(envelope), envelopeReference(envelope)]);
     const prior = this.#finished.get(envelope.deliveryId);
     if (prior) return prior.identity === identity ? prior.result : { status: "rejected", code: "delivery_identity_changed" };
     const attempt = this.#attempts.get(envelope.deliveryId);
     if (attempt) return attempt.identity === identity ? attempt.result : { status: "rejected", code: "delivery_identity_changed" };
     const key = `${epoch(binding)}:${this.#ownerRevision}`;
     if (!this.#rpc?.connected || this.#ready.get(binding.origin.managerId) !== key) {
-      this.#prepare(binding);
+      this.#prepare(binding, envelope);
       return retry(this.#registration ? "cli_preparing" : "cli_not_admitted");
     }
     const result = this.#send(binding, envelope, signal).then((result) => {
@@ -112,11 +120,12 @@ export class CodexCliHost implements HostAdapter {
     if (!binding) throw new ConnectorError("origin_denied", "This native CLI task is not a registered manager. Report to your manager.", 403);
     return binding;
   }
-  #bindingCurrent(binding: ManagerBinding): boolean {
+  #bindingCurrent(binding: NativeReturnTarget): boolean {
     const current = this.core.managerBinding(this.id, binding.origin.managerId);
     return Boolean(current && epoch(current) === epoch(binding));
   }
-  #current(binding: ManagerBinding, envelope: HostEnvelope): boolean {
+  #current(binding: NativeReturnTarget, envelope: NativeEnvelope): boolean {
+    if ("event" in envelope) return eventReturnCurrent(this.core, binding, envelope);
     if (!this.#bindingCurrent(binding)) return false;
     const view = this.core.store.get(envelope.exchangeId), exchange = view?.exchange;
     if (!view || !exchange || exchange.bindingId !== binding.id || exchange.state === "cancelled" || exchange.origin.generation !== binding.origin.generation) return false;
@@ -206,17 +215,17 @@ export class CodexCliHost implements HostAdapter {
     this.#connecting = operation; return operation;
   }
 
-  #prepare(binding: ManagerBinding): void {
+  #prepare(binding: NativeReturnTarget, envelope: NativeEnvelope): void {
     const threadId = binding.origin.managerId, key = epoch(binding);
     if (!this.#registration || this.#closed || this.#preparing.has(key) || this.#preparing.size >= 32 || Date.now() < this.#nextPreparation) return;
     const signal = AbortSignal.any([this.#lifetime.signal, AbortSignal.timeout(12_000)]);
     const operation = (async () => {
       const rpc = await this.#connection(signal), revision = this.#ownerRevision;
-      if (!this.#bindingCurrent(binding)) return;
+      if (!this.#current(binding, envelope)) return;
       const result = record(await rpc.request("thread/resume", { threadId, excludeTurns: true }, signal, 8_000));
       if (record(result.thread).id !== threadId) throw new ConnectorError("cli_wrong_thread", "CLI resumed a different task.", 503);
       signal.throwIfAborted();
-      if (!this.#bindingCurrent(binding) || revision !== this.#ownerRevision || rpc !== this.#rpc) return;
+      if (!this.#current(binding, envelope) || revision !== this.#ownerRevision || rpc !== this.#rpc) return;
       this.#ready.set(threadId, `${epoch(binding)}:${revision}`);
       // Let the core commit the known-unaccepted attempt before reopening any
       // exhausted retries. Background preparation never sends a notification.
@@ -226,24 +235,38 @@ export class CodexCliHost implements HostAdapter {
     this.#preparing.set(key, operation);
   }
 
-  async #send(binding: ManagerBinding, envelope: HostEnvelope, signal: AbortSignal): Promise<DeliveryResult> {
+  async #send(binding: NativeReturnTarget, envelope: NativeEnvelope, signal: AbortSignal): Promise<DeliveryResult> {
     const rpc = this.#rpc!, registration = this.#registration!, revision = this.#ownerRevision;
     const deadline = AbortSignal.any([signal, this.#lifetime.signal, AbortSignal.timeout(4_000)]);
     let requested = false;
     try {
       if (await this.runtime.gone(registration.owner, deadline)) { rpc.close(); this.#ready.clear(); return retry("cli_offline"); }
       if (deadline.aborted || revision !== this.#ownerRevision || rpc !== this.#rpc || !this.#current(binding, envelope)) return retry("cli_delivery_cancelled");
+      if ("event" in envelope) {
+        const wait = this.core.store.events.current(envelope.event, envelope.deliveryId, envelope.event.version, this.core.clock());
+        if (!wait?.owner.turnId) return { status: "rejected", code: "event_owner_changed" };
+        const turns = record(await rpc.request("thread/turns/list", { threadId: binding.origin.managerId, limit: 1, sortDirection: "desc", itemsView: "notLoaded" }, deadline, 1500));
+        if (!Array.isArray(turns.data) || turns.data.length !== 1) return retry("event_native_state_unavailable");
+        const state = eventAnchorState(wait.owner.turnId, parseNativeEventTurn(binding.origin.managerId, turns.data[0]));
+        if (state === "active") return retry("event_owner_active");
+        if (state !== "ready") {
+          this.core.store.events.pause(envelope.event, envelope.event.version, state === "changed" ? "native_turn_changed" : "native_turn_stopped", this.core.clock());
+          return { status: "rejected", code: "event_reconciliation_required" };
+        }
+        if (deadline.aborted || revision !== this.#ownerRevision || rpc !== this.#rpc || !this.#current(binding, envelope)) return retry("cli_delivery_cancelled");
+      }
       requested = true;
       const result = record(await rpc.request("turn/start", { threadId: binding.origin.managerId, input: [{ type: "text", text: nativeWakeup({ attemptId: randomUUID(), binding, envelope }) }] }, deadline, 2_500));
       const turnId = identifier(record(result.turn).id);
       return { status: "accepted", reference: `cli:${binding.origin.managerId}:${turnId}` };
     } catch (error) {
       if (error instanceof NativeRpcError) {
+        if (!requested) return retry("event_native_state_unavailable");
         if (!error.written) return retry(error.code);
         if (error.nativeCode === -32600 && /^thread not found:/i.test(error.nativeMessage ?? "")) { this.#ready.delete(binding.origin.managerId); return retry("cli_task_unloaded"); }
         return { status: "unknown", code: "cli_input_uncertain" };
       }
-      // Before request() only OS inspection can fail. A malformed successful
+      // Metadata/OS failures before the input request are definitely unsent. A malformed successful
       // response occurs after a write and must retain uncertainty.
       return requested ? { status: "unknown", code: "cli_response_unrecognized" } : retry("cli_unavailable");
     }

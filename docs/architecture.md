@@ -1,6 +1,6 @@
 # Architecture
 
-Seeker owns durable attention exchanges. An exchange refers to work already owned by an external manager; it is not a goal, task, or execution database.
+Seeker owns durable attention exchanges and separate machine-event waits. An exchange refers to work already owned by an external manager; it is not a goal, task, or execution database.
 
 ```mermaid
 flowchart LR
@@ -10,7 +10,7 @@ flowchart LR
   M <--> U[Person]
 ```
 
-The modules run in one application and are wired explicitly. `SeekerCore` creates narrow manager and channel ports. It does not discover plugins, launch agents, interpret permissions with a model, or schedule their work.
+The modules run in one application and are wired explicitly. `SeekerCore` creates narrow manager, event-owner and channel ports. It does not discover plugins, launch agents, interpret permissions with a model, or schedule their work.
 
 ## Ownership
 
@@ -44,3 +44,12 @@ A restart turns interrupted sends into `unknown`; it does not blindly repeat the
 At most four outbound operations are active, with one per channel or manager ownership generation. An operation that ignores cancellation is quarantined with that one unsettled call. Other managers and verified successors can continue. Total outstanding I/O, including quarantined calls, is capped at 32; reaching that fault limit pauses new sends until calls settle or the service is restarted. Attempt owner generations fence late results after a transfer.
 
 There are no recurring reminders or arbitrary expiry of user authority. No automatic retention job deletes open exchanges, receipts, or relied-on decisions. Resource limits reject new work explicitly. See [local operations](local.md) for availability and recovery limits.
+
+
+## Machine events
+
+An event wait binds a host-verified native task and turn, immutable source revision, random wait generation, explicit deadline and producer capability digest. It has no human recipient, decision options or ManagerPort. The ordinary job/dependency owner keeps the private producer file; only its digest enters native tool arguments and SQLite. Signal intake saves the bounded result and one native outbox intent in the same existing SQLite connection/transaction.
+
+Event sends share the pump's I/O capacity, cancellation and uncertain-outcome rules. The native owner additionally checks the armed turn before grant; newer/interrupted activity pauses the saved result for explicit owner reconciliation. Accepted and unknown sends never reopen automatically. Lookup and acknowledgment distinguish native input acceptance from the original owner incorporating a result. A machine event grants no human or native execution authority.
+
+Caller deadlines expire notification authority without deleting results. Explicit clearing removes result/evidence and key material, retaining only a revoked identity tombstone to prevent delayed retries recreating input. Retained-result admission is bounded and rejects without eviction; indefinite tombstone retention is not a total database-size bound. See [event contracts and recovery](events.md). The schema migration adds one event table/indexes in the existing database; older binaries that do not support that schema must not open it.

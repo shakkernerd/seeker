@@ -1,15 +1,16 @@
-import type { DeliveryResult, HostEnvelope, ManagerBinding } from "../../contracts.ts";
+import { eventAnchorState } from "./event-state.ts";
+import type { DeliveryResult, NativeEnvelope, NativeReturnTarget } from "../../contracts.ts";
 import type { SeekerCore } from "../../core/seeker.ts";
 import { sameOwner } from "../../core/validation.ts";
 import { hostEnvelopeCurrent } from "../codex-common/current.ts";
 import type { HelperEvents, HelperRequestId } from "./helper-rpc.ts";
 import type { DesktopHelperRuntime, PreparedHelper } from "./helper-runtime.ts";
-import { envelopeReference, identifier, nativeWakeup, record } from "./protocol.ts";
+import { envelopeIdentity, envelopeReference, identifier, nativeWakeup, record } from "./protocol.ts";
 
 interface Job {
   key: string;
-  binding: ManagerBinding;
-  envelope: HostEnvelope;
+  binding: NativeReturnTarget;
+  envelope: NativeEnvelope;
   args: { threadId: string; prompt: string };
   controller: AbortController;
   phase: "preparing" | "ready" | "sending" | "finished";
@@ -27,7 +28,7 @@ interface Job {
   finish?: (value: DeliveryResult) => void;
 }
 const retry = (code: string): DeliveryResult => ({ status: "retry", retryAfterMs: 1_000, code });
-const epoch = (binding: ManagerBinding) => [binding.id, binding.origin.hostId, binding.origin.managerId, binding.origin.assignmentId, binding.origin.generation];
+const epoch = (binding: NativeReturnTarget) => [binding.id, binding.origin.hostId, binding.origin.managerId, binding.origin.assignmentId, binding.origin.generation];
 
 /** Model preparation cannot send: one real native approval is the input boundary. */
 export class DesktopHelperDelivery {
@@ -40,15 +41,30 @@ export class DesktopHelperDelivery {
 
   constructor(private readonly core: SeekerCore, private readonly runtime: DesktopHelperRuntime, private readonly preparationMs = 60_000, private readonly inputMs = 4_000, private readonly readyMs = 15_000) {}
 
-  deliver(binding: ManagerBinding, envelope: HostEnvelope, signal: AbortSignal): Promise<DeliveryResult> {
+  async deliver(binding: NativeReturnTarget, envelope: NativeEnvelope, signal: AbortSignal): Promise<DeliveryResult> {
     if (this.#closed || signal.aborted) return Promise.resolve(retry("desktop_helper_unavailable"));
-    const current = this.core.managerBinding(binding.origin.hostId, binding.origin.managerId);
-    if (!current || current.id !== binding.id || !sameOwner(current.origin, binding.origin)) return Promise.resolve({ status: "rejected", code: "owner_changed" });
+    if (!("event" in envelope)) {
+      const current = this.core.managerBinding(binding.origin.hostId, binding.origin.managerId);
+      if (!current || current.id !== binding.id || !sameOwner(current.origin, binding.origin)) return { status: "rejected", code: "owner_changed" };
+    }
     const args = { threadId: binding.origin.managerId, prompt: nativeWakeup({ attemptId: envelope.deliveryId, binding, envelope }) };
-    const key = JSON.stringify([epoch(binding), envelope.deliveryId, envelope.exchangeId, envelopeReference(envelope), args]);
+    const key = JSON.stringify([epoch(binding), envelope.deliveryId, envelopeIdentity(envelope), envelopeReference(envelope), args]);
     const finished = this.#finished.get(envelope.deliveryId);
     if (finished) return Promise.resolve(finished.key === key ? finished.result : { status: "rejected", code: "delivery_identity_changed" });
     if (!hostEnvelopeCurrent(this.core, binding, envelope)) return Promise.resolve({ status: "rejected", code: "owner_or_exchange_changed" });
+    if ("event" in envelope) {
+      try {
+        const wait = this.core.store.events.current(envelope.event, envelope.deliveryId, envelope.event.version, this.core.clock());
+        if (!wait || !wait.owner.turnId || !wait.owner.callId || !this.runtime.readEventState) return retry("event_native_state_unavailable");
+        const state = eventAnchorState(wait.owner.turnId, await this.runtime.readEventState({ ...wait.owner, turnId: wait.owner.turnId, callId: wait.owner.callId }, signal));
+        if (state === "active") return retry("event_owner_active");
+        if (state !== "ready") {
+          this.core.store.events.pause(envelope.event, envelope.event.version, state === "changed" ? "native_turn_changed" : "native_turn_stopped", this.core.clock());
+          return { status: "rejected", code: "event_reconciliation_required" };
+        }
+        if (signal.aborted || !hostEnvelopeCurrent(this.core, binding, envelope)) return retry("desktop_helper_cancelled");
+      } catch { return retry("event_native_state_unavailable"); }
+    }
     const previous = this.#job;
     if (previous && previous.key !== key && previous.phase !== "sending" && !this.#current(previous)) this.#finish(previous, retry("desktop_helper_cancelled"));
     if (this.#job && this.#job.key !== key) return Promise.resolve(retry("desktop_helper_busy"));
@@ -93,7 +109,7 @@ export class DesktopHelperDelivery {
   #current(job: Job): boolean {
     return !this.#closed && this.#job === job && !job.controller.signal.aborted && hostEnvelopeCurrent(this.core, job.binding, job.envelope);
   }
-  #prepare(binding: ManagerBinding, envelope: HostEnvelope, args: Job["args"], key: string): void {
+  #prepare(binding: NativeReturnTarget, envelope: NativeEnvelope, args: Job["args"], key: string): void {
     const controller = new AbortController();
     const job: Job = { key, binding, envelope, args, controller, phase: "preparing", approvalWritten: false,
       watch: setInterval(() => { if (!this.#current(job)) this.#finish(job, job.approvalWritten ? { status: "unknown", code: "desktop_input_uncertain" } : retry("desktop_helper_cancelled")); }, 250),

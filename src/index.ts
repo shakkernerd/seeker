@@ -10,3 +10,6 @@ export { defaultDataDir, ensureDataDir, loadAccessKey, version, runtimeVersion }
 export { createTelegramChannel, type TelegramReceiver } from "./channels/telegram/index.ts";
 export { loadTelegramRecipient } from "./channels/telegram/config.ts";
 export { loadCodexHost, setupCodex, type CodexSetupOptions } from "./hosts/codex/setup.ts";
+
+export type * from "./events.ts";
+export { prepareEventCapability, signalEvent } from "./core/event-client.ts";

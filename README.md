@@ -32,6 +32,10 @@ The demo is clearly labelled and uses a deterministic host fixture. It changes n
 
 The local channel is available immediately. [Codex Desktop setup](docs/codex.md) and [Codex CLI setup](docs/codex-cli.md) connect existing managers and return replies to those same native tasks. They share one project MCP entry. [Telegram setup](docs/telegram.md) adds an optional private conversation with a deliberately paired owner. The local demo uses its labelled fixture; live connections are configured separately.
 
+## Background results
+
+[Background event return](docs/events.md) lets an existing native task arm a durable wait and receive a correlated job completion or dependency release. The existing owner signals through a private per-wait capability; Seeker retains the result and delivery evidence without executing the job. Machine events are separate from human decisions and do not grant conversation-manager access.
+
 ## Use and extend
 
 [Local setup and recovery](docs/local.md) covers authentication, data, startup, and operating limits. [Architecture](docs/architecture.md) explains the component boundaries. [Adapter contracts](docs/adapters.md) describes authenticated origin, reply correlation, and receipts. [Development and packaging](docs/development.md) covers verification and the installable tarball.

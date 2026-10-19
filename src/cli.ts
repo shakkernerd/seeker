@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { runEventCommand } from "./cli/events.ts";
 import { join, resolve } from "node:path";
 import { SeekerCore } from "./core/seeker.ts";
 import { SeekerError } from "./core/validation.ts";
@@ -20,6 +21,7 @@ Usage: seeker <command> [options]
 
   start                 Start the authenticated local inbox
   demo                  Try the local channel with a labelled host fixture
+  event                 Prepare a private wait capability or signal a background result
   access-key            Print the local browser/CLI access key deliberately
   telegram              Pair or inspect the optional Telegram channel
   codex setup           Connect an existing Codex Desktop manager
@@ -39,6 +41,7 @@ Pending exchanges survive shutdown. A fixture is not a real agent manager.
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
+  if (args[0] === "event") { await runEventCommand(args.slice(1)); return; }
   if (args[0] === "telegram") { await runTelegramCommand(args.slice(1)); return; }
   if (args[0] === "codex" || args[0] === "codex-cli") {
     await runCodexCommand(args.slice(1), { packageDirectory: resolve(import.meta.dir, ".."), defaultRecipient: localRecipient, resolveRecipient: (dataDir, channel) => {

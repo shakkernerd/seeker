@@ -1,10 +1,12 @@
-import type { HostEnvelope, ManagerBinding } from "../../contracts.ts";
+import { eventReturnCurrent } from "../../core/event-return.ts";
+import type { NativeEnvelope, NativeReturnTarget } from "../../contracts.ts";
 import { channelReadiness } from "../../core/attention.ts";
 import type { SeekerCore } from "../../core/seeker.ts";
 import { sameOwner } from "../../core/validation.ts";
 
 /** Recheck retained delivery authority; the caller must also fence its live attempt. */
-export function hostEnvelopeCurrent(core: SeekerCore, binding: ManagerBinding, envelope: HostEnvelope): boolean {
+export function hostEnvelopeCurrent(core: SeekerCore, binding: NativeReturnTarget, envelope: NativeEnvelope): boolean {
+  if ("event" in envelope) return eventReturnCurrent(core, binding, envelope);
   try {
     const current = core.managerBinding(binding.origin.hostId, binding.origin.managerId);
     if (!current || current.id !== binding.id || !sameOwner(current.origin, binding.origin)) return false;

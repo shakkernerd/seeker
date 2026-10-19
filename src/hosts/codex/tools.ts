@@ -1,3 +1,4 @@
+import { eventTools } from "./event-tools.ts";
 import type { ManagerCommand, ManagerPort, ReadOptions } from "../../contracts.ts";
 import { nativeEvidence } from "./native.ts";
 import { ConnectorError, identifier, onlyKeys, record, type NativeInvocation } from "./protocol.ts";
@@ -17,7 +18,7 @@ const change = (type: string, properties: Record<string, unknown>, optional: str
   ["type", "requestId", "expectedVersion", ...Object.keys(properties).filter((key) => !optional.includes(key))],
 );
 
-export const seekerTools = [
+export const conversationTools = [
   { name: "submit", description: "Queue a bounded question for your configured owner. Use a stable requestId for retries. Submission does not prove delivery; if Seeker is unavailable, use native attention for required owner input. Only an explicitly registered native manager may submit; Seeker obtains your identity from Codex. Return promptly and continue unrelated work.", inputSchema: object({ requestId: id, decision }) },
   { name: "get", description: "Read complete saved records with current scope and the selected item's original revision. Use the collection and itemId named by a Seeker notification; deferred input also requires channelId. To read history, pass nextCursor unchanged with the same collection. A question or receipt is not an approval.", inputSchema: object({ requestId: id, collection: { enum: ["receipts", "deferred", "context", "revisions", "deliveries"] }, cursor, itemId: id, channelId: id }, ["requestId"]), annotations: { readOnlyHint: true } },
   { name: "pending", description: "Read one page of pending exchange summaries, then use get for complete questions and replies. Pass nextCursor unchanged for more summaries. This is for recovery, not repeated polling; Seeker delivers reply notifications through the native host.", inputSchema: object({ cursor }, []), annotations: { readOnlyHint: true } },
@@ -29,6 +30,8 @@ export const seekerTools = [
     change("reconcile-input", { channelId: id, eventId: id, note: string }, ["note"]),
   ] } },
 ] as const;
+
+export const seekerTools = [...conversationTools, ...eventTools] as const;
 
 export function invokeManager(port: ManagerPort, operation: string, raw: unknown, origin: NativeInvocation): unknown {
   const input = record(raw);

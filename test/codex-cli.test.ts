@@ -5,6 +5,8 @@ import { join } from "node:path";
 import type { Decision, DeliveryResult, ManagerBinding, ReceiptEnvelope } from "../src/contracts.ts";
 import { SeekerCore } from "../src/core/seeker.ts";
 import { SqliteExchangeStore } from "../src/store/sqlite.ts";
+import { eventDigest } from "../src/core/events.ts";
+import { eventEnvelope, eventReturnTarget } from "../src/core/event-return.ts";
 import { localRecipient } from "../src/local/channel.ts";
 import { invocationFromMetadata, nativeWakeup, type NativeInvocation } from "../src/hosts/codex/protocol.ts";
 import { cliHostId, cliRoute } from "../src/hosts/codex-cli/config.ts";
@@ -381,4 +383,39 @@ test.each(["preparation", "input"] as const)("shutdown aborts and settles outsta
   expect((await send(f, value)).status).toBe("retry");
   if (stage === "preparation") expect(f.connections).toHaveLength(0);
   else expect(f.rpc.connected).toBe(false);
+});
+
+
+test("CLI worker event admission and explicit reanchor preserve producer identity and native permissions", async () => {
+  const f = fixture(), origin = invocation("individual-cli-worker");
+  const address = { waitId: "cli-dependency", generation: "wait-generation", revision: "release-one" };
+  const armed = await f.invoke(origin, "event_arm", { ...address, title: "Release", expiresAt: Date.now() + 60_000, capabilityDigest: eventDigest("d".repeat(64)) });
+  expect(armed.status).toBe(200);
+  expect(f.core.managerBinding(cliHostId, origin.threadId)).toBeUndefined();
+  expect((await f.invoke(origin, "submit", { requestId: "not-a-manager", decision })).status).toBe(403);
+  f.store.events.signal("d".repeat(64), { ...address, eventId: "released", outcome: "released", summary: "Untrusted producer text", evidenceRefs: [] }, Date.now());
+  let nativeTurn = "native-turn", status = "interrupted";
+  f.behavior.request = async (call) => call.method === "thread/turns/list" ? { data: [{ id: nativeTurn, status }] } : f.defaultResponse(call);
+  const claimed = f.store.events.claim(1, Date.now(), [])[0]!, target = eventReturnTarget(claimed), envelope = eventEnvelope(claimed);
+  const ready = deferred<number>(); f.behavior.restored = ready.resolve;
+  expect((await f.host.deliver(target, envelope, new AbortController().signal)).status).toBe("retry");
+  await ready.promise;
+  const rejected = await f.host.deliver(target, envelope, new AbortController().signal);
+  expect(rejected.status).toBe("rejected");
+  f.store.events.complete(address.waitId, address.generation, claimed.delivery!.attemptId!, rejected, Date.now());
+  expect(f.calls.some((call) => call.method === "turn/start")).toBe(false);
+  const port = f.core.events({ hostId: cliHostId, taskId: origin.threadId, turnId: origin.turnId, callId: origin.callId });
+  const paused = port.get(address); expect(paused.state).toBe("paused");
+  nativeTurn = "current-turn"; status = "completed";
+  expect((await f.invoke({ ...origin, turnId: nativeTurn }, "event_resume", { ...address, expectedVersion: paused.version })).status).toBe(200);
+  const resumed = f.store.events.claim(1, Date.now(), [])[0]!, currentEnvelope = eventEnvelope(resumed);
+  expect(resumed.receipt!.id).toBe(claimed.receipt!.id);
+  expect(resumed.delivery!.id === claimed.delivery!.id).toBe(false);
+  const result = await f.host.deliver(eventReturnTarget(resumed), currentEnvelope, new AbortController().signal);
+  expect(result.status).toBe("accepted");
+  const calls = f.calls.filter((call) => call.method === "turn/start"); expect(calls).toHaveLength(1);
+  expect(Object.keys(calls[0]!.params as object).sort()).toEqual(["input", "threadId"]);
+  expect(JSON.stringify(calls[0]!.params)).not.toContain("Untrusted producer text");
+  f.store.events.complete(address.waitId, address.generation, resumed.delivery!.attemptId!, result, Date.now());
+  expect(f.store.events.claim(1, Date.now(), [])).toEqual([]);
 });

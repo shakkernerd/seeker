@@ -1,3 +1,4 @@
+import { SqliteEventStore } from "./events.ts";
 import { Database } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, constants, mkdirSync, openSync } from "node:fs";
@@ -22,6 +23,7 @@ const activeExchange = `e.id IN (${activeIds})`;
 /** One connection owns this local store. Transactions contain no asynchronous I/O. */
 export class SqliteExchangeStore implements ExchangeStore {
   readonly #db: Database;
+  readonly events: SqliteEventStore;
 
   constructor(filename: string) {
     if (filename !== ":memory:") {
@@ -38,7 +40,7 @@ export class SqliteExchangeStore implements ExchangeStore {
       this.#db.run("PRAGMA fullfsync = ON");
       this.#db.run("PRAGMA foreign_keys = ON");
       const version = this.#db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version;
-      if (version < 0 || version > 6) fail("store_version", "This store needs a compatible Seeker version; it was not changed.");
+      if (version < 0 || version > 7) fail("store_version", "This store needs a compatible Seeker version; it was not changed.");
       this.#db.transaction(() => {
         this.#db.run(`
           CREATE TABLE IF NOT EXISTS bindings (id TEXT PRIMARY KEY, data TEXT NOT NULL);
@@ -94,7 +96,14 @@ export class SqliteExchangeStore implements ExchangeStore {
             '$.state','reconcile','$.version',json_extract(data,'$.version')+1)
             WHERE id IN (SELECT json_extract(data,'$.deferred.exchangeId') FROM inbound WHERE json_extract(data,'$.deferred.disposition.status')='pending')`);
         }
-        this.#db.run("PRAGMA user_version = 6");
+        this.#db.run(`CREATE TABLE IF NOT EXISTS event_waits (
+          id TEXT PRIMARY KEY, host_id TEXT NOT NULL, task_id TEXT NOT NULL,
+          state TEXT NOT NULL, next_at INTEGER NOT NULL, data TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS event_wait_queue ON event_waits(state,next_at);
+        CREATE INDEX IF NOT EXISTS event_wait_owner ON event_waits(host_id,task_id,state);
+        CREATE INDEX IF NOT EXISTS event_wait_retained ON event_waits(host_id,task_id) WHERE state<>'cleared';`);
+        this.#db.run("PRAGMA user_version = 7");
       }).immediate();
     } catch (error) {
       this.#db.close();
@@ -103,6 +112,7 @@ export class SqliteExchangeStore implements ExchangeStore {
       }
       throw error;
     }
+    this.events = new SqliteEventStore(this.#db);
   }
 
   bind(input: ManagerBinding): void {

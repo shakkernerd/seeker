@@ -1,3 +1,5 @@
+import type { EventOwner, EventPort } from "../events.ts";
+import { eventOwner } from "./events.ts";
 import type { ChannelIngress, ExchangeStore, ExchangeView, InboundReply, ManagerBinding, ManagerOrigin, ManagerPort, ReadOptions, Recipient } from "../contracts.ts";
 import { fail, id, origin as validateOrigin, sameRecipient } from "./validation.ts";
 
@@ -14,7 +16,7 @@ export class SeekerCore {
     return this.store.findBinding(hostId, managerId);
   }
 
-  resumeHost(hostId: string): number { return this.store.resumeRoute("host", id(hostId, "Host"), this.clock()); }
+  resumeHost(hostId: string): number { const host = id(hostId, "Host"); return this.store.resumeRoute("host", host, this.clock()) + this.store.events.resumeHost(host, this.clock()); }
   resumeChannel(channelId: string): number { return this.store.resumeRoute("channel", id(channelId, "Channel"), this.clock()); }
 
   manager(input: ManagerOrigin): ManagerPort {
@@ -38,6 +40,28 @@ export class SeekerCore {
         this.store.execute(origin, command, this.clock());
         return read(command.requestId);
       },
+    };
+  }
+
+  /** Trusted host composition supplies this identity; event access never grants ManagerPort. */
+  events(input: EventOwner): EventPort {
+    const origin = eventOwner(input);
+    const binding = this.managerBinding(origin.hostId, origin.taskId);
+    if (binding) { origin.bindingId = binding.id; origin.ownerGeneration = binding.origin.generation; }
+    const current = () => {
+      const live = this.managerBinding(origin.hostId, origin.taskId);
+      if ((live?.id !== origin.bindingId) || (live?.origin.generation !== origin.ownerGeneration)) fail("owner_changed", "This event port's native assignment changed. Reconnect from the current owner.", 409);
+    };
+    const mutate: (address: Parameters<EventPort["cancel"]>[0], expectedVersion: number, command: Parameters<ExchangeStore["events"]["mutate"]>[3]) => ReturnType<EventPort["get"]> =
+      (address, expectedVersion, command) => { current(); return this.store.events.mutate(origin, address, expectedVersion, command, this.clock()); };
+    return {
+      arm: (value) => { current(); return this.store.events.arm(origin, value, this.clock()); },
+      get: (address) => { current(); return this.store.events.get(origin, address, this.clock()); },
+      pending: () => { current(); return this.store.events.pending(origin, this.clock()).map(({ waitId, generation, revision, title, expiresAt, version, state, updatedAt, reason, receipt }) => ({ waitId, generation, revision, title, expiresAt, version, state, updatedAt, ...(reason ? { reason } : {}), ...(receipt ? { receiptId: receipt.id } : {}) })); },
+      cancel: (address, version) => mutate(address, version, { type: "cancel" }),
+      resume: (address, version) => mutate(address, version, { type: "resume" }),
+      acknowledge: (address, version, receiptId, status) => mutate(address, version, { type: "acknowledge", receiptId, status }),
+      clear: (address, version) => mutate(address, version, { type: "clear" }),
     };
   }
 

@@ -39,6 +39,7 @@ async function fixture(dropSendResponse = false) {
   const notices: string[] = [];
   const outcomes: IngestResult[] = [];
   const host: HostAdapter = { id: "test-host", deliver: async (binding, envelope) => {
+    if ("event" in envelope) throw new Error("Unexpected machine event in human channel fixture");
     if ("receipt" in envelope) {
       returned.push(`${binding.origin.managerId}:${envelope.receipt.id}`);
       return { status: "accepted", reference: envelope.receipt.id };

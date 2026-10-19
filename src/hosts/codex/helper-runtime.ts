@@ -1,3 +1,5 @@
+import type { EventOwner } from "../../events.ts";
+import type { NativeEventState } from "./event-state.ts";
 import { randomUUID } from "node:crypto";
 import { accessSync, constants, existsSync, linkSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -13,6 +15,7 @@ export interface PreparedHelper {
   start(prompt: string, signal: AbortSignal): Promise<string>;
 }
 export interface DesktopHelperRuntime {
+  readEventState?(owner: EventOwner, signal: AbortSignal): Promise<NativeEventState>;
   prepare(events: HelperEvents, signal: AbortSignal, current: () => boolean): Promise<PreparedHelper>;
   reset(): Promise<void>;
   close(): Promise<void>;
@@ -91,7 +94,7 @@ export class NativeDesktopHelper implements DesktopHelperRuntime {
   #generation = 0;
   #resetting?: Promise<void>;
 
-  constructor(private readonly lifecycle: Pick<CodexDesktopLifecycle, "prepare">, dataDir: string, private readonly connect: ConnectHelper) {
+  constructor(private readonly lifecycle: Pick<CodexDesktopLifecycle, "prepare">, dataDir: string, private readonly connect: ConnectHelper, private readonly eventReader?: (owner: EventOwner, signal: AbortSignal) => Promise<NativeEventState>) {
     mkdirSync(join(privateDirectory(dataDir), "codex-helper"), { mode: 0o700, recursive: true });
     this.#workspace = privateDirectory(join(dataDir, "codex-helper"));
     this.#statePath = join(this.#workspace, "session.json");
@@ -101,6 +104,11 @@ export class NativeDesktopHelper implements DesktopHelperRuntime {
       if (value.version !== 1 || !Number.isSafeInteger(value.turns) || (value.turns as number) < 0 || (value.turns as number) > 16) throw unavailable("The helper lifecycle record needs reconciliation.");
       this.#state = { version: 1, threadId: identifier(value.threadId), turns: value.turns as number };
     }
+  }
+
+  async readEventState(owner: EventOwner, signal: AbortSignal): Promise<NativeEventState> {
+    if (this.#closed || !this.eventReader) throw unavailable("The native event metadata reader is unavailable.");
+    return this.eventReader(owner, signal);
   }
 
   async prepare(events: HelperEvents, signal: AbortSignal, current: () => boolean): Promise<PreparedHelper> {

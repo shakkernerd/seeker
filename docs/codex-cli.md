@@ -61,3 +61,10 @@ Known-unaccepted work may retry after readiness returns. A lost response after a
 The native path is qualified against local Unix app-server contracts from Codex CLI 0.153.2 and 0.154.0. These app-server APIs are experimental. An embedded TUI, network WebSocket, custom launch flags, changed executable or ambiguous native profile cannot silently become a different daemon or conversation. Keep the existing task and deliberately reconcile the unsupported host configuration; registration does not migrate it.
 
 The service stores CLI bridge state under the private Seeker data directory's `cli/` subdirectory. It does not copy native conversations, credentials or provider configuration. The native host owns its saved session and authentication. Stop Seeker normally to close its private listener and pending preparation; an already recovered native host retains its own lifetime.
+
+
+## Background completion and dependency events
+
+The same connector exposes separate [machine event tools](events.md) to host-authenticated native task owners, including ordinary workers. These do not register workers as human-decision managers. Existing human conversation tools and native approval/filter choices retain their current gates; conversation-permission setup still concerns only its four human tools.
+
+Prepare a private per-wait producer file with `seeker event prepare`, pass only its digest/identity to `event_arm`, and let the existing job/dependency owner signal through `seeker event signal`. Each new owner turn, including another event wake, reconciles retained waits once and explicitly reanchors still-needed waiting/paused waits before ending again. Current human stops/instructions remain authoritative. Unavailable native metadata cannot authorize a send; retain the result and restore the original qualified connector instead of polling with models or replaying uncertain input.
