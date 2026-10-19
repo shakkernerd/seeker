@@ -56,7 +56,9 @@ export class DesktopHelperDelivery {
       try {
         const wait = this.core.store.events.current(envelope.event, envelope.deliveryId, envelope.event.version, this.core.clock());
         if (!wait || !wait.owner.turnId || !wait.owner.callId || !this.runtime.readEventState) return retry("event_native_state_unavailable");
-        const state = eventAnchorState(wait.owner.turnId, await this.runtime.readEventState({ ...wait.owner, turnId: wait.owner.turnId, callId: wait.owner.callId }, signal));
+        const metadata = await this.runtime.readEventState({ ...wait.owner, turnId: wait.owner.turnId, callId: wait.owner.callId }, signal);
+        if (this.#closed || signal.aborted) return retry("desktop_helper_cancelled");
+        const state = eventAnchorState(wait.owner.turnId, metadata);
         if (state === "active") return retry("event_owner_active");
         if (state !== "ready") {
           this.core.store.events.pause(envelope.event, envelope.event.version, state === "changed" ? "native_turn_changed" : "native_turn_stopped", this.core.clock());

@@ -91,6 +91,8 @@ export class NativeDesktopHelper implements DesktopHelperRuntime {
   #rpc?: HelperConnection;
   #opening?: Promise<HelperConnection>;
   #closed = false;
+  readonly #readLifetime = new AbortController();
+  readonly #reads = new Set<Promise<NativeEventState>>();
   #generation = 0;
   #resetting?: Promise<void>;
 
@@ -108,7 +110,10 @@ export class NativeDesktopHelper implements DesktopHelperRuntime {
 
   async readEventState(owner: EventOwner, signal: AbortSignal): Promise<NativeEventState> {
     if (this.#closed || !this.eventReader) throw unavailable("The native event metadata reader is unavailable.");
-    return this.eventReader(owner, signal);
+    const reading = this.eventReader(owner, AbortSignal.any([signal, this.#readLifetime.signal]));
+    this.#reads.add(reading);
+    try { return await reading; }
+    finally { this.#reads.delete(reading); }
   }
 
   async prepare(events: HelperEvents, signal: AbortSignal, current: () => boolean): Promise<PreparedHelper> {
@@ -200,7 +205,7 @@ export class NativeDesktopHelper implements DesktopHelperRuntime {
     void closing.finally(() => { if (this.#resetting === closing) this.#resetting = undefined; }).catch(() => {});
     return closing;
   }
-  async close(): Promise<void> { this.#closed = true; await this.reset(); }
+  async close(): Promise<void> { this.#closed = true; this.#readLifetime.abort(); await Promise.allSettled([...this.#reads]); await this.reset(); }
 
   #save(value: HelperState | undefined): void {
     if (this.#closed) throw unavailable("The helper is closed.");

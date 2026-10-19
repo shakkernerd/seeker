@@ -13,7 +13,7 @@ import type { EventArm, EventOwner, EventSignal } from "../src/events.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); });
-const owner: EventOwner = { hostId: "codex-desktop", taskId: "task-one", turnId: "turn-one", callId: "call-one" };
+const owner: EventOwner = { hostId: "fixture-events", taskId: "task-one", turnId: "turn-one", callId: "call-one" };
 const capability = "a".repeat(64);
 const address = { waitId: "dependency-one", generation: "generation-one", revision: "source-one" };
 const arm: EventArm = { ...address, title: "Wait for dependency", expiresAt: 100_000, capabilityDigest: eventDigest(capability) };
@@ -111,7 +111,7 @@ test("newer native activity pauses results for explicit owner resume, while unkn
   expect(f.store.events.claim(1, 1004, [])).toEqual([]);
   expect(() => newer.clear(address, saved.version)).toThrow("Settle");
   saved = newer.acknowledge(address, saved.version, saved.receipt!.id, "handled");
-  expect(saved.receipt?.evidenceRef).toBe("codex:task-one:turn-two:call-two");
+  expect(saved.receipt?.evidenceRef).toBe("fixture-events:task-one:turn-two:call-two");
   saved = newer.clear(address, saved.version);
   expect(saved.state).toBe("cleared"); expect(saved.receipt).toBeUndefined();
   expect(saved.owner).toEqual({ hostId: owner.hostId, taskId: owner.taskId });

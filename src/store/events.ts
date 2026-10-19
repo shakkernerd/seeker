@@ -60,7 +60,7 @@ export class SqliteEventStore implements EventStore {
         if (!["received", "handled", "unknown"].includes(command.status) || !wait.receipt || wait.receipt.id !== id(command.receiptId, "Receipt")) fail("event_receipt", "The exact saved event receipt is required.", 409);
         if (wait.state === "cleared") fail("event_closed", "This event evidence was cleared.", 409);
         if (wait.receipt.disposition === "handled" && command.status !== "handled") fail("event_disposition", "A handled event cannot become unhandled.", 409);
-        wait.receipt.disposition = command.status; wait.receipt.evidenceRef = `codex:${owner.taskId}:${owner.turnId}:${owner.callId}`;
+        wait.receipt.disposition = command.status; wait.receipt.evidenceRef = `${owner.hostId}:${owner.taskId}:${owner.turnId}:${owner.callId}`;
         if (command.status === "handled" && !["cancelled", "expired"].includes(wait.state)) wait.state = "handled";
         this.#retire(wait);
       } else {
