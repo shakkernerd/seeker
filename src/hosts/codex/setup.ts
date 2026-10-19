@@ -86,8 +86,9 @@ export async function loadCodexHost(core: SeekerCore, dataDir: string) {
   if (!statIfPresent(path)) return;
   const config = readConnectorConfig(path);
   const lifecycle = new CodexDesktopLifecycle(join(dataDir, "codex-desktop.json"));
-  const input = new DesktopHelperDelivery(core, new NativeDesktopHelper(lifecycle, dataDir));
-  const host = new CodexHostAdapter(config.hostId, readConnectorCredential(config.credentialFile), { binding: (managerId) => core.managerBinding(config.hostId, managerId), manager: (origin) => core.manager(origin) }, lifecycle, input);
+  const runtime = new NativeDesktopHelper(lifecycle, dataDir, (profile, _pipe, _workspace, signal) => host.helperConnection(profile, dataDir, signal));
+  const input = new DesktopHelperDelivery(core, runtime);
+  const host: CodexHostAdapter = new CodexHostAdapter(config.hostId, readConnectorCredential(config.credentialFile), { binding: (managerId) => core.managerBinding(config.hostId, managerId), manager: (origin) => core.manager(origin) }, lifecycle, input);
   try {
     const listener = await listenPrivate(config.socketPath, async (request) => await host.handle(request) ?? new Response(null, { status: 404 }));
     let closing: Promise<void> | undefined;

@@ -1,3 +1,5 @@
+import { dirname } from "node:path";
+import { listenHelperBridge, type HelperEndpoint } from "./helper-bridge.ts";
 import { randomUUID } from "node:crypto";
 import { privateSocket, readConnectorConfig, readConnectorCredential, type CodexConnectorConfig } from "./config.ts";
 import { CodexNativeClient } from "./native.ts";
@@ -12,7 +14,7 @@ export class CodexConnector {
   #session?: string;
   #connecting?: Promise<string>;
 
-  constructor(private readonly config: CodexConnectorConfig, private readonly credential: string, private readonly native: CodexNativeClient, private readonly desktop?: DesktopOwner) {}
+  constructor(private readonly config: CodexConnectorConfig, private readonly credential: string, private readonly native: CodexNativeClient, private readonly desktop?: DesktopOwner, private readonly helper?: HelperEndpoint) {}
 
   async invoke(origin: NativeInvocation, operation: string, args: unknown, signal?: AbortSignal): Promise<unknown> {
     const session = await this.#connect();
@@ -23,6 +25,20 @@ export class CodexConnector {
       if (!(error instanceof ConnectorError) || error.status !== 401 || this.#session !== session) throw error;
       this.#session = undefined;
       return this.#request("invoke", { origin, operation, arguments: args }, await this.#connect(), 4_000, signal);
+    }
+  }
+
+  /** Ordinary I/O keeps the qualified execution owner available while the task is idle. */
+  async receive(): Promise<void> {
+    while (!this.#lifetime.signal.aborted) {
+      try { await this.#request("heartbeat", {}, await this.#connect(), 4_000); }
+      catch { this.#session = undefined; }
+      if (this.#lifetime.signal.aborted) break;
+      await new Promise<void>((resolve) => {
+        const finish = () => { clearTimeout(timer); this.#lifetime.signal.removeEventListener("abort", finish); resolve(); };
+        const timer = setTimeout(finish, 20_000); timer.unref();
+        this.#lifetime.signal.addEventListener("abort", finish, { once: true });
+      });
     }
   }
 
@@ -40,7 +56,7 @@ export class CodexConnector {
     this.#connecting = (async () => {
       privateSocket(this.config.socketPath);
       await this.native.qualify(this.#lifetime.signal);
-      const response = record(await this.#request("connect", { protocol: connectorProtocol, instanceId: this.#instanceId, ...(this.desktop ? { desktop: this.desktop } : {}) }, this.credential, 4_000));
+      const response = record(await this.#request("connect", { protocol: connectorProtocol, instanceId: this.#instanceId, ...(this.desktop ? { desktop: this.desktop } : {}), ...(this.helper ? { helper: this.helper } : {}) }, this.credential, 4_000));
       if (response.protocol !== connectorProtocol || response.hostId !== this.config.hostId || typeof response.session !== "string" || !/^[a-f0-9]{64}$/.test(response.session)) throw new ConnectorError("wrong_host", "The connector reached a different Seeker host registration.");
       this.#session = response.session;
       return response.session;
@@ -68,7 +84,11 @@ export async function runCodexConnector(configPath: string, owner?: DesktopOwner
   if (!pipe) throw new ConnectorError("native_host_required", "Run this connector through Codex Desktop's configured MCP server.");
   const config = readConnectorConfig(configPath);
   const desktop = owner ?? await captureDesktopOwner();
-  const connector = new CodexConnector(config, readConnectorCredential(config.credentialFile), new CodexNativeClient(pipe, 3_000), desktop);
+  const native = new CodexNativeClient(pipe, 3_000);
+  await native.qualify();
+  const bridge = await listenHelperBridge(dirname(config.socketPath), desktop, pipe);
+  const connector = new CodexConnector(config, readConnectorCredential(config.credentialFile), native, desktop, bridge.endpoint);
+  const receiving = connector.receive();
   try { await serveSeekerTools(connector); }
-  finally { await connector.close(); }
+  finally { await connector.close(); await receiving; await bridge.close(); }
 }

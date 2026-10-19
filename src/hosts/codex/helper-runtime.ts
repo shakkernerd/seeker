@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, linkSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { accessSync, constants, existsSync, linkSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { privateDirectory, readPrivateFile } from "./config.ts";
-import { CodexDesktopLifecycle } from "./desktop.ts";
+import type { CodexDesktopLifecycle } from "./desktop.ts";
 import type { DesktopProfile } from "./desktop-owner.ts";
 import { HelperRpc, HelperRpcError, type HelperConnection, type HelperEvents } from "./helper-rpc.ts";
 import { ConnectorError, identifier, onlyKeys, record } from "./protocol.ts";
@@ -18,11 +18,13 @@ export interface DesktopHelperRuntime {
   close(): Promise<void>;
 }
 interface HelperState { version: 1; threadId: string; turns: number }
-type ConnectHelper = (profile: DesktopProfile, pipePath: string, workspace: string) => HelperConnection;
+export type ConnectHelper = (profile: DesktopProfile, pipePath: string, workspace: string, signal: AbortSignal) => HelperConnection | Promise<HelperConnection>;
 
 /** The installed CLI entrypoint keeps its real binary resolution and signal forwarding role. */
 export function codexLauncher(): string {
-  const selected = Bun.which("codex");
+  const selected = (process.env.PATH ?? "").split(":").filter((entry) => entry.startsWith("/")).map((entry) => join(entry, "codex")).find((entry) => {
+    try { accessSync(entry, constants.X_OK); return true; } catch { return false; }
+  });
   if (!selected) throw unavailable("Install the official Codex npm CLI and make codex available on Seeker's PATH.");
   const path = realpathSync(selected), root = dirname(dirname(path));
   const pkg = record(JSON.parse(readFileSync(join(root, "package.json"), "utf8")));
@@ -31,7 +33,7 @@ export function codexLauncher(): string {
   return path;
 }
 
-function connectHelper(profile: DesktopProfile, pipePath: string, workspace: string): HelperConnection {
+export function connectDesktopHelper(profile: DesktopProfile, pipePath: string, workspace: string): HelperConnection {
   const node = join(profile.appPath, "Contents/Resources/cua_node/bin/node");
   const settings = [
     'features.plugins=false', 'features.apps=false',
@@ -84,11 +86,12 @@ export class NativeDesktopHelper implements DesktopHelperRuntime {
   #state?: HelperState;
   #saved?: string;
   #rpc?: HelperConnection;
+  #opening?: Promise<HelperConnection>;
   #closed = false;
   #generation = 0;
   #resetting?: Promise<void>;
 
-  constructor(private readonly lifecycle: Pick<CodexDesktopLifecycle, "prepare">, dataDir: string, private readonly connect: ConnectHelper = connectHelper) {
+  constructor(private readonly lifecycle: Pick<CodexDesktopLifecycle, "prepare">, dataDir: string, private readonly connect: ConnectHelper) {
     mkdirSync(join(privateDirectory(dataDir), "codex-helper"), { mode: 0o700, recursive: true });
     this.#workspace = privateDirectory(join(dataDir, "codex-helper"));
     this.#statePath = join(this.#workspace, "session.json");
@@ -101,8 +104,9 @@ export class NativeDesktopHelper implements DesktopHelperRuntime {
   }
 
   async prepare(events: HelperEvents, signal: AbortSignal, current: () => boolean): Promise<PreparedHelper> {
-    // Resume overrides can be ignored by an already loaded native task. Always
-    // settle the owned process, then apply fresh config during a cold resume.
+    // Settle the previous owned process before creating a fresh bounded helper.
+    // The Desktop may adopt its source thread when a native tool is called; a
+    // new CLI must not resume a root whose writer now belongs to that Desktop.
     await this.reset();
     const generation = ++this.#generation;
     const check = () => {
@@ -112,8 +116,15 @@ export class NativeDesktopHelper implements DesktopHelperRuntime {
     check();
     const { owner, pipePath } = await this.lifecycle.prepare(signal, current);
     check();
-    const rpc = this.connect(owner.profile, pipePath, this.#workspace);
-    this.#rpc = rpc; rpc.events = events;
+    const opening = Promise.resolve().then(() => this.connect(owner.profile, pipePath, this.#workspace, signal));
+    this.#opening = opening;
+    let rpc: HelperConnection | undefined;
+    try {
+      rpc = await opening; check();
+      this.#rpc = rpc;
+    } catch (error) { await rpc?.close(); throw error; }
+    finally { if (this.#opening === opening) this.#opening = undefined; }
+    rpc.events = events;
     await rpc.request("initialize", { clientInfo: { name: "seeker_desktop_helper", version: "0.1.0" }, capabilities: { experimentalApi: true } }, signal);
     check(); rpc.notify("initialized", {});
     const config = record(record(await rpc.request("config/read", { cwd: this.#workspace, includeLayers: false }, signal)).config);
@@ -129,12 +140,12 @@ export class NativeDesktopHelper implements DesktopHelperRuntime {
       }
       check();
       if (saved && (saved.id !== this.#state?.threadId || saved.cwd !== this.#workspace || saved.forkedFromId != null)) throw unavailable("The saved root is not this service's owned helper.");
-      if (this.#state?.turns === 16) {
+      if (this.#state && saved) {
         await rpc.request("thread/delete", { threadId: this.#state.threadId }, signal);
         check(); this.#save(undefined);
       }
     }
-    const response = record(await rpc.request(this.#state ? "thread/resume" : "thread/start", this.#state ? { ...options, threadId: this.#state.threadId, excludeTurns: true } : { ...options, ephemeral: false, environments: [] }, signal));
+    const response = record(await rpc.request("thread/start", { ...options, ephemeral: false, environments: [] }, signal));
     check();
     const thread = record(response.thread), threadId = identifier(thread.id);
     if (thread.cwd !== this.#workspace || (this.#state && threadId !== this.#state.threadId)) throw unavailable("The native helper has a different identity or workspace.");
@@ -160,7 +171,7 @@ export class NativeDesktopHelper implements DesktopHelperRuntime {
       start: async (prompt, turnSignal) => {
         check();
         this.#save({ ...this.#state!, turns: this.#state!.turns + 1 });
-        // An explicit empty environment list also applies after a cold resume:
+        // An explicit empty environment list applies to every fresh helper turn:
         // this model turn has no shell, patch, or local-image environment.
         const result = record(await rpc.request("turn/start", { threadId, input: [{ type: "text", text: prompt }], effort: "low", environments: [] }, turnSignal));
         return identifier(record(result.turn).id);
@@ -171,8 +182,12 @@ export class NativeDesktopHelper implements DesktopHelperRuntime {
   reset(): Promise<void> {
     if (this.#resetting) return this.#resetting;
     this.#generation += 1;
-    const rpc = this.#rpc;
-    const closing = (async () => { await rpc?.close(); if (this.#rpc === rpc) this.#rpc = undefined; })();
+    const rpc = this.#rpc, opening = this.#opening;
+    const closing = (async () => {
+      const results = await Promise.allSettled([rpc?.close(), opening?.then((connection) => connection.close(), () => {})]);
+      for (const result of results) if (result.status === "rejected") throw result.reason;
+      if (this.#rpc === rpc) this.#rpc = undefined;
+    })();
     this.#resetting = closing;
     void closing.finally(() => { if (this.#resetting === closing) this.#resetting = undefined; }).catch(() => {});
     return closing;

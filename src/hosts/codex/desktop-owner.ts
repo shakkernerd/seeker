@@ -70,7 +70,7 @@ function parseProcess(value: unknown, fromOs = false): DesktopProcess {
 export function parseDesktopOwner(value: unknown): DesktopOwner {
   const item = object(value, ["profile", "app", "server"]);
   const profile = parseProfile(item.profile), app = parseProcess(item.app), server = parseProcess(item.server);
-  if (dirname(app.executable) !== join(profile.appPath, "Contents", "MacOS") || server.executable !== serverPath(profile.appPath) || server.parentPid !== app.pid || app.parentPid === server.pid || app.pid === server.pid) throw failure("invalid_desktop_owner", "Desktop process ancestry does not match its registered bundle.");
+  if (dirname(app.executable) !== join(profile.appPath, "Contents", "MacOS") || !serverPaths(profile.appPath).includes(server.executable) || server.parentPid !== app.pid || app.parentPid === server.pid || app.pid === server.pid) throw failure("invalid_desktop_owner", "Desktop process ancestry does not match its registered bundle.");
   return { profile, app, server };
 }
 
@@ -166,7 +166,10 @@ async function bundle(appPath: string, signal?: AbortSignal): Promise<Bundle> {
   const result = { appPath: canonical, appVersion: version(info.CFBundleShortVersionString), appBuild: version(info.CFBundleVersion), executable: join(canonical, "Contents", "MacOS", info.CFBundleExecutable) };
   return result;
 }
-const serverPath = (appPath: string) => join(appPath, "Contents", "Resources", "codex");
+const serverPaths = (appPath: string) => [
+  join(appPath, "Contents", "Resources", "codex"),
+  join(appPath, "Contents", "Resources", "codex-cli", "CodexCLI.app", "Contents", "MacOS", "codex"),
+];
 async function processes(signal?: AbortSignal): Promise<DesktopProcess[]> {
   const uid = process.geteuid?.();
   if (uid === undefined) throw failure("desktop_user_unavailable", "The effective OS user could not be identified.");
@@ -179,7 +182,7 @@ function frameworkChildren(snapshot: DesktopProcess[], app: DesktopProcess, appP
   return snapshot.filter((entry) => entry.parentPid === app.pid && entry.executable.startsWith(prefix) && /^[^/]+\/Helpers\/[^/]+\.app\/Contents\/MacOS\/[^/]+$/.test(entry.executable.slice(prefix.length)));
 }
 function directServer(snapshot: DesktopProcess[], app: DesktopProcess, appPath: string): DesktopProcess | undefined {
-  const matches = snapshot.filter((entry) => entry.parentPid === app.pid && entry.executable === serverPath(appPath));
+  const matches = snapshot.filter((entry) => entry.parentPid === app.pid && serverPaths(appPath).includes(entry.executable));
   if (matches.length > 1) throw failure("desktop_owner_ambiguous", "The Desktop application has multiple native app-server owners.");
   return matches[0];
 }
@@ -231,7 +234,7 @@ export async function captureDesktopOwner(signal?: AbortSignal): Promise<Desktop
   const appPath = desktopAppFromRuntime(runtime), metadata = await bundle(appPath, signal);
   const before = await processes(signal), server = before.find((entry) => entry.pid === process.ppid);
   const app = server && before.find((entry) => entry.pid === server.parentPid);
-  if (!server || !app || server.executable !== serverPath(appPath) || app.executable !== metadata.executable || directServer(before, app, appPath)?.pid !== server.pid) throw failure("native_host_required", "The connector was not launched directly by this Desktop app-server.");
+  if (!server || !app || !serverPaths(appPath).includes(server.executable) || app.executable !== metadata.executable || directServer(before, app, appPath)?.pid !== server.pid) throw failure("native_host_required", "The connector was not launched directly by this Desktop app-server.");
   const children = frameworkChildren(before, app, appPath);
   const userDataPath = process.env.CODEX_ELECTRON_USER_DATA_PATH === undefined
     ? await userData(children, signal) : await directory(process.env.CODEX_ELECTRON_USER_DATA_PATH, signal);

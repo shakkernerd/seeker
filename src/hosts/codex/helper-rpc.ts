@@ -1,3 +1,4 @@
+import type { Socket } from "node:net";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { ConnectorError, maxWireBytes, record } from "./protocol.ts";
 
@@ -26,30 +27,38 @@ interface Pending { finish(error?: Error, value?: unknown): void }
 /** The only native server controlled here is Seeker's own stdio helper. */
 export class HelperRpc {
   readonly #pending = new Map<string, Pending>();
-  readonly #child: ChildProcessWithoutNullStreams;
+  readonly #child?: ChildProcessWithoutNullStreams;
+  readonly #socket?: Socket;
+  readonly #input: NodeJS.WritableStream;
+  readonly #output: NodeJS.ReadableStream;
   #sequence = 0;
   #buffer = "";
   #closed = false;
   #closing?: Promise<void>;
   #exit: Promise<void>;
   #settled = false;
+  #remoteSettled = false;
   events?: HelperEvents;
 
-  constructor(executable: string, args: string[], cwd: string, env: NodeJS.ProcessEnv) {
-    this.#child = spawn(executable, args, { cwd, env, stdio: ["pipe", "pipe", "pipe"], detached: true });
-    this.#child.stdout.setEncoding("utf8");
-    // Native logs can contain private data. Drain them without retaining or exposing them.
-    this.#child.stderr.resume();
-    this.#child.stdout.on("data", (chunk: string) => this.#read(chunk));
-    this.#child.stdin.on("error", () => this.#lost());
-    this.#child.stdout.on("error", () => this.#lost());
-    this.#child.stderr.on("error", () => this.#lost());
-    this.#child.once("error", () => this.#lost());
-    this.#child.once("exit", () => this.#lost());
-    this.#exit = new Promise((resolve) => this.#child.once("close", () => { this.#settled = true; this.#lost(); resolve(); }));
+  constructor(executable: string | Socket, args: string[], cwd: string, env: NodeJS.ProcessEnv) {
+    if (typeof executable === "string") {
+      const child = spawn(executable, args, { cwd, env, stdio: ["pipe", "pipe", "pipe"], detached: true });
+      this.#child = child; this.#input = child.stdin; this.#output = child.stdout;
+      child.stderr.resume();
+      child.stderr.on("error", () => this.#lost());
+      child.once("error", () => this.#lost()); child.once("exit", () => this.#lost());
+      this.#exit = new Promise((resolve) => child.once("close", () => { this.#settled = true; this.#lost(); resolve(); }));
+    } else {
+      this.#socket = executable; this.#input = executable; this.#output = executable;
+      this.#exit = new Promise((resolve) => executable.once("close", () => { this.#settled = true; this.#lost(); resolve(); }));
+    }
+    this.#output.setEncoding("utf8");
+    this.#output.on("data", (chunk: string) => this.#read(chunk));
+    this.#input.on("error", () => this.#lost());
+    this.#output.on("error", () => this.#lost());
   }
 
-  get connected(): boolean { return !this.#closed && this.#child.stdin.writable && !this.#child.stdin.destroyed; }
+  get connected(): boolean { return !this.#closed && this.#input.writable && !(this.#input as { destroyed?: boolean }).destroyed; }
 
   async request(method: string, params: unknown, signal: AbortSignal, timeoutMs = 10_000): Promise<unknown> {
     if (!this.connected || signal.aborted) throw unavailable();
@@ -84,18 +93,29 @@ export class HelperRpc {
     this.#lost();
     void (async () => {
       // EOF lets the official launcher/native server settle their own MCP children.
-      this.#child.stdin.end();
-      this.#child.kill("SIGTERM");
+      if (this.#socket) {
+        // A local socket close does not prove that the connector settled its child.
+        // Keep reading only the explicit settlement acknowledgment until its EOF.
+        if (!this.#socket.destroyed) this.#socket.write(JSON.stringify({ method: "seeker/close" }) + "\n");
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([this.#exit, new Promise<void>((resolve) => { timer = setTimeout(resolve, 7_000); })]);
+        clearTimeout(timer); this.#socket.destroy();
+        if (!this.#settled || !this.#remoteSettled) throw new ConnectorError("desktop_helper_cleanup_failed", "The Desktop connector did not confirm native child settlement.", 503);
+        return;
+      }
+      const child = this.#child!;
+      child.stdin.end();
+      child.kill("SIGTERM");
       let timer: ReturnType<typeof setTimeout> | undefined;
       await Promise.race([this.#exit, new Promise<void>((resolve) => { timer = setTimeout(resolve, 2_000); })]);
       clearTimeout(timer);
-      if (!this.#settled && this.#child.pid) {
+      if (!this.#settled && child.pid) {
         // This process group was created by this exact ChildProcess, never adopted.
-        try { process.kill(-this.#child.pid, "SIGKILL"); } catch { /* It already exited. */ }
+        try { process.kill(-child.pid, "SIGKILL"); } catch { /* It already exited. */ }
         await Promise.race([this.#exit, new Promise<void>((resolve) => { timer = setTimeout(resolve, 1_000); })]);
         clearTimeout(timer);
         if (!this.#settled) {
-          this.#child.stdout.destroy(); this.#child.stderr.destroy(); this.#child.stdin.destroy();
+          child.stdout.destroy(); child.stderr.destroy(); child.stdin.destroy();
           throw new ConnectorError("desktop_helper_cleanup_failed", "The owned helper did not settle its native pipes.", 503);
         }
       }
@@ -107,10 +127,10 @@ export class HelperRpc {
     if (!this.connected) throw unavailable();
     const line = JSON.stringify(value);
     if (Buffer.byteLength(line) > maxWireBytes) throw unavailable();
-    this.#child.stdin.write(`${line}\n`);
+    this.#input.write(`${line}\n`);
   }
   #read(chunk: string): void {
-    if (this.#closed) return;
+    if (this.#closed && !this.#socket) return;
     this.#buffer += chunk;
     for (;;) {
       const end = this.#buffer.indexOf("\n");
@@ -123,6 +143,8 @@ export class HelperRpc {
       if (!line.trim()) continue;
       try {
         const message = record(JSON.parse(line));
+        if (this.#socket && message.method === "seeker/settled") { this.#remoteSettled = message.params === true; continue; }
+        if (this.#closed) continue;
         if (typeof message.method === "string") {
           if (typeof message.id === "string" || typeof message.id === "number") {
             if (this.events) this.events.request(message.id, message.method, message.params);
@@ -137,7 +159,7 @@ export class HelperRpc {
           else if (Object.hasOwn(message, "result")) pending?.finish(undefined, message.result);
         }
       } catch { void this.close().catch(() => {}); return; }
-      if (this.#closed) return;
+      if (this.#closed && !this.#socket) return;
     }
   }
   #lost(): void {

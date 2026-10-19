@@ -1,6 +1,8 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import type { DeliveryResult, HostAdapter, HostEnvelope, ManagerBinding, ManagerOrigin, ManagerPort } from "../../contracts.ts";
 import { ConnectorError, codexRoute, connectorProtocol, identifier, maxWireBytes, onlyKeys, parseInvocation, record } from "./protocol.ts";
+import { connectHelperBridge, parseHelperEndpoint, type HelperEndpoint } from "./helper-bridge.ts";
+import type { DesktopOwner, DesktopProfile } from "./desktop-owner.ts";
 import { invokeManager } from "./tools.ts";
 
 export interface CodexManagerAccess {
@@ -19,6 +21,7 @@ interface Connection {
   poll?: (response: Response) => void;
   bindings: Map<string, string>;
   desktop?: unknown;
+  helper?: HelperEndpoint;
 }
 export interface DesktopHostInput {
   deliver(binding: ManagerBinding, envelope: HostEnvelope, signal: AbortSignal): Promise<DeliveryResult>;
@@ -49,26 +52,34 @@ export class CodexHostAdapter implements HostAdapter {
       const token = request.headers.get("authorization")?.replace(/^Bearer /, "");
       if (path === `${codexRoute}/connect`) {
         if (!sameSecret(token, this.credential)) throw new ConnectorError("unauthorized", "Native connector authentication failed.", 401);
-        const body = await bodyObject(request); onlyKeys(body, ["protocol", "instanceId", "desktop"]);
+        const body = await bodyObject(request); onlyKeys(body, ["protocol", "instanceId", "desktop", "helper"]);
         if (body.protocol !== connectorProtocol) throw new ConnectorError("protocol_mismatch", "The native connector and service versions differ.", 409);
         const instanceId = identifier(body.instanceId);
+        const helper = body.helper === undefined ? undefined : parseHelperEndpoint(body.helper);
+        if (helper && body.desktop === undefined) throw new ConnectorError("desktop_owner_required", "A helper requires its qualified Desktop owner.", 403);
         await this.lifecycle?.connected(body.desktop);
         if (this.#closed || request.signal.aborted) throw new ConnectorError("host_closed", "The native host bridge is stopping.", 503);
         this.#prune();
         // A retry of an unacknowledged connect reuses its transport identity.
         let connection = [...this.#connections.values()].find((item) => item.instanceId === instanceId);
-        if (connection && JSON.stringify(connection.desktop) !== JSON.stringify(body.desktop)) throw new ConnectorError("desktop_owner_changed", "A connector cannot replace its native owner while reconnecting.", 409);
+        if (connection && (JSON.stringify(connection.desktop) !== JSON.stringify(body.desktop) || JSON.stringify(connection.helper) !== JSON.stringify(helper))) throw new ConnectorError("desktop_owner_changed", "A connector cannot replace its native owner while reconnecting.", 409);
         if (!connection) {
           if (this.#connections.size >= 256) throw new ConnectorError("host_capacity", "Native connector capacity reached.", 503);
-          connection = { token: randomBytes(32).toString("hex"), instanceId, lastSeen: Date.now(), bindings: new Map(), desktop: body.desktop };
+          connection = { token: randomBytes(32).toString("hex"), instanceId, lastSeen: Date.now(), bindings: new Map(), desktop: body.desktop, helper };
           this.#connections.set(connection.token, connection);
         }
         connection.lastSeen = Date.now();
+        if (helper) { this.lifecycle?.ready?.(body.desktop); this.input?.restored?.(); }
         return privateJson({ protocol: connectorProtocol, hostId: this.id, session: connection.token });
       }
       const connection = token ? this.#connections.get(token) : undefined;
       if (!connection) throw new ConnectorError("unauthorized", "Native connector session expired.", 401);
       connection.lastSeen = Date.now();
+      if (path === `${codexRoute}/heartbeat`) {
+        onlyKeys(await bodyObject(request), []);
+        this.lifecycle?.ready?.(connection.desktop);
+        return privateJson({ connected: true });
+      }
       if (path === `${codexRoute}/invoke`) {
         const body = await bodyObject(request); onlyKeys(body, ["origin", "operation", "arguments"]);
         const invocation = parseInvocation(body.origin);
@@ -116,6 +127,28 @@ export class CodexHostAdapter implements HostAdapter {
       const known = error instanceof ConnectorError || (error instanceof Error && error.name === "SeekerError");
       return privateJson({ error: known ? value.code : "connector_error", message: known ? value.message : "Native connector request failed." }, { status: known && typeof value.status === "number" ? value.status : 400 });
     }
+  }
+
+  async helperConnection(profile: DesktopProfile, dataDir: string, signal: AbortSignal) {
+    this.#prune();
+    const candidates = [...this.#connections.values()].filter((connection) => {
+      if (!connection.helper || !connection.desktop) return false;
+      try {
+        this.lifecycle?.ready?.(connection.desktop);
+        const owner = connection.desktop as DesktopOwner;
+        return JSON.stringify(owner.profile) === JSON.stringify(profile);
+      } catch { return false; }
+    });
+    if (!candidates.length) throw new ConnectorError("desktop_connector_unavailable", "Restore the qualified Desktop MCP connector; saved replies remain pending.", 503);
+    // A profile can have multiple native MCP clients. Each supplies the same
+    // qualified process owner; use one without transferring manager admission.
+    candidates.sort((first, second) => second.lastSeen - first.lastSeen);
+    for (const connection of candidates) {
+      signal.throwIfAborted();
+      try { return await connectHelperBridge(connection.helper!, dataDir, signal); }
+      catch { this.#drop(connection); }
+    }
+    throw new ConnectorError("desktop_connector_unavailable", "Restore the qualified Desktop MCP connector; saved replies remain pending.", 503);
   }
 
   async deliver(binding: ManagerBinding, envelope: HostEnvelope, signal: AbortSignal): Promise<DeliveryResult> {

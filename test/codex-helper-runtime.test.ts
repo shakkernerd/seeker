@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DesktopOwner } from "../src/hosts/codex/desktop-owner.ts";
 import { HelperRpcError, type HelperConnection, type HelperEvents } from "../src/hosts/codex/helper-rpc.ts";
-import { NativeDesktopHelper } from "../src/hosts/codex/helper-runtime.ts";
+import { NativeDesktopHelper, type ConnectHelper } from "../src/hosts/codex/helper-runtime.ts";
 
 type ObjectValue = Record<string, unknown>;
 interface State { version: 1; threadId: string; turns: number }
@@ -17,6 +17,7 @@ interface NativePlan {
   inventory?: unknown;
   after?: (method: string) => void;
   close?: () => Promise<void>;
+  connect?: () => Promise<void>;
 }
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -36,7 +37,7 @@ function fixture(plans: NativePlan[] = [{}], state?: State) {
     server: { pid: 102, parentPid: 101, executable: "/Applications/Fixture.app/Contents/Resources/codex", startedAt: "Sat Sep 19 10:00:01 2026" },
   };
   const calls: Call[] = [], connections: HelperConnection[] = [], order: string[] = [], runtimes: NativeDesktopHelper[] = [];
-  const factory = (profile: DesktopOwner["profile"], pipe: string, cwd: string): HelperConnection => {
+  const factory: ConnectHelper = (profile, pipe, cwd) => {
     expect({ profile, pipe, cwd }).toEqual({ profile: owner.profile, pipe: "/private/fixture/native.sock", cwd: workspace });
     const connection = connections.length, plan = plans[connection] ?? {};
     let closed = false;
@@ -71,7 +72,7 @@ function fixture(plans: NativePlan[] = [{}], state?: State) {
       reject: () => {},
       close: async () => { if (!closed) { await plan.close?.(); closed = true; order.push(connection + ":closed"); } },
     };
-    connections.push(rpc); return rpc;
+    connections.push(rpc); return plan.connect ? plan.connect().then(() => rpc) : rpc;
   };
   const createRuntime = () => {
     const runtime = new NativeDesktopHelper({ prepare: async () => ({ owner, pipePath: "/private/fixture/native.sock" }) }, directory, factory);
@@ -135,7 +136,7 @@ test("active or unknown inherited servers, extra tools, duplicates and paginatio
   }
 });
 
-test("each preparation settles its old process and re-enumerates config before a cold resume", async () => {
+test("each preparation settles its old process and rotates a verified root before fresh startup", async () => {
   const closing = deferred(), settled = deferred();
   const f = fixture([
     { servers: { previous: { command: "/fixture/previous-server" } }, close: async () => { closing.resolve(); await settled.promise; } },
@@ -146,12 +147,14 @@ test("each preparation settles its old process and re-enumerates config before a
   const next = f.prepare(); await closing.promise;
   try { expect(f.connections).toHaveLength(1); } finally { settled.resolve(); }
   const second = await next;
-  expect(f.connections[0]!.connected).toBe(false); expect(second.threadId).toBe(first.threadId);
+  expect(f.connections[0]!.connected).toBe(false); expect(second.threadId).not.toBe(first.threadId);
   expect(f.order.indexOf("0:closed")).toBeLessThan(f.order.indexOf("1:config/read"));
   expect(requests(f.calls, "config/read")).toHaveLength(2);
-  const resume = requests(f.calls, "thread/resume")[0]!;
-  expect(resume.params).toMatchObject({ threadId: first.threadId, excludeTurns: true, config: { mcp_servers: { "new.server": { enabled: false } } } });
-  expect(Object.keys((resume.params.config as ObjectValue).mcp_servers as ObjectValue).sort()).toEqual(["codex_app", "new.server"]);
+  expect(requests(f.calls, "thread/resume")).toHaveLength(0);
+  expect(requests(f.calls, "thread/delete")[0]!.params).toEqual({ threadId: first.threadId });
+  const started = requests(f.calls, "thread/start")[1]!;
+  expect(started.params).toMatchObject({ config: { mcp_servers: { "new.server": { enabled: false } } } });
+  expect(Object.keys((started.params.config as ObjectValue).mcp_servers as ObjectValue).sort()).toEqual(["codex_app", "new.server"]);
   await expect(first.start("Stale preparation", signal())).rejects.toThrow("no longer current");
   expect(requests(f.calls, "turn/start")).toHaveLength(0);
 });
@@ -231,4 +234,18 @@ test("an externally replaced lifecycle file is preserved before starting a model
   await expect(ready.start("Must not replace another owner's state", signal())).rejects.toThrow("changed outside this service");
   expect(readFileSync(f.statePath, "utf8")).toBe("externally replaced private lifecycle\n");
   expect(requests(f.calls, "turn/start")).toHaveLength(0);
+});
+
+
+test("reset owns a connecting helper and closes a connection returned after cancellation", async () => {
+  const connecting = deferred(), release = deferred(), f = fixture([{ connect: async () => { connecting.resolve(); await release.promise; } }]);
+  const abort = new AbortController();
+  const preparing = f.prepare(abort.signal).then(() => { throw new Error("cancelled helper was adopted"); }, () => {});
+  await connecting.promise;
+  abort.abort(); let settled = false;
+  const resetting = f.runtime.reset().then(() => { settled = true; });
+  await Bun.sleep(10); expect(settled).toBe(false);
+  release.resolve(); await Promise.all([preparing, resetting]);
+  expect(f.connections[0]!.connected).toBe(false);
+  expect(requests(f.calls, "initialize")).toHaveLength(0);
 });
