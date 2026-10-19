@@ -1,4 +1,5 @@
 import { parseNativeEventState, type NativeEventState } from "./event-state.ts";
+import { randomUUID } from "node:crypto";
 import { createConnection } from "node:net";
 import { identifier, maxWireBytes, record, type NativeInvocation } from "./protocol.ts";
 
@@ -33,7 +34,8 @@ export class CodexNativeClient {
     const result = await this.#request(signal, "tools/call", {
       arguments: { threadId: origin.threadId, turnLimit: 1, includeOutputs: false, maxOutputCharsPerItem: 50 },
       callerSource: "codex", namespace: this.#eventNamespace, tool: "read_thread",
-      threadId: origin.threadId, turnId: origin.turnId, callId: origin.callId,
+      // Each read is a new native invocation; the saved arm call remains provenance.
+      threadId: origin.threadId, turnId: origin.turnId, callId: randomUUID(),
     });
     return parseNativeEventState(result, origin.threadId);
   }

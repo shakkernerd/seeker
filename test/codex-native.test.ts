@@ -9,9 +9,9 @@ import { installSection } from "../src/hosts/codex/setup.ts";
 const cleanup: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
 
-async function nativeFixture(mode: "compatible" | "drop" | "bad-frame" | "extra-required" | "wrong-input-type" = "compatible") {
+async function nativeFixture(mode: "compatible" | "drop" | "bad-frame" | "extra-required" | "wrong-input-type" | "events" = "compatible") {
   const path = join(tmpdir(), `sk-${randomUUID().slice(0, 8)}.sock`);
-  const requests: Record<string, any>[] = [], sockets = new Set<Socket>();
+  const requests: Record<string, any>[] = [], sockets = new Set<Socket>(), calls = new Set(["arm-call"]);
   const server = createServer((socket) => {
     sockets.add(socket); socket.on("close", () => sockets.delete(socket));
     let pending = Buffer.alloc(0);
@@ -22,8 +22,16 @@ async function nativeFixture(mode: "compatible" | "drop" | "bad-frame" | "extra-
       requests.push(request);
       if (mode === "drop") { socket.destroy(); return; }
       if (mode === "bad-frame") { const header = Buffer.alloc(4); header.writeUInt32LE(0xffffffff); socket.end(header); return; }
-      const result = { tools: [{ name: "send_message_to_thread", namespace: "codex_app", inputSchema: { type: "object", properties: { threadId: { type: mode === "wrong-input-type" ? "number" : "string" }, prompt: { type: "string" } }, ...(mode === "extra-required" ? { required: ["threadId", "prompt", "newRequiredField"] } : {}) } }] };
-      const body = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }));
+      let result: unknown = { tools: [{ name: mode === "events" ? "read_thread" : "send_message_to_thread", namespace: "codex_app", inputSchema: { type: "object", properties: { threadId: { type: mode === "wrong-input-type" ? "number" : "string" }, prompt: { type: "string" } }, ...(mode === "extra-required" ? { required: ["threadId", "prompt", "newRequiredField"] } : {}) } }] };
+      let error: unknown;
+      if (mode === "events" && request.method === "tools/call") {
+        if (calls.has(request.params.callId)) error = { code: -32603, message: "Native call identity was already used." };
+        else {
+          calls.add(request.params.callId);
+          result = { success: true, contentItems: [{ type: "inputText", text: JSON.stringify({ schemaVersion: 1, thread: { id: "owner", kind: "codex" }, page: { order: "newest_first" }, turns: [{ id: "armed-turn", status: calls.size === 2 ? "completed" : "interrupted" }] }) }] };
+        }
+      }
+      const body = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: request.id, ...(error ? { error } : { result }) }));
       const frame = Buffer.alloc(4 + body.length); frame.writeUInt32LE(body.length); body.copy(frame, 4);
       socket.write(frame.subarray(0, 2)); socket.write(frame.subarray(2, 9)); socket.end(frame.subarray(9));
     });
@@ -34,6 +42,16 @@ async function nativeFixture(mode: "compatible" | "drop" | "bad-frame" | "extra-
 }
 
 describe("native catalogue qualification", () => {
+  test("successive event reads use distinct native calls while preserving the armed owner", async () => {
+    const fixture = await nativeFixture("events"), client = new CodexNativeClient(fixture.path);
+    const origin = { threadId: "owner", turnId: "armed-turn", callId: "arm-call" };
+    expect(await client.eventState(origin)).toEqual({ taskId: "owner", turnId: "armed-turn", status: "completed" });
+    expect(await client.eventState(origin)).toEqual({ taskId: "owner", turnId: "armed-turn", status: "interrupted" });
+    const reads = fixture.requests.filter((request) => request.method === "tools/call");
+    expect(reads.map((request) => ({ ...request.params, callId: "fresh" }))).toEqual(Array(2).fill({ arguments: { threadId: "owner", turnLimit: 1, includeOutputs: false, maxOutputCharsPerItem: 50 }, callerSource: "codex", namespace: "codex_app", tool: "read_thread", threadId: "owner", turnId: "armed-turn", callId: "fresh" }));
+    expect(origin).toEqual({ threadId: "owner", turnId: "armed-turn", callId: "arm-call" });
+  });
+
   test("rejects an incompatible refreshed input capability", async () => {
     for (const mode of ["extra-required", "wrong-input-type"] as const) {
       const fixture = await nativeFixture(mode);
