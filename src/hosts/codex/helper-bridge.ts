@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { chmodSync, lstatSync, mkdirSync, unlinkSync } from "node:fs";
+import { chmodSync, linkSync, lstatSync, mkdirSync, unlinkSync } from "node:fs";
 import { createConnection, createServer, type Socket } from "node:net";
 import { dirname, join } from "node:path";
 import { privateDirectory } from "./config.ts";
@@ -18,7 +18,7 @@ export function parseHelperEndpoint(value: unknown): HelperEndpoint {
 }
 
 /** Only the already qualified Desktop child creates native helper processes. */
-export async function listenHelperBridge(dataDir: string, owner: DesktopOwner, pipePath: string, connect = connectDesktopHelper) {
+export async function listenHelperBridge(dataDir: string, owner: DesktopOwner, pipePath: string, connect = connectDesktopHelper, retire = async (rpc: HelperConnection, threadId: string, _turnId: string) => { await rpc.request("thread/archive", { threadId }, AbortSignal.timeout(3_000)); }) {
   const directory = privateDirectory(dataDir), workspace = join(directory, "codex-helper");
   mkdirSync(workspace, { recursive: true, mode: 0o700 }); privateDirectory(workspace);
   const endpoint = { socketPath: join(directory, `.h${randomBytes(4).toString("hex")}`), credential: randomBytes(32).toString("hex") };
@@ -29,6 +29,7 @@ export async function listenHelperBridge(dataDir: string, owner: DesktopOwner, p
   const server = createServer((socket) => {
     sockets.add(socket);
     let rpc: HelperConnection | undefined, buffer = "", authenticated = false, stopping = false;
+    let helperId: string | undefined, helperTurn: string | undefined;
     let closing: Promise<void> | undefined;
     const timer = setTimeout(() => socket.destroy(), 2_000); timer.unref();
     const write = (value: unknown) => {
@@ -41,7 +42,15 @@ export async function listenHelperBridge(dataDir: string, owner: DesktopOwner, p
       stopping = true; clearTimeout(timer);
       const owned = rpc; rpc = undefined;
       const pending = (async () => {
+        let retirementError: unknown;
+        try {
+          if (owned && helperId && helperTurn) {
+            if (!owned.connected) throw unavailable();
+            await retire(owned, helperId, helperTurn);
+          }
+        } catch (error) { retirementError = error; }
         await owned?.close();
+        if (retirementError) throw retirementError;
         if (owned) active = false;
         if (!socket.destroyed) { write({ method: "seeker/settled", params: true }); socket.end(); }
       })();
@@ -67,7 +76,12 @@ export async function listenHelperBridge(dataDir: string, owner: DesktopOwner, p
             authenticated = true; clearTimeout(timer);
             rpc = connect(owner.profile, pipePath, workspace); active = true;
             rpc.events = {
-              notice: (method, params) => write({ method, params }),
+              notice: (method, params) => {
+                if (method === "turn/started") {
+                  try { const notice = record(params); if (notice.threadId === helperId) helperTurn = String(record(notice.turn).id); } catch { socket.destroy(); return; }
+                }
+                write({ method, params });
+              },
               request: (id, method, params) => write({ id, method, params }),
               lost: () => { if (!stopping) void settle().catch(() => {}); },
             };
@@ -79,7 +93,23 @@ export async function listenHelperBridge(dataDir: string, owner: DesktopOwner, p
           if (typeof message.method === "string") {
             if (typeof message.id === "string") {
               const id = message.id;
-              void rpc.request(message.method, message.params, AbortSignal.timeout(15_000)).then(
+              const connection = rpc, method = message.method;
+              void (async () => {
+                if (method === "thread/delete") {
+                  const target = record(message.params).threadId;
+                  if (!helperId || target !== helperId) throw unavailable();
+                }
+                if (method === "turn/start" && record(message.params).threadId !== helperId) throw unavailable();
+                const result = await connection.request(method, message.params, AbortSignal.timeout(15_000));
+                if (method === "thread/read" || method === "thread/start") {
+                  const thread = record(record(result).thread);
+                  if (thread.cwd !== workspace || thread.forkedFromId != null || typeof thread.id !== "string") throw unavailable();
+                  helperId = thread.id;
+                  if (method === "thread/start") helperTurn = undefined;
+                } else if (method === "turn/start") helperTurn = String(record(record(result).turn).id);
+                else if (method === "thread/delete") { helperId = undefined; helperTurn = undefined; }
+                return result;
+              })().then(
                 (result) => write({ id, result }),
                 (error) => write({ id, error: { code: error?.nativeCode ?? -32603, message: error?.nativeMessage ?? "Native helper request failed." } }),
               );
@@ -94,15 +124,25 @@ export async function listenHelperBridge(dataDir: string, owner: DesktopOwner, p
       }
     });
   });
-  await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(endpoint.socketPath, resolve); });
-  chmodSync(endpoint.socketPath, 0o600);
-  const inode = lstatSync(endpoint.socketPath);
+  // Node removes its bound pathname automatically on close. Bind a private
+  // staging address and expose a separate hard link, as the service listener does.
+  const staging = join(directory, `.b${randomBytes(4).toString("hex")}`);
+  await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(staging, resolve); });
+  let inode: ReturnType<typeof lstatSync>;
+  try { chmodSync(staging, 0o600); inode = lstatSync(staging); linkSync(staging, endpoint.socketPath); }
+  catch (error) { await new Promise<void>((resolve) => server.close(() => resolve())); throw error; }
   let closing: Promise<void> | undefined;
   return { endpoint, close: () => closing ??= (async () => {
     closed = true;
     // End each authenticated connection through its settlement path, not a raw
     // socket destroy that could let the service reuse a still-running helper.
     const results = await Promise.allSettled([...sessions.values()].map((settle) => settle()));
+    let bound: ReturnType<typeof lstatSync> | undefined;
+    try { bound = lstatSync(staging); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    if (!bound || bound.dev !== inode.dev || bound.ino !== inode.ino) {
+      server.unref();
+      throw new ConnectorError("desktop_helper_cleanup_failed", "The helper's bound socket address changed; preserve its replacement.", 503);
+    }
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await Promise.allSettled([...settling]);
     for (const result of results) if (result.status === "rejected") cleanupError ??= result.reason;

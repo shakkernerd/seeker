@@ -104,8 +104,9 @@ export class NativeDesktopHelper implements DesktopHelperRuntime {
   }
 
   async prepare(events: HelperEvents, signal: AbortSignal, current: () => boolean): Promise<PreparedHelper> {
-    // Resume overrides can be ignored by an already loaded native task. Always
-    // settle the owned process, then apply fresh config during a cold resume.
+    // Settle the previous owned process before creating a fresh bounded helper.
+    // The Desktop may adopt its source thread when a native tool is called; a
+    // new CLI must not resume a root whose writer now belongs to that Desktop.
     await this.reset();
     const generation = ++this.#generation;
     const check = () => {
@@ -139,12 +140,12 @@ export class NativeDesktopHelper implements DesktopHelperRuntime {
       }
       check();
       if (saved && (saved.id !== this.#state?.threadId || saved.cwd !== this.#workspace || saved.forkedFromId != null)) throw unavailable("The saved root is not this service's owned helper.");
-      if (this.#state?.turns === 16) {
+      if (this.#state && saved) {
         await rpc.request("thread/delete", { threadId: this.#state.threadId }, signal);
         check(); this.#save(undefined);
       }
     }
-    const response = record(await rpc.request(this.#state ? "thread/resume" : "thread/start", this.#state ? { ...options, threadId: this.#state.threadId, excludeTurns: true } : { ...options, ephemeral: false, environments: [] }, signal));
+    const response = record(await rpc.request("thread/start", { ...options, ephemeral: false, environments: [] }, signal));
     check();
     const thread = record(response.thread), threadId = identifier(thread.id);
     if (thread.cwd !== this.#workspace || (this.#state && threadId !== this.#state.threadId)) throw unavailable("The native helper has a different identity or workspace.");
@@ -170,7 +171,7 @@ export class NativeDesktopHelper implements DesktopHelperRuntime {
       start: async (prompt, turnSignal) => {
         check();
         this.#save({ ...this.#state!, turns: this.#state!.turns + 1 });
-        // An explicit empty environment list also applies after a cold resume:
+        // An explicit empty environment list applies to every fresh helper turn:
         // this model turn has no shell, patch, or local-image environment.
         const result = record(await rpc.request("turn/start", { threadId, input: [{ type: "text", text: prompt }], effort: "low", environments: [] }, turnSignal));
         return identifier(record(result.turn).id);

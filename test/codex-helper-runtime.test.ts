@@ -136,7 +136,7 @@ test("active or unknown inherited servers, extra tools, duplicates and paginatio
   }
 });
 
-test("each preparation settles its old process and re-enumerates config before a cold resume", async () => {
+test("each preparation settles its old process and rotates a verified root before fresh startup", async () => {
   const closing = deferred(), settled = deferred();
   const f = fixture([
     { servers: { previous: { command: "/fixture/previous-server" } }, close: async () => { closing.resolve(); await settled.promise; } },
@@ -147,12 +147,14 @@ test("each preparation settles its old process and re-enumerates config before a
   const next = f.prepare(); await closing.promise;
   try { expect(f.connections).toHaveLength(1); } finally { settled.resolve(); }
   const second = await next;
-  expect(f.connections[0]!.connected).toBe(false); expect(second.threadId).toBe(first.threadId);
+  expect(f.connections[0]!.connected).toBe(false); expect(second.threadId).not.toBe(first.threadId);
   expect(f.order.indexOf("0:closed")).toBeLessThan(f.order.indexOf("1:config/read"));
   expect(requests(f.calls, "config/read")).toHaveLength(2);
-  const resume = requests(f.calls, "thread/resume")[0]!;
-  expect(resume.params).toMatchObject({ threadId: first.threadId, excludeTurns: true, config: { mcp_servers: { "new.server": { enabled: false } } } });
-  expect(Object.keys((resume.params.config as ObjectValue).mcp_servers as ObjectValue).sort()).toEqual(["codex_app", "new.server"]);
+  expect(requests(f.calls, "thread/resume")).toHaveLength(0);
+  expect(requests(f.calls, "thread/delete")[0]!.params).toEqual({ threadId: first.threadId });
+  const started = requests(f.calls, "thread/start")[1]!;
+  expect(started.params).toMatchObject({ config: { mcp_servers: { "new.server": { enabled: false } } } });
+  expect(Object.keys((started.params.config as ObjectValue).mcp_servers as ObjectValue).sort()).toEqual(["codex_app", "new.server"]);
   await expect(first.start("Stale preparation", signal())).rejects.toThrow("no longer current");
   expect(requests(f.calls, "turn/start")).toHaveLength(0);
 });

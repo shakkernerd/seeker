@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, realpathSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { join } from "node:path";
 import type { DesktopOwner } from "../src/hosts/codex/desktop-owner.ts";
@@ -107,4 +107,32 @@ test("an unconfirmed child cleanup fails the remote close and quarantines the br
   await expect(remote.close()).rejects.toMatchObject({ code: "desktop_helper_cleanup_failed" });
   await expect(connectHelperBridge(bridge.endpoint, directory)).rejects.toThrow();
   await expect(bridge.close()).rejects.toThrow("fixture settlement failed");
+});
+
+
+test("closing the connector preserves an unrelated replacement at its exposed socket path", async () => {
+  const f = await fixture(), path = f.bridge.endpoint.socketPath;
+  unlinkSync(path); writeFileSync(path, "unrelated fixture replacement", { mode: 0o600 });
+  await f.bridge.close();
+  expect(readFileSync(path, "utf8")).toBe("unrelated fixture replacement");
+});
+
+
+test("only a verified helper root is archived by its own server before child settlement", async () => {
+  const directory = realpathSync(mkdtempSync("/tmp/seeker-retire-")), order: string[] = [];
+  const bridge = await listenHelperBridge(directory, owner, "/private/native.sock", () => ({
+    connected: true, async request(method, params) {
+      if (method === "thread/start") return { thread: { id: "owned-helper", cwd: join(directory, "codex-helper"), forkedFromId: null } };
+      if (method === "thread/read") return { thread: { id: "foreign-helper", cwd: "/private/another-workspace", forkedFromId: null } };
+      if (method === "turn/start") return { turn: { id: "owned-turn" } };
+      throw new Error("unexpected native method");
+    }, notify() {}, respond() {}, reject() {}, async close() { order.push("child-settled"); },
+  }), async (_rpc, threadId, turnId) => { order.push("retired:" + threadId + ":" + turnId); });
+  const remote = await connectHelperBridge(bridge.endpoint, directory);
+  cleanup.push(async () => { await remote.close(); await bridge.close(); rmSync(directory, { recursive: true, force: true }); });
+  await expect(remote.request("thread/read", { threadId: "foreign-helper" }, AbortSignal.timeout(1_000))).rejects.toThrow();
+  expect(order).toEqual([]);
+  await remote.request("thread/start", {}, AbortSignal.timeout(1_000));
+  await remote.request("turn/start", { threadId: "owned-helper" }, AbortSignal.timeout(1_000));
+  await remote.close(); expect(order).toEqual(["retired:owned-helper:owned-turn", "child-settled"]);
 });

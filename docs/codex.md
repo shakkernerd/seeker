@@ -109,7 +109,12 @@ confirm the original target; the helper's final answer is never delivery evidenc
 
 The helper uses the registered profile's existing native authentication and
 storage. Its workspace and lifecycle record live in the private
-`<data-dir>/codex-helper` directory, and its separate native history is bounded.
+`<data-dir>/codex-helper` directory. Each notification uses a fresh helper root.
+The connector verifies that root's exact workspace and identity, archives a used
+root through its owning helper server before settling the child, and deletes the
+verified previous root before the next preparation. This bounds helper history without resuming a
+thread whose writer Desktop has adopted. Retirement cannot select the manager's
+root or another workspace.
 The qualified Desktop MCP connector launches and supervises its native process.
 The service controls it through a private, authenticated local socket and retains
 the exact approval and receipt checks. This preserves the Desktop ancestry and

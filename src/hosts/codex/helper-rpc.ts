@@ -98,7 +98,7 @@ export class HelperRpc {
         // Keep reading only the explicit settlement acknowledgment until its EOF.
         if (!this.#socket.destroyed) this.#socket.write(JSON.stringify({ method: "seeker/close" }) + "\n");
         let timer: ReturnType<typeof setTimeout> | undefined;
-        await Promise.race([this.#exit, new Promise<void>((resolve) => { timer = setTimeout(resolve, 5_000); })]);
+        await Promise.race([this.#exit, new Promise<void>((resolve) => { timer = setTimeout(resolve, 7_000); })]);
         clearTimeout(timer); this.#socket.destroy();
         if (!this.#settled || !this.#remoteSettled) throw new ConnectorError("desktop_helper_cleanup_failed", "The Desktop connector did not confirm native child settlement.", 503);
         return;
