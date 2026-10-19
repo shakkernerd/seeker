@@ -16,7 +16,7 @@ own the conversation and work.
 
 Install the built Seeker package and the qualified Bun version described in the
 [local setup guide](local.md). Background return requires the official
-`@openai/codex` npm CLI, available as `codex` on the Seeker service's `PATH`.
+`@openai/codex` npm CLI, available as `codex` on the Desktop connector's `PATH`.
 Seeker runs its unmodified launcher with the Node runtime supplied by the
 registered Desktop application. Keep both installations available and compatible.
 
@@ -110,13 +110,21 @@ confirm the original target; the helper's final answer is never delivery evidenc
 The helper uses the registered profile's existing native authentication and
 storage. Its workspace and lifecycle record live in the private
 `<data-dir>/codex-helper` directory, and its separate native history is bounded.
-Seeker supervises its process lifetime and can resume it after service restart.
+The qualified Desktop MCP connector launches and supervises its native process.
+The service controls it through a private, authenticated local socket and retains
+the exact approval and receipt checks. This preserves the Desktop ancestry and
+signed runtime chain required by the native tool socket. A service outside that
+ancestry cannot launch a usable native helper directly. The connector stays
+connected through ordinary background I/O while the manager is idle and
+reconnects after a service restart, without model polling.
 It does not copy credentials or the manager's conversation into the helper.
 Preparation failures have bounded retries; an unavailable native interface does
 not start an unlimited sequence of model turns.
 
-Background input works without an existing Seeker receiver in the target task.
-If the registered application is absent, Seeker can open it in the background
+Background input requires a qualified Seeker MCP connector in the registered
+Desktop application; it need not be receiving tools in the target task. The
+connector must remain loaded during the wait. If the registered application is
+absent, Seeker can open it in the background
 with its registered profile and native storage locations. It never restarts a
 running Desktop app. Recovery uses no task URI or navigation operation. The
 original manager's connector qualifies again when its Seeker tools reconnect.
@@ -159,7 +167,11 @@ capabilities at startup. The helper's genuine CLI invokes the registered Desktop
 host's native tool; the target remains the Desktop task. A saved task record in a
 different daemon or an ACP adapter that starts another server does not establish
 that return path. Requalify native behavior after host updates; the host
-integration interfaces are version-sensitive.
+integration interfaces are version-sensitive. The qualified layouts include the
+legacy bundled `Contents/Resources/codex` and the current nested
+`codex-cli/CodexCLI.app/Contents/MacOS/codex`. Both require the actual server to be
+a direct child of the registered app; arbitrary executables and indirect owners
+are rejected.
 
 [CLI managers](codex-cli.md) use their own explicitly registered native Unix
 app-server. Both hosts share the same project MCP entry and tool definitions;
@@ -188,7 +200,7 @@ service on loopback and keep connector credentials out of prompts and logs.
 | The task is denied | Verify the exact registered task ID. A lead should report to its manager. |
 | Native runtime is unavailable | Launch the connector through Desktop; do not replace its runtime with a PATH CLI or change host authentication. |
 | Replies are waiting | Start Seeker with the registered data directory and restore the native connector. |
-| Automatic Desktop recovery is unavailable | Check that the official `@openai/codex` npm CLI is available as `codex` on Seeker's service `PATH`. After an upgrade, repeat setup, reload the connector and use `pending` from the original manager once. Keep the registered application and profile available. |
+| Automatic Desktop recovery is unavailable | Check that the official `@openai/codex` npm CLI is available as `codex` on the Desktop connector's `PATH`. After an upgrade, repeat setup, reload the connector and use `pending` from the original manager once. Keep the registered application and profile available. |
 | A different Desktop profile or incompatible interface is running | Restore the registered profile and a compatible native connector; saved replies remain available. |
 | Delivery is unknown | Read the retained exchange and native receipt before attempting another delivery. |
 | Setup reports conflicting settings | Preserve the existing configuration and reconcile the specifically named Seeker section. |

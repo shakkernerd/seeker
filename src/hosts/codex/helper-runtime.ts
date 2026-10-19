@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, linkSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { accessSync, constants, existsSync, linkSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { privateDirectory, readPrivateFile } from "./config.ts";
-import { CodexDesktopLifecycle } from "./desktop.ts";
+import type { CodexDesktopLifecycle } from "./desktop.ts";
 import type { DesktopProfile } from "./desktop-owner.ts";
 import { HelperRpc, HelperRpcError, type HelperConnection, type HelperEvents } from "./helper-rpc.ts";
 import { ConnectorError, identifier, onlyKeys, record } from "./protocol.ts";
@@ -18,11 +18,13 @@ export interface DesktopHelperRuntime {
   close(): Promise<void>;
 }
 interface HelperState { version: 1; threadId: string; turns: number }
-type ConnectHelper = (profile: DesktopProfile, pipePath: string, workspace: string) => HelperConnection;
+export type ConnectHelper = (profile: DesktopProfile, pipePath: string, workspace: string, signal: AbortSignal) => HelperConnection | Promise<HelperConnection>;
 
 /** The installed CLI entrypoint keeps its real binary resolution and signal forwarding role. */
 export function codexLauncher(): string {
-  const selected = Bun.which("codex");
+  const selected = (process.env.PATH ?? "").split(":").filter((entry) => entry.startsWith("/")).map((entry) => join(entry, "codex")).find((entry) => {
+    try { accessSync(entry, constants.X_OK); return true; } catch { return false; }
+  });
   if (!selected) throw unavailable("Install the official Codex npm CLI and make codex available on Seeker's PATH.");
   const path = realpathSync(selected), root = dirname(dirname(path));
   const pkg = record(JSON.parse(readFileSync(join(root, "package.json"), "utf8")));
@@ -31,7 +33,7 @@ export function codexLauncher(): string {
   return path;
 }
 
-function connectHelper(profile: DesktopProfile, pipePath: string, workspace: string): HelperConnection {
+export function connectDesktopHelper(profile: DesktopProfile, pipePath: string, workspace: string): HelperConnection {
   const node = join(profile.appPath, "Contents/Resources/cua_node/bin/node");
   const settings = [
     'features.plugins=false', 'features.apps=false',
@@ -88,7 +90,7 @@ export class NativeDesktopHelper implements DesktopHelperRuntime {
   #generation = 0;
   #resetting?: Promise<void>;
 
-  constructor(private readonly lifecycle: Pick<CodexDesktopLifecycle, "prepare">, dataDir: string, private readonly connect: ConnectHelper = connectHelper) {
+  constructor(private readonly lifecycle: Pick<CodexDesktopLifecycle, "prepare">, dataDir: string, private readonly connect: ConnectHelper) {
     mkdirSync(join(privateDirectory(dataDir), "codex-helper"), { mode: 0o700, recursive: true });
     this.#workspace = privateDirectory(join(dataDir, "codex-helper"));
     this.#statePath = join(this.#workspace, "session.json");
@@ -112,7 +114,8 @@ export class NativeDesktopHelper implements DesktopHelperRuntime {
     check();
     const { owner, pipePath } = await this.lifecycle.prepare(signal, current);
     check();
-    const rpc = this.connect(owner.profile, pipePath, this.#workspace);
+    const rpc = await this.connect(owner.profile, pipePath, this.#workspace, signal);
+    check();
     this.#rpc = rpc; rpc.events = events;
     await rpc.request("initialize", { clientInfo: { name: "seeker_desktop_helper", version: "0.1.0" }, capabilities: { experimentalApi: true } }, signal);
     check(); rpc.notify("initialized", {});

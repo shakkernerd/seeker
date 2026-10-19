@@ -70,6 +70,16 @@ describe("Desktop process ownership", () => {
     const parsed = parseDesktopOwner(value); parsed.app.pid = 999;
     expect(value.app.pid).toBe(100);
   });
+
+  test("accepts the current nested CLI bundle only under its exact direct Desktop owner", () => {
+    const value = owner();
+    value.server.executable = `${bundle}/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex`;
+    expect(parseDesktopOwner(value)).toEqual(value);
+    for (const executable of [value.server.executable.replace("CodexCLI.app", "Other.app"), `${bundle}/Contents/Resources/codex-cli/codex`, `${bundle}/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/../MacOS/codex`]) {
+      expect(() => parseDesktopOwner({ ...value, server: { ...value.server, executable } })).toThrow();
+    }
+    expect(() => parseDesktopOwner({ ...value, server: { ...value.server, parentPid: 999 } })).toThrow();
+  });
 });
 
 describe("narrow Desktop profile metadata", () => {
