@@ -35,6 +35,8 @@ export class HelperRpc {
   #buffer = "";
   #closed = false;
   #closing?: Promise<void>;
+  #closeFailed = false;
+  #closeNotice?: () => void;
   #exit: Promise<void>;
   #settled = false;
   #remoteSettled = false;
@@ -87,7 +89,14 @@ export class HelperRpc {
   }
 
   close(): Promise<void> {
-    if (this.#closing) return this.#closing;
+    // A deadline is not evidence against a later close event. For a bridge,
+    // only its affirmative acknowledgment plus EOF confirms native settlement.
+    if (this.#settled && (!this.#socket || this.#remoteSettled)) {
+      if (!this.#closing || this.#closeFailed) { this.#closing = Promise.resolve(); this.#closeFailed = false; }
+      return this.#closing;
+    }
+    if (this.#closing && (!this.#closeFailed || !this.#socket || this.#socket.destroyed)) return this.#closing;
+    this.#closeFailed = false;
     let resolveClose!: () => void, rejectClose!: (reason: unknown) => void;
     this.#closing = new Promise<void>((resolve, reject) => { resolveClose = resolve; rejectClose = reject; });
     this.#lost();
@@ -96,11 +105,17 @@ export class HelperRpc {
       if (this.#socket) {
         // A local socket close does not prove that the connector settled its child.
         // Keep reading only the explicit settlement acknowledgment until its EOF.
+        const notice = new Promise<void>((resolve) => { this.#closeNotice = resolve; });
         if (!this.#socket.destroyed) this.#socket.write(JSON.stringify({ method: "seeker/close" }) + "\n");
         let timer: ReturnType<typeof setTimeout> | undefined;
-        await Promise.race([this.#exit, new Promise<void>((resolve) => { timer = setTimeout(resolve, 7_000); })]);
-        clearTimeout(timer); this.#socket.destroy();
-        if (!this.#settled || !this.#remoteSettled) throw new ConnectorError("desktop_helper_cleanup_failed", "The Desktop connector did not confirm native child settlement.", 503);
+        await Promise.race([this.#exit, notice, new Promise<void>((resolve) => { timer = setTimeout(resolve, 7_000); })]);
+        clearTimeout(timer); this.#closeNotice = undefined;
+        if (!this.#settled || !this.#remoteSettled) {
+          // Preserve the sole channel for late settlement, with no ordinary RPC
+          // traffic and no process-lifetime hold. Re-admission may recheck it.
+          this.#socket.unref();
+          throw new ConnectorError("desktop_helper_cleanup_failed", "The Desktop connector did not confirm native child settlement.", 503);
+        }
         return;
       }
       const child = this.#child!;
@@ -119,7 +134,7 @@ export class HelperRpc {
           throw new ConnectorError("desktop_helper_cleanup_failed", "The owned helper did not settle its native pipes.", 503);
         }
       }
-    })().then(resolveClose, rejectClose);
+    })().then(resolveClose, (error) => { this.#closeFailed = true; rejectClose(error); });
     return this.#closing;
   }
 
@@ -135,15 +150,19 @@ export class HelperRpc {
     for (;;) {
       const end = this.#buffer.indexOf("\n");
       if (end < 0) {
-        if (Buffer.byteLength(this.#buffer) > maxWireBytes) void this.close().catch(() => {});
+        if (Buffer.byteLength(this.#buffer) > maxWireBytes) this.#invalid();
         return;
       }
       const line = this.#buffer.slice(0, end); this.#buffer = this.#buffer.slice(end + 1);
-      if (Buffer.byteLength(line) > maxWireBytes) { void this.close().catch(() => {}); return; }
+      if (Buffer.byteLength(line) > maxWireBytes) { this.#invalid(); return; }
       if (!line.trim()) continue;
       try {
         const message = record(JSON.parse(line));
-        if (this.#socket && message.method === "seeker/settled") { this.#remoteSettled = message.params === true; continue; }
+        if (this.#socket && message.method === "seeker/settled") {
+          this.#remoteSettled = message.params === true;
+          if (!this.#remoteSettled) this.#closeNotice?.();
+          continue;
+        }
         if (this.#closed) continue;
         if (typeof message.method === "string") {
           if (typeof message.id === "string" || typeof message.id === "number") {
@@ -158,9 +177,14 @@ export class HelperRpc {
           }
           else if (Object.hasOwn(message, "result")) pending?.finish(undefined, message.result);
         }
-      } catch { void this.close().catch(() => {}); return; }
+      } catch { this.#invalid(); return; }
       if (this.#closed && !this.#socket) return;
     }
+  }
+  #invalid(): void {
+    // A quarantined socket must not retain unbounded or malformed input.
+    if (this.#socket) { this.#remoteSettled = false; this.#socket.destroy(); }
+    void this.close().catch(() => {});
   }
   #lost(): void {
     if (this.#closed) return;

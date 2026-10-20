@@ -150,3 +150,70 @@ test("existing connector bridge returns only event metadata without starting or 
   await expect(readEventStateBridge({ ...bridge.endpoint, credential: "f".repeat(64) }, directory, { threadId: "native-task", turnId: "armed-turn", callId: "armed-call" }, AbortSignal.timeout(1000))).rejects.toThrow();
   expect(reads).toBe(1);
 });
+
+
+test("a late settlement acknowledgment survives the close deadline without another child", async () => {
+  const directory = realpathSync(mkdtempSync("/tmp/seeker-late-settle-")), release = deferred<void>();
+  let creations = 0, settled = false;
+  const bridge = await listenHelperBridge(directory, owner, "/private/native.sock", () => {
+    creations++;
+    return { connected: true, request: async () => ({}), notify() {}, respond() { throw new Error("No send permitted"); }, reject() {},
+      async close() { await release.promise; settled = true; } };
+  });
+  const remote = await connectHelperBridge(bridge.endpoint, directory);
+  cleanup.push(async () => { release.resolve(); await bridge.close(); rmSync(directory, { recursive: true, force: true }); });
+  await expect(remote.close()).rejects.toMatchObject({ code: "desktop_helper_cleanup_failed" });
+  expect(settled).toBe(false); expect(creations).toBe(1); expect(remote.connected).toBe(false);
+  await expect(connectHelperBridge(bridge.endpoint, directory)).rejects.toThrow();
+  release.resolve();
+  await remote.close();
+  expect(settled).toBe(true); expect(creations).toBe(1);
+}, 10_000);
+
+test("same-connection cleanup rechecks keep the child fenced and archive only once", async () => {
+  const directory = realpathSync(mkdtempSync("/tmp/seeker-recheck-"));
+  let childSettled = false, allowClose = false, creations = 0, archives = 0, closes = 0;
+  const bridge = await listenHelperBridge(directory, owner, "/private/native.sock", () => {
+    creations++;
+    return { get connected() { return !childSettled; }, async request(method) {
+      if (method === "thread/start") return { thread: { id: "owned", cwd: join(directory, "codex-helper") } };
+      if (method === "turn/start") return { turn: { id: "turn" } };
+      throw new Error("unexpected request");
+    }, notify() {}, respond() { throw new Error("No send permitted"); }, reject() {},
+    async close() { closes++; if (!allowClose) throw new Error("child still running"); childSettled = true; } };
+  }, async () => { archives++; });
+  const remote = await connectHelperBridge(bridge.endpoint, directory);
+  cleanup.push(async () => { allowClose = true; await bridge.close(); rmSync(directory, { recursive: true, force: true }); });
+  await remote.request("thread/start", {}, AbortSignal.timeout(1000));
+  await remote.request("turn/start", { threadId: "owned" }, AbortSignal.timeout(1000));
+  await expect(remote.close()).rejects.toMatchObject({ code: "desktop_helper_cleanup_failed" });
+  await expect(remote.close()).rejects.toMatchObject({ code: "desktop_helper_cleanup_failed" });
+  expect(childSettled).toBe(false); expect(creations).toBe(1); expect(closes).toBe(2); expect(archives).toBe(1);
+  await expect(connectHelperBridge(bridge.endpoint, directory)).rejects.toThrow();
+  allowClose = true; await remote.close();
+  expect(childSettled).toBe(true); expect(closes).toBe(3); expect(archives).toBe(1);
+  const next = await connectHelperBridge(bridge.endpoint, directory);
+  expect(creations).toBe(2); await next.close();
+});
+
+test("child settlement cannot erase a failed archive on a cleanup recheck", async () => {
+  const directory = realpathSync(mkdtempSync("/tmp/seeker-retire-failed-"));
+  let childSettled = false, archives = 0, creations = 0;
+  const bridge = await listenHelperBridge(directory, owner, "/private/native.sock", () => {
+    creations++;
+    return { get connected() { return !childSettled; }, async request(method) {
+      if (method === "thread/start") return { thread: { id: "owned", cwd: join(directory, "codex-helper") } };
+      return { turn: { id: "turn" } };
+    }, notify() {}, respond() {}, reject() {}, async close() { childSettled = true; } };
+  }, async () => { archives++; throw new Error("archive unconfirmed"); });
+  const remote = await connectHelperBridge(bridge.endpoint, directory);
+  cleanup.push(async () => { await bridge.close().catch(() => {}); rmSync(directory, { recursive: true, force: true }); });
+  await remote.request("thread/start", {}, AbortSignal.timeout(1000));
+  await remote.request("turn/start", { threadId: "owned" }, AbortSignal.timeout(1000));
+  await expect(remote.close()).rejects.toMatchObject({ code: "desktop_helper_cleanup_failed" });
+  expect(childSettled).toBe(true);
+  await expect(remote.close()).rejects.toMatchObject({ code: "desktop_helper_cleanup_failed" });
+  expect(archives).toBe(1); expect(creations).toBe(1);
+  await expect(connectHelperBridge(bridge.endpoint, directory)).rejects.toThrow();
+  await expect(bridge.close()).rejects.toThrow("archive unconfirmed");
+});
