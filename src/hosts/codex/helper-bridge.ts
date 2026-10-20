@@ -4,9 +4,9 @@ import { randomBytes } from "node:crypto";
 import { chmodSync, linkSync, lstatSync, mkdirSync, unlinkSync } from "node:fs";
 import { createConnection, createServer, type Socket } from "node:net";
 import { dirname, join } from "node:path";
-import { privateDirectory } from "./config.ts";
+import { privateDirectory, readPrivateFile } from "./config.ts";
 import type { DesktopOwner } from "./desktop-owner.ts";
-import { connectDesktopHelper } from "./helper-runtime.ts";
+import { connectDesktopHelper, parseHelperState } from "./helper-runtime.ts";
 import { HelperRpc, type HelperConnection } from "./helper-rpc.ts";
 import { ConnectorError, identifier, maxWireBytes, onlyKeys, parseInvocation, record, type NativeInvocation } from "./protocol.ts";
 
@@ -23,6 +23,10 @@ export function parseHelperEndpoint(value: unknown): HelperEndpoint {
 export async function listenHelperBridge(dataDir: string, owner: DesktopOwner, pipePath: string, connect = connectDesktopHelper, retire = async (rpc: HelperConnection, threadId: string, _turnId: string) => { await rpc.request("thread/archive", { threadId }, AbortSignal.timeout(3_000)); }, readEvent?: (origin: NativeInvocation, signal: AbortSignal) => Promise<NativeEventState>) {
   const directory = privateDirectory(dataDir), workspace = join(directory, "codex-helper");
   mkdirSync(workspace, { recursive: true, mode: 0o700 }); privateDirectory(workspace);
+  const ownsRelocatedRoot = (threadId: string, cwd: unknown) => {
+    const saved = parseHelperState(readPrivateFile(join(workspace, "session.json")));
+    return saved.threadId === threadId && saved.previousWorkspace !== undefined && saved.previousWorkspace === cwd;
+  };
   const endpoint = { socketPath: join(directory, `.h${randomBytes(4).toString("hex")}`), credential: randomBytes(32).toString("hex") };
   const sockets = new Set<Socket>(), settling = new Set<Promise<void>>();
   const sessions = new Map<Socket, () => Promise<void>>();
@@ -33,7 +37,7 @@ export async function listenHelperBridge(dataDir: string, owner: DesktopOwner, p
   const server = createServer((socket) => {
     sockets.add(socket);
     let rpc: HelperConnection | undefined, buffer = "", authenticated = false, stopping = false;
-    let helperId: string | undefined, helperTurn: string | undefined;
+    let helperId: string | undefined, helperTurn: string | undefined, helperWorkspace: string | undefined;
     let closing: Promise<void> | undefined, reading: Promise<void> | undefined, retirement: Promise<void> | undefined;
     const readAbort = new AbortController();
     const timer = setTimeout(() => socket.destroy(), 2_000); timer.unref();
@@ -127,17 +131,19 @@ export async function listenHelperBridge(dataDir: string, owner: DesktopOwner, p
               void (async () => {
                 if (method === "thread/delete") {
                   const target = record(message.params).threadId;
-                  if (!helperId || target !== helperId) throw unavailable();
+                  if (!helperId || target !== helperId || (helperWorkspace !== workspace && !ownsRelocatedRoot(helperId, helperWorkspace))) throw unavailable();
                 }
-                if (method === "turn/start" && record(message.params).threadId !== helperId) throw unavailable();
+                if (method === "turn/start" && (record(message.params).threadId !== helperId || helperWorkspace !== workspace)) throw unavailable();
                 const result = await connection.request(method, message.params, AbortSignal.timeout(15_000));
                 if (method === "thread/read" || method === "thread/start") {
                   const thread = record(record(result).thread);
-                  if (thread.cwd !== workspace || thread.forkedFromId != null || typeof thread.id !== "string") throw unavailable();
-                  helperId = thread.id;
+                  if (thread.forkedFromId != null || typeof thread.id !== "string") throw unavailable();
+                  if (method === "thread/read" && thread.id !== record(message.params).threadId) throw unavailable();
+                  if (thread.cwd !== workspace && (method !== "thread/read" || !ownsRelocatedRoot(thread.id, thread.cwd))) throw unavailable();
+                  helperId = thread.id; helperWorkspace = String(thread.cwd);
                   if (method === "thread/start") helperTurn = undefined;
                 } else if (method === "turn/start") helperTurn = String(record(record(result).turn).id);
-                else if (method === "thread/delete") { helperId = undefined; helperTurn = undefined; }
+                else if (method === "thread/delete") { helperId = undefined; helperTurn = undefined; helperWorkspace = undefined; }
                 return result;
               })().then(
                 (result) => write({ id, result }),

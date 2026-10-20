@@ -23,6 +23,14 @@ export interface DesktopHelperRuntime {
 interface HelperState { version: 1; threadId: string; turns: number; previousWorkspace?: string }
 export type ConnectHelper = (profile: DesktopProfile, pipePath: string, workspace: string, signal: AbortSignal) => HelperConnection | Promise<HelperConnection>;
 
+/** Shared by the service lifecycle and the connector's owned-root admission. */
+export function parseHelperState(contents: string): HelperState {
+  const value = record(JSON.parse(contents)); onlyKeys(value, ["version", "threadId", "turns", "previousWorkspace"]);
+  if (value.version !== 1 || !Number.isSafeInteger(value.turns) || (value.turns as number) < 0 || (value.turns as number) > 16) throw unavailable("The helper lifecycle record needs reconciliation.");
+  if (value.previousWorkspace !== undefined && (typeof value.previousWorkspace !== "string" || !value.previousWorkspace.startsWith("/") || !value.previousWorkspace.endsWith("/codex-helper"))) throw unavailable("The relocated helper workspace needs reconciliation.");
+  return { version: 1, threadId: identifier(value.threadId), turns: value.turns as number, ...(typeof value.previousWorkspace === "string" ? { previousWorkspace: value.previousWorkspace } : {}) };
+}
+
 /** The installed CLI entrypoint keeps its real binary resolution and signal forwarding role. */
 export function codexLauncher(): string {
   const selected = (process.env.PATH ?? "").split(":").filter((entry) => entry.startsWith("/")).map((entry) => join(entry, "codex")).find((entry) => {
@@ -102,10 +110,7 @@ export class NativeDesktopHelper implements DesktopHelperRuntime {
     this.#statePath = join(this.#workspace, "session.json");
     if (existsSync(this.#statePath)) {
       this.#saved = readPrivateFile(this.#statePath);
-      const value = record(JSON.parse(this.#saved)); onlyKeys(value, ["version", "threadId", "turns", "previousWorkspace"]);
-      if (value.version !== 1 || !Number.isSafeInteger(value.turns) || (value.turns as number) < 0 || (value.turns as number) > 16) throw unavailable("The helper lifecycle record needs reconciliation.");
-      if (value.previousWorkspace !== undefined && (typeof value.previousWorkspace !== "string" || !value.previousWorkspace.startsWith("/") || !value.previousWorkspace.endsWith("/codex-helper"))) throw unavailable("The relocated helper workspace needs reconciliation.");
-      this.#state = { version: 1, threadId: identifier(value.threadId), turns: value.turns as number, ...(typeof value.previousWorkspace === "string" ? { previousWorkspace: value.previousWorkspace } : {}) };
+      this.#state = parseHelperState(this.#saved);
     }
   }
 

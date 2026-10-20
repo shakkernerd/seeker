@@ -1,10 +1,11 @@
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { join } from "node:path";
 import type { DesktopOwner } from "../src/hosts/codex/desktop-owner.ts";
 import { connectHelperBridge, listenHelperBridge, readEventStateBridge } from "../src/hosts/codex/helper-bridge.ts";
 import type { HelperConnection } from "../src/hosts/codex/helper-rpc.ts";
+import { NativeDesktopHelper } from "../src/hosts/codex/helper-runtime.ts";
 
 const cleanup: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
@@ -216,4 +217,67 @@ test("child settlement cannot erase a failed archive on a cleanup recheck", asyn
   expect(archives).toBe(1); expect(creations).toBe(1);
   await expect(connectHelperBridge(bridge.endpoint, directory)).rejects.toThrow();
   await expect(bridge.close()).rejects.toThrow("archive unconfirmed");
+});
+
+async function relocatedFixture(savedThread: Record<string, unknown> = {}, startedThread: Record<string, unknown> = {}) {
+  const directory = realpathSync(mkdtempSync("/tmp/seeker-relocate-")), workspace = join(directory, "codex-helper");
+  const previousWorkspace = "/private/old-seeker/codex-helper", statePath = join(workspace, "session.json");
+  const saved = { version: 1, threadId: "saved-helper", turns: 1, previousWorkspace };
+  mkdirSync(workspace, { mode: 0o700 }); writeFileSync(statePath, JSON.stringify(saved) + "\n", { mode: 0o600 });
+  const calls: { method: string; params: Record<string, unknown> }[] = [];
+  const bridge = await listenHelperBridge(directory, owner, "/private/native.sock", () => ({
+    connected: true, async request(method, input) {
+      const params = input as Record<string, unknown>; calls.push({ method, params });
+      if (method === "initialize" || method === "thread/delete") return {};
+      if (method === "config/read") return { config: {} };
+      if (method === "thread/read") return { thread: { id: "saved-helper", cwd: previousWorkspace, forkedFromId: null, ...savedThread } };
+      if (method === "thread/start") return { thread: { id: "new-helper", cwd: workspace, forkedFromId: null, ...startedThread } };
+      if (method === "turn/start") return { turn: { id: "new-turn" } };
+      if (method === "mcpServerStatus/list") return { data: [{ name: "codex_app", runtimeStatus: "connected", tools: {
+        send_message_to_thread: { inputSchema: { type: "object", properties: { threadId: { type: "string" }, prompt: { type: "string" } } } },
+      } }], nextCursor: null };
+      throw new Error("Unexpected native request: " + method);
+    }, notify() {}, respond() { throw new Error("No delivery approval permitted"); }, reject() {}, async close() {},
+  }), async () => {});
+  const runtime = new NativeDesktopHelper({ prepare: async () => ({ owner, pipePath: "/private/native.sock" }) }, directory,
+    (_profile, _pipe, _workspace, signal) => connectHelperBridge(bridge.endpoint, directory, signal));
+  cleanup.push(async () => { await runtime.close(); await bridge.close(); rmSync(directory, { recursive: true, force: true }); });
+  return { directory, workspace, previousWorkspace, statePath, saved, calls, bridge, runtime,
+    prepare: () => runtime.prepare({ notice() {}, request() { throw new Error("No model turn expected"); }, lost() {} }, AbortSignal.timeout(2_000), () => true) };
+}
+
+test("a migrated helper is verified and retired through the production bridge before a new root starts", async () => {
+  const f = await relocatedFixture(), helper = await f.prepare();
+  expect(f.calls.filter(call => call.method.startsWith("thread/"))).toEqual([
+    { method: "thread/read", params: { threadId: "saved-helper", includeTurns: false } },
+    { method: "thread/delete", params: { threadId: "saved-helper" } },
+    { method: "thread/start", params: expect.objectContaining({ cwd: f.workspace }) },
+  ]);
+  expect(JSON.parse(readFileSync(f.statePath, "utf8"))).toEqual({ version: 1, threadId: "new-helper", turns: 0 });
+  expect(await helper.start("fixture input", AbortSignal.timeout(1_000))).toBe("new-turn");
+  expect(f.calls.filter(call => call.method === "turn/start")[0]!.params.threadId).toBe("new-helper");
+});
+
+test("relocation never admits a mismatched ID, missing or foreign workspace, or forked root", async () => {
+  for (const savedThread of [{ id: "foreign-helper" }, { cwd: undefined }, { cwd: "/private/foreign/codex-helper" }, { forkedFromId: "another-root" }]) {
+    const f = await relocatedFixture(savedThread);
+    await expect(f.prepare()).rejects.toThrow();
+    expect(f.calls.filter(call => ["thread/delete", "thread/start", "turn/start"].includes(call.method))).toEqual([]);
+    expect(JSON.parse(readFileSync(f.statePath, "utf8"))).toEqual(f.saved);
+  }
+});
+
+test("the previous workspace permits only the exact saved helper retirement", async () => {
+  const f = await relocatedFixture(), remote = await connectHelperBridge(f.bridge.endpoint, f.directory);
+  cleanup.push(() => remote.close());
+  const request = (method: string, params: Record<string, unknown>) => remote.request(method, params, AbortSignal.timeout(1_000));
+  await expect(request("thread/read", { threadId: "foreign-helper" })).rejects.toThrow();
+  await request("thread/read", { threadId: "saved-helper" });
+  await expect(request("thread/delete", { threadId: "foreign-helper" })).rejects.toThrow();
+  await expect(request("turn/start", { threadId: "saved-helper" })).rejects.toThrow();
+  expect(f.calls.some(call => call.method === "thread/delete" || call.method === "turn/start")).toBe(false);
+  await request("thread/delete", { threadId: "saved-helper" });
+  const wrongStart = await relocatedFixture({}, { cwd: f.previousWorkspace });
+  await expect(wrongStart.prepare()).rejects.toThrow();
+  expect(wrongStart.calls.some(call => call.method === "turn/start")).toBe(false);
 });
