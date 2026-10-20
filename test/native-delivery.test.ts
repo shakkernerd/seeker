@@ -24,8 +24,11 @@ function fixture(deadline = false) {
   const claimed = store.events.claim(1, now, [])[0]!, target = eventReturnTarget(claimed), envelope = eventEnvelope(claimed);
   const sends: { origin: NativeInvocation; args: NativeSendArguments }[] = [];
   let outcome: NativeSendOutcome | Error = { status: "accepted", threadId: owner.taskId }, gate: Promise<void> | undefined;
-  const sender = new DesktopNativeDelivery(core, async (origin, args) => {
-    sends.push({ origin, args }); await gate;
+  const sender = new DesktopNativeDelivery(core, async (origin, args, _signal, current) => {
+    await gate;
+    // The bridge checks currency immediately before writing; a stale delivery never reaches the host.
+    if (!current()) throw new ConnectorError("delivery_not_current", "stale", 409);
+    sends.push({ origin, args });
     if (outcome instanceof Error) throw outcome;
     return outcome;
   });
@@ -78,13 +81,21 @@ test("a refused call retries, a lost answer stays uncertain and is never resent,
   expect(f.port.get(f.address).delivery?.state).toBe("unknown");
 });
 
-test("a cancelled wait never sends, and one in-flight attempt serves concurrent deliveries", async () => {
+test("a cancelled wait never sends, even when cancelled while the connection opens, and one in-flight attempt serves concurrent deliveries", async () => {
   const f = fixture();
   const gate = deferred<void>(); f.hold(gate.promise);
   const first = f.deliver(), second = f.deliver();
-  expect(f.sends).toHaveLength(1);
   gate.resolve();
   expect(await first).toEqual(await second);
+  expect(f.sends).toHaveLength(1);
+  // Cancellation committed between the adapter's check and the write withholds the send.
+  const racing = fixture();
+  const held = deferred<void>(); racing.hold(held.promise);
+  const pending = racing.deliver();
+  racing.port.cancel(racing.address, racing.port.get(racing.address).version);
+  held.resolve();
+  expect(await pending).toEqual({ status: "rejected", code: "owner_or_exchange_changed" });
+  expect(racing.sends).toHaveLength(0);
   const cancelled = fixture();
   cancelled.port.cancel(cancelled.address, cancelled.port.get(cancelled.address).version);
   expect(await cancelled.deliver()).toEqual({ status: "rejected", code: "owner_or_exchange_changed" });

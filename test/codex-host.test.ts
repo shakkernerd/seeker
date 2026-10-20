@@ -39,6 +39,24 @@ function envelope(f: ReturnType<typeof fixture>, index = 0): { binding: ManagerB
   return { binding: { ...binding, origin }, envelope: { deliveryId: `delivery-${index}`, exchangeId: view.exchange.id, revision: current.exchange.revisions[0]!, receipt: current.exchange.receipts.find((item) => item.id === reply.receiptId)!, requiresReconciliation: false } };
 }
 
+describe("native sending", () => {
+  test("only a connector that announces the sending bridge is used; an earlier connector reports outdated", async () => {
+    const lifecycle: CodexHostLifecycle = { connected: async () => {}, admitted: async () => {}, ready: () => {} };
+    const f = fixture(Date.now, lifecycle), dataDir = mkdtempSync(join(tmpdir(), "seeker-bridge-dir-"));
+    cleanups.push(() => rmSync(dataDir, { recursive: true, force: true }));
+    const origin = { threadId: "manager-one", turnId: "submit-turn", callId: "fresh-call" }, args = { threadId: "manager-one", prompt: "notice" };
+    const send = () => f.host.nativeSend(dataDir, origin, args, new AbortController().signal);
+    await expect(send()).rejects.toMatchObject({ code: "desktop_connector_unavailable" });
+    const outdated = { socketPath: join(dataDir, ".h0000aaaa"), credential: "c".repeat(64) };
+    expect((await f.send("connect", { protocol: 1, instanceId: "older", desktop: "qualified", helper: outdated })).status).toBe(200);
+    await expect(send()).rejects.toMatchObject({ code: "desktop_connector_outdated" });
+    expect((await f.send("connect", { protocol: 1, instanceId: "current", desktop: "qualified", helper: { socketPath: join(dataDir, ".h0000bbbb"), credential: "d".repeat(64), protocol: 2 } })).status).toBe(200);
+    // The capable connector's socket is gone: that connection is dropped and the older one is still no sender.
+    await expect(send()).rejects.toMatchObject({ code: "desktop_connector_outdated" });
+    expect((await f.send("connect", { protocol: 1, instanceId: "bad", desktop: "qualified", helper: { ...outdated, protocol: "2" } })).status).not.toBe(200);
+  });
+});
+
 describe("native caller admission", () => {
   test("the shared host connection admits exact managers and denies workers and forged tool fields", async () => {
     const f = fixture();

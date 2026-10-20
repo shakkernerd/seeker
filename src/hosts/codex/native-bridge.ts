@@ -6,15 +6,18 @@ import { privateDirectory } from "./config.ts";
 import type { CodexNativeClient, NativeSendArguments, NativeSendOutcome } from "./native.ts";
 import { ConnectorError, identifier, maxWireBytes, onlyKeys, parseInvocation, record, type NativeInvocation } from "./protocol.ts";
 
-export interface BridgeEndpoint { socketPath: string; credential: string }
-export type NativeSender = (origin: NativeInvocation, args: NativeSendArguments, signal: AbortSignal) => Promise<NativeSendOutcome>;
+/** The bridge request a connector answers; a connector from an earlier release has no `protocol` and only answers older requests. */
+export const bridgeProtocol = 2;
+export interface BridgeEndpoint { socketPath: string; credential: string; protocol?: number }
+export type NativeSender = (origin: NativeInvocation, args: NativeSendArguments, signal: AbortSignal, current: () => boolean) => Promise<NativeSendOutcome>;
 const unavailable = () => new ConnectorError("desktop_connector_unavailable", "The qualified Desktop connector's native bridge is unavailable.", 503);
 const outcomes = ["accepted", "refused", "uncertain"];
 
 export function parseBridgeEndpoint(value: unknown): BridgeEndpoint {
-  const item = record(value); onlyKeys(item, ["socketPath", "credential"]);
+  const item = record(value); onlyKeys(item, ["socketPath", "credential", "protocol"]);
   if (typeof item.socketPath !== "string" || !/^\.h[a-f0-9]{8}$/.test(item.socketPath.slice(item.socketPath.lastIndexOf("/") + 1)) || typeof item.credential !== "string" || !/^[a-f0-9]{64}$/.test(item.credential)) throw unavailable();
-  return { socketPath: item.socketPath, credential: item.credential };
+  if (item.protocol !== undefined && (!Number.isSafeInteger(item.protocol) || (item.protocol as number) < 1)) throw unavailable();
+  return { socketPath: item.socketPath, credential: item.credential, ...(item.protocol === undefined ? {} : { protocol: item.protocol as number }) };
 }
 
 /**
@@ -24,7 +27,7 @@ export function parseBridgeEndpoint(value: unknown): BridgeEndpoint {
  */
 export async function listenNativeBridge(dataDir: string, native: Pick<CodexNativeClient, "send">) {
   const directory = privateDirectory(dataDir);
-  const endpoint = { socketPath: join(directory, `.h${randomBytes(4).toString("hex")}`), credential: randomBytes(32).toString("hex") };
+  const endpoint: BridgeEndpoint = { socketPath: join(directory, `.h${randomBytes(4).toString("hex")}`), credential: randomBytes(32).toString("hex"), protocol: bridgeProtocol };
   const sockets = new Set<Socket>(), sends = new Set<Promise<unknown>>();
   let closed = false;
   const server = createServer((socket) => {
@@ -82,11 +85,14 @@ export async function listenNativeBridge(dataDir: string, native: Pick<CodexNati
 }
 
 /**
- * The service's side: one send over the connector's authenticated bridge. A
- * failure before the request is written is definitely unsent; a lost answer
- * after it is uncertain, because the connector may have completed the call.
+ * The service's side: one send over the connector's authenticated bridge. The
+ * caller's `current` check runs immediately before the request is written, so
+ * a cancellation, owner change or settled reply committed while the socket
+ * connected still withholds the send. A failure before the request is written
+ * is definitely unsent; a lost answer after it is uncertain, because the
+ * connector may have completed the call.
  */
-export async function nativeSendBridge(endpoint: BridgeEndpoint, dataDir: string, origin: NativeInvocation, args: NativeSendArguments, signal: AbortSignal): Promise<NativeSendOutcome> {
+export async function nativeSendBridge(endpoint: BridgeEndpoint, dataDir: string, origin: NativeInvocation, args: NativeSendArguments, signal: AbortSignal, current: () => boolean = () => true): Promise<NativeSendOutcome> {
   const parsed = parseBridgeEndpoint(endpoint);
   if (dirname(parsed.socketPath) !== privateDirectory(dataDir)) throw unavailable();
   let info: ReturnType<typeof lstatSync>;
@@ -94,11 +100,12 @@ export async function nativeSendBridge(endpoint: BridgeEndpoint, dataDir: string
   if (!info.isSocket() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0) throw unavailable();
   const socket = createConnection(parsed.socketPath);
   return new Promise((resolve, reject) => {
-    let buffer = "", settled = false, written = false;
+    let buffer = "", settled = false, written = false, stale = false;
     const finish = (value?: NativeSendOutcome) => {
       if (settled) return; settled = true; clearTimeout(timer); signal.removeEventListener("abort", abort); socket.destroy();
       if (value) resolve(value);
       else if (written) resolve({ status: "uncertain", code: "desktop_bridge_lost" });
+      else if (stale) reject(new ConnectorError("delivery_not_current", "The delivery is no longer current; nothing was sent.", 409));
       else reject(unavailable());
     };
     const abort = () => finish(), timer = setTimeout(abort, 10_000); timer.unref();
@@ -118,7 +125,10 @@ export async function nativeSendBridge(endpoint: BridgeEndpoint, dataDir: string
     signal.addEventListener("abort", abort, { once: true });
     socket.once("connect", () => {
       if (signal.aborted) return abort();
-      socket.write(`${JSON.stringify({ credential: parsed.credential, nativeSend: { origin, arguments: args } })}\n`, () => { written = true; });
+      // Nothing asynchronous belongs between this currency check and the write.
+      if (!current()) { stale = true; return abort(); }
+      written = true;
+      socket.write(`${JSON.stringify({ credential: parsed.credential, nativeSend: { origin, arguments: args } })}\n`);
     });
     if (signal.aborted) abort();
   });

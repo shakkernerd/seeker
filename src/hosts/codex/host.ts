@@ -3,7 +3,7 @@ import { isEventOperation, invokeEvent } from "./event-tools.ts";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import type { DeliveryResult, HostAdapter, NativeEnvelope, NativeReturnTarget, ManagerBinding, ManagerOrigin, ManagerPort } from "../../contracts.ts";
 import { ConnectorError, codexRoute, connectorProtocol, identifier, maxWireBytes, onlyKeys, parseInvocation, record, type NativeInvocation } from "./protocol.ts";
-import { nativeSendBridge, parseBridgeEndpoint, type BridgeEndpoint } from "./native-bridge.ts";
+import { bridgeProtocol, nativeSendBridge, parseBridgeEndpoint, type BridgeEndpoint } from "./native-bridge.ts";
 import type { NativeSendArguments, NativeSendOutcome } from "./native.ts";
 import { invokeManager } from "./tools.ts";
 
@@ -147,22 +147,25 @@ export class CodexHostAdapter implements HostAdapter {
   /** The latest admitted invocation of a task: a turn the host knows that task has. */
   lastInvocation(threadId: string): NativeInvocation | undefined { return this.#invocations.get(threadId); }
 
-  async nativeSend(dataDir: string, origin: NativeInvocation, args: NativeSendArguments, signal: AbortSignal): Promise<NativeSendOutcome> {
+  async nativeSend(dataDir: string, origin: NativeInvocation, args: NativeSendArguments, signal: AbortSignal, current: () => boolean = () => true): Promise<NativeSendOutcome> {
     if (this.#closed || signal.aborted) throw new ConnectorError("host_closed", "The native connection ended.", 503);
     this.#prune();
-    const candidates = [...this.#connections.values()].filter((connection) => {
+    const qualified = [...this.#connections.values()].filter((connection) => {
       if (!connection.helper || !connection.desktop) return false;
       try { this.lifecycle?.ready?.(connection.desktop); return true; } catch { return false; }
     }).sort((first, second) => second.lastSeen - first.lastSeen);
+    // A connector from an earlier release answers only its own bridge requests; it is not a sender.
+    const candidates = qualified.filter((connection) => connection.helper!.protocol === bridgeProtocol);
     // A profile can have multiple native MCP clients; each reaches the same Desktop input tool.
     for (const connection of candidates) {
       signal.throwIfAborted();
-      try { return await nativeSendBridge(connection.helper!, dataDir, origin, args, signal); }
+      try { return await nativeSendBridge(connection.helper!, dataDir, origin, args, signal, current); }
       catch (error) {
         if (!(error instanceof ConnectorError) || error.code !== "desktop_connector_unavailable") throw error;
         this.#drop(connection);
       }
     }
+    if (qualified.length) throw new ConnectorError("desktop_connector_outdated", "Reload the Seeker MCP server in Desktop; the loaded connector predates native sending and saved results and replies remain pending.", 503);
     throw new ConnectorError("desktop_connector_unavailable", "Restore the qualified Desktop MCP connector; saved results and replies remain pending.", 503);
   }
 

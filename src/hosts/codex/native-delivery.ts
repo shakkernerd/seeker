@@ -23,6 +23,7 @@ export class DesktopNativeDelivery {
 
   constructor(private readonly core: SeekerCore, private readonly send: NativeSender, private readonly lastInvocation: (threadId: string) => NativeInvocation | undefined = () => undefined) {}
 
+
   deliver(binding: NativeReturnTarget, envelope: NativeEnvelope, signal: AbortSignal): Promise<DeliveryResult> {
     if (this.#closed || signal.aborted) return Promise.resolve(retry("desktop_unavailable"));
     if (!("event" in envelope)) {
@@ -71,8 +72,11 @@ export class DesktopNativeDelivery {
     if (!turnId) return retry("desktop_owner_turn_unknown");
     const origin: NativeInvocation = { threadId, turnId, callId: randomUUID() };
     let outcome;
-    try { outcome = await this.send(origin, { threadId, prompt }, signal); }
-    catch (error) { return retry(typeof (error as { code?: unknown }).code === "string" ? (error as { code: string }).code : "desktop_connector_unavailable"); }
+    try { outcome = await this.send(origin, { threadId, prompt }, signal, () => !this.#closed && hostEnvelopeCurrent(this.core, binding, envelope)); }
+    catch (error) {
+      const code = typeof (error as { code?: unknown }).code === "string" ? (error as { code: string }).code : "desktop_connector_unavailable";
+      return code === "delivery_not_current" ? { status: "rejected", code: "owner_or_exchange_changed" } : retry(code);
+    }
     if (outcome.status === "accepted") return { status: "accepted", reference: nativeEvidence(origin) };
     if (outcome.status === "refused") return retry(outcome.code);
     return { status: "unknown", code: outcome.code };

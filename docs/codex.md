@@ -113,7 +113,10 @@ registered profile. A connector that cannot be reached before the request is
 written is a definite failure and the delivery retries within its ordinary
 budget; a request written without an answer is uncertain and is never resent.
 The connector reports the host's own confirmation of the target; a call the host
-refuses is reported as unsent and retried within the same budget.
+refuses is reported as unsent and retried within the same budget. A connector
+loaded from an earlier release announces no sending capability: the service
+does not use it, reports `desktop_connector_outdated`, and delivers once a
+reloaded connector connects.
 
 Replies and results that arrive while no qualified connector is connected stay
 in Seeker. Restoring the connector reopens known-unsent retries, including work

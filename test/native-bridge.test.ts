@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, lstatSync } from "node:fs";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { listenNativeBridge, nativeSendBridge, parseBridgeEndpoint } from "../src/hosts/codex/native-bridge.ts";
+import { bridgeProtocol, listenNativeBridge, nativeSendBridge, parseBridgeEndpoint } from "../src/hosts/codex/native-bridge.ts";
 import type { NativeSendArguments, NativeSendOutcome } from "../src/hosts/codex/native.ts";
 import type { NativeInvocation } from "../src/hosts/codex/protocol.ts";
 
@@ -25,6 +25,13 @@ async function fixture() {
 test("the service's send crosses the authenticated bridge and returns the connector's native outcome unchanged", async () => {
   const f = await fixture();
   expect(lstatSync(f.bridge.endpoint.socketPath).mode & 0o077).toBe(0);
+  expect(f.bridge.endpoint.protocol).toBe(bridgeProtocol);
+  expect(parseBridgeEndpoint(f.bridge.endpoint)).toEqual(f.bridge.endpoint);
+  expect(parseBridgeEndpoint({ socketPath: f.bridge.endpoint.socketPath, credential: f.bridge.endpoint.credential }).protocol).toBeUndefined();
+  expect(() => parseBridgeEndpoint({ ...f.bridge.endpoint, protocol: "2" })).toThrow();
+  // The caller's currency check runs immediately before the request is written; a stale delivery sends nothing.
+  await expect(nativeSendBridge(f.bridge.endpoint, f.dataDir, origin, args, new AbortController().signal, () => false)).rejects.toMatchObject({ code: "delivery_not_current" });
+  expect(f.sends).toHaveLength(0);
   expect(await nativeSendBridge(f.bridge.endpoint, f.dataDir, origin, args, new AbortController().signal)).toEqual({ status: "accepted", threadId: "owner-task" });
   expect(f.sends).toEqual([{ origin, args }]);
   f.outcome({ status: "refused", code: "native_input_refused" });

@@ -42,7 +42,9 @@ export class CodexNativeClient {
       });
     } catch (error) {
       const failure = error instanceof NativeFailure ? error : new NativeFailure("native_unavailable");
-      if (failure.code === "native_rpc_error") return { status: "refused", code: "native_input_refused" };
+      // Only the host's own correlated error answer says the call did not happen. Anything else after
+      // the request was written, a wrong id, a malformed frame, silence, leaves the outcome unknown.
+      if (failure.code === "native_rpc_refused") return { status: "refused", code: "native_input_refused" };
       return failure.written ? { status: "uncertain", code: failure.code } : { status: "refused", code: failure.code };
     }
     try {
@@ -95,11 +97,13 @@ export class CodexNativeClient {
         if (pending.length < size + 4) return;
         try {
           const response = record(JSON.parse(pending.subarray(4, size + 4).toString("utf8")));
-          if (response.jsonrpc !== "2.0" || response.id !== 1) return finish(new NativeFailure("native_rpc_error"));
-          if ("error" in response || !("result" in response)) {
-            const error = "error" in response ? record(response.error) : {};
-            return finish(new NativeFailure("native_rpc_error", false, typeof error.code === "number" ? error.code : undefined, typeof error.message === "string" ? error.message.slice(0, 200) : undefined));
+          if (response.jsonrpc !== "2.0" || response.id !== 1) return finish(new NativeFailure("native_rpc_uncorrelated"));
+          if ("error" in response) {
+            const error = record(response.error);
+            if (typeof error.code !== "number") return finish(new NativeFailure("native_invalid_response"));
+            return finish(new NativeFailure("native_rpc_refused", false, error.code, typeof error.message === "string" ? error.message.slice(0, 200) : undefined));
           }
+          if (!("result" in response)) return finish(new NativeFailure("native_invalid_response"));
           finish(undefined, response.result);
         } catch { finish(new NativeFailure("native_invalid_response")); }
       });
