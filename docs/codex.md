@@ -129,10 +129,12 @@ not start an unlimited sequence of model turns.
 While a finished helper is retiring, another notification reports
 `desktop_helper_cleaning_up`. If retirement or child settlement fails, it reports
 `desktop_helper_cleanup_failed` and keeps that helper quarantined. Genuine
-connector restoration retries settlement of the same owned connection; it does
-not release the helper merely because a connector is available. Only confirmed
-cleanup allows another preparation. An unconfirmed retirement remains blocked
-for reconciliation, and accepted or uncertain notifications are never replayed.
+connector restoration rechecks the retained connection; it does not release the
+helper merely because a connector is available. Only confirmed cleanup allows
+another preparation. The production transport retains a rejected close result:
+a failed close or lost settlement acknowledgment stays quarantined pending
+reconciliation. Reconnecting alone cannot recover it. Accepted or uncertain
+notifications are never replayed.
 
 Background input requires a qualified Seeker MCP connector in the registered
 Desktop application; it need not be receiving tools in the target task. The
