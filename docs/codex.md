@@ -126,6 +126,14 @@ It does not copy credentials or the manager's conversation into the helper.
 Preparation failures have bounded retries; an unavailable native interface does
 not start an unlimited sequence of model turns.
 
+While a finished helper is retiring, another notification reports
+`desktop_helper_cleaning_up`. If retirement or child settlement fails, it reports
+`desktop_helper_cleanup_failed` and keeps that helper quarantined. Genuine
+connector restoration retries settlement of the same owned connection; it does
+not release the helper merely because a connector is available. Only confirmed
+cleanup allows another preparation. An unconfirmed retirement remains blocked
+for reconciliation, and accepted or uncertain notifications are never replayed.
+
 Background input requires a qualified Seeker MCP connector in the registered
 Desktop application; it need not be receiving tools in the target task. The
 connector must remain loaded during the wait. If the registered application is

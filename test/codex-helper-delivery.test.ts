@@ -194,3 +194,69 @@ test("shutdown cancels pending preparation and late callbacks cannot access a cl
   f.store.close(); f.lost();
   expect(f.replies.some((entry) => entry.result.action === "accept")).toBe(false);
 });
+
+function anotherDelivery(f: ReturnType<typeof fixture>) {
+  const binding = { ...f.binding, id: "other-binding", origin: { ...f.binding.origin, managerId: "other-manager", assignmentId: "other-assignment" } };
+  f.core.bind(binding);
+  const initial = f.core.manager(binding.origin).submit({ requestId: "other-request", decision: fixtureDecision });
+  const received = f.core.channel("local").receive([{ eventId: "other-reply", actorId: "owner", conversationId: "inbox", sourceRef: "local:other-reply", replyHandle: initial.current.replyHandle, kind: "question", text: "Fixture reply" }])[0]!;
+  const view = f.store.get(initial.exchange.id)!;
+  const envelope: ReceiptEnvelope = { deliveryId: view.deliveries.find((item) => item.receiptId === received.receiptId)!.id, exchangeId: initial.exchange.id, revision: view.exchange.revisions[0]!, receipt: view.exchange.receipts[0]!, requiresReconciliation: false };
+  return () => f.sender.deliver(binding, envelope, new AbortController().signal);
+}
+
+test("failed cleanup stays quarantined until restoration confirms settlement", async () => {
+  const f = fixture(), other = anotherDelivery(f), retired = deferred();
+  let resets = 0, failCleanup = true;
+  f.runtime.reset = async () => {
+    resets++;
+    if (failCleanup) throw new Error("unconfirmed child settlement");
+    await retired.promise;
+  };
+  f.failPreparation(); await f.deliver();
+  await until(() => resets === 1); await Bun.sleep(2);
+  expect(await f.deliver()).toMatchObject({ code: "desktop_helper_cleanup_failed" });
+  expect(await other()).toMatchObject({ code: "desktop_helper_cleanup_failed" });
+  f.sender.restored();
+  await until(() => resets === 2); await Bun.sleep(2);
+  expect(await other()).toMatchObject({ code: "desktop_helper_cleanup_failed" });
+  expect(f.preparations()).toBe(1); expect(f.replies).toHaveLength(0);
+  failCleanup = false; f.sender.restored(); f.sender.restored();
+  await until(() => resets === 3);
+  expect(await other()).toMatchObject({ code: "desktop_helper_cleanup_failed" });
+  expect(f.preparations()).toBe(1);
+  retired.resolve(); await Bun.sleep(2);
+  expect(await other()).toMatchObject({ code: "desktop_helper_preparing" });
+  await f.ready();
+  expect(f.preparations()).toBe(2); expect(f.replies).toHaveLength(0);
+});
+
+test("successful cleanup releases the same failed preparation without restoration", async () => {
+  const f = fixture(), other = anotherDelivery(f), retired = deferred();
+  f.holdReset(retired.promise); f.failPreparation(); await f.deliver();
+  await until(() => f.resets() === 1);
+  expect(await other()).toMatchObject({ code: "desktop_helper_cleaning_up" });
+  retired.resolve(); await Bun.sleep(2);
+  expect(await other()).toMatchObject({ code: "desktop_helper_preparing" });
+  await f.ready(); expect(f.preparations()).toBe(2); expect(f.replies).toHaveLength(0);
+});
+
+test("cleanup failure and recovery never replay accepted or unknown input", async () => {
+  for (const outcome of ["accepted", "unknown"] as const) {
+    const f = fixture(), other = anotherDelivery(f);
+    let resets = 0, failCleanup = true;
+    f.runtime.reset = async () => { resets++; if (failCleanup) throw new Error("unconfirmed child settlement"); };
+    await f.deliver(); await f.ready();
+    const sending = f.deliver();
+    if (outcome === "accepted") f.nativeResult(); else f.lost();
+    expect((await sending).status).toBe(outcome);
+    await until(() => resets === 1); await Bun.sleep(2);
+    expect((await f.deliver()).status).toBe(outcome);
+    expect(await other()).toMatchObject({ code: "desktop_helper_cleanup_failed" });
+    failCleanup = false; f.sender.restored();
+    await until(() => resets === 2); await Bun.sleep(2);
+    expect((await f.deliver()).status).toBe(outcome);
+    expect(f.preparations()).toBe(1);
+    expect(f.replies.filter((reply) => reply.result.action === "accept")).toHaveLength(1);
+  }
+});

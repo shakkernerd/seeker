@@ -129,13 +129,16 @@ export class NativeDesktopHelper implements DesktopHelperRuntime {
     check();
     const { owner, pipePath } = await this.lifecycle.prepare(signal, current);
     check();
-    const opening = Promise.resolve().then(() => this.connect(owner.profile, pipePath, this.#workspace, signal));
+    const opening = Promise.resolve().then(() => this.connect(owner.profile, pipePath, this.#workspace, signal)).then((connection) => {
+      // Adopt even a late, cancelled opening until its close confirms settlement.
+      this.#rpc = connection;
+      return connection;
+    });
     this.#opening = opening;
     let rpc: HelperConnection | undefined;
     try {
       rpc = await opening; check();
-      this.#rpc = rpc;
-    } catch (error) { await rpc?.close(); throw error; }
+    } catch (error) { await this.reset(); throw error; }
     finally { if (this.#opening === opening) this.#opening = undefined; }
     rpc.events = events;
     await rpc.request("initialize", { clientInfo: { name: "seeker_desktop_helper", version: "0.1.0" }, capabilities: { experimentalApi: true } }, signal);
@@ -197,9 +200,11 @@ export class NativeDesktopHelper implements DesktopHelperRuntime {
     this.#generation += 1;
     const rpc = this.#rpc, opening = this.#opening;
     const closing = (async () => {
-      const results = await Promise.allSettled([rpc?.close(), opening?.then((connection) => connection.close(), () => {})]);
+      const opened = await opening?.catch(() => undefined);
+      const connections = new Set([rpc, opened].filter((connection) => connection !== undefined));
+      const results = await Promise.allSettled([...connections].map((connection) => connection.close()));
       for (const result of results) if (result.status === "rejected") throw result.reason;
-      if (this.#rpc === rpc) this.#rpc = undefined;
+      if (this.#rpc === rpc || this.#rpc === opened) this.#rpc = undefined;
     })();
     this.#resetting = closing;
     void closing.finally(() => { if (this.#resetting === closing) this.#resetting = undefined; }).catch(() => {});

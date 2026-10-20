@@ -26,6 +26,8 @@ interface Job {
   abort?: () => void;
   result?: Promise<DeliveryResult>;
   finish?: (value: DeliveryResult) => void;
+  cleanup?: Promise<void>;
+  cleanupFailed?: boolean;
 }
 const retry = (code: string): DeliveryResult => ({ status: "retry", retryAfterMs: 1_000, code });
 const epoch = (binding: NativeReturnTarget) => [binding.id, binding.origin.hostId, binding.origin.managerId, binding.origin.assignmentId, binding.origin.generation];
@@ -69,6 +71,7 @@ export class DesktopHelperDelivery {
     }
     const previous = this.#job;
     if (previous && previous.key !== key && previous.phase !== "sending" && !this.#current(previous)) this.#finish(previous, retry("desktop_helper_cancelled"));
+    if (this.#job?.phase === "finished") return retry(this.#job.cleanupFailed ? "desktop_helper_cleanup_failed" : "desktop_helper_cleaning_up");
     if (this.#job && this.#job.key !== key) return Promise.resolve(retry("desktop_helper_busy"));
     if (!this.#job) {
       const failed = this.#failed.get(envelope.deliveryId);
@@ -105,6 +108,8 @@ export class DesktopHelperDelivery {
   restored(): void {
     if (this.#closed) return;
     this.#failed.clear();
+    // Re-admission may retry settlement, but never proves the old child stopped.
+    if (this.#job?.cleanupFailed) this.#cleanup(this.#job, false);
     this.core.resumeHost("codex-desktop");
   }
 
@@ -215,7 +220,12 @@ export class DesktopHelperDelivery {
     job.finish?.(result);
     // Receipt resolution need not wait for model completion, but the next job
     // cannot reuse a thread while its previous native turn could still act.
-    this.#track(this.runtime.reset().then(() => {
+    this.#cleanup(job, retryPreparation);
+  }
+
+  #cleanup(job: Job, retryPreparation: boolean): void {
+    if (job.cleanup) return;
+    const cleanup = Promise.resolve().then(() => this.runtime.reset()).then(() => {
       if (this.#job === job) this.#job = undefined;
       // Other managers may have exhausted their pump attempts while this one
       // occupied the helper. Releasing it restores their known-unsent work too;
@@ -225,7 +235,13 @@ export class DesktopHelperDelivery {
         this.#readyTimer = setTimeout(() => { if (!this.#closed) this.core.resumeHost(job.binding.origin.hostId); }, retryPreparation ? 1_000 : 0);
         this.#readyTimer.unref();
       }
-    }));
+    }, () => {
+      // Keep ownership and a truthful terminal cleanup state. Neither another
+      // delivery nor a fresh connector can authorize reuse of an unretired child.
+      job.cleanupFailed = true;
+    }).finally(() => { job.cleanup = undefined; });
+    job.cleanup = cleanup;
+    this.#track(cleanup);
   }
   #track(operation: Promise<unknown>): void {
     this.#settling.add(operation);

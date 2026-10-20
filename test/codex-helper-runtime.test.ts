@@ -266,3 +266,26 @@ test("runtime close aborts and joins event metadata reads without creating a hel
   await started; await runtime.close(); await reading;
   expect(aborted).toBe(true); expect(settled).toBe(true);
 });
+
+
+test("a cancelled opening retains its exact connection after failed cleanup", async () => {
+  const connecting = deferred(), release = deferred();
+  let settled = false, closes = 0;
+  const f = fixture([{ connect: async () => { connecting.resolve(); await release.promise; }, close: async () => {
+    closes++;
+    if (!settled) throw new Error("original child is not settled");
+  } }]);
+  cleanups.push(async () => { settled = true; release.resolve(); });
+  const abort = new AbortController();
+  const preparing = f.prepare(abort.signal);
+  await connecting.promise; abort.abort(); release.resolve();
+  await expect(preparing).rejects.toThrow("original child is not settled");
+  await expect(f.runtime.reset()).rejects.toThrow("original child is not settled");
+  await expect(f.prepare()).rejects.toThrow("original child is not settled");
+  expect(f.connections).toHaveLength(1); expect(closes).toBe(3);
+  expect(requests(f.calls, "initialize")).toHaveLength(0);
+  settled = true;
+  await f.prepare();
+  expect(closes).toBe(4); expect(f.connections).toHaveLength(2);
+  expect(f.order.indexOf("0:closed")).toBeLessThan(f.order.indexOf("1:initialize"));
+});
