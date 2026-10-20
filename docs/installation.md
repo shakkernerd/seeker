@@ -23,7 +23,7 @@ Add `export PATH="$HOME/.seeker/bin:$PATH"` once to the startup file for your se
 ~/.seeker/bin/seeker install connect --config "$HOME/.codex/config.toml"
 ```
 
-This prepares private transport credentials and adds the event-only `seeker_events` entry. It does not register a human manager, expose conversation tools, or change existing filters, approvals, trust or timeouts. Existing entries from another installation require the explicit migration below. Human-manager setup remains project-local through `seeker codex setup` or `seeker codex-cli setup`.
+This prepares separate private Desktop and CLI transport credentials and adds the event-only `seeker_events` entry. It checks the existing official Codex CLI prerequisite and reports an unavailable runtime without installing one. It does not register a human manager, expose conversation tools, or change existing filters, approvals, trust or timeouts. Existing entries from another installation require the explicit migration below. Human-manager setup remains project-local through `seeker codex setup` or `seeker codex-cli setup`.
 
 Reload the affected MCP server using the original host's supported settings, preserving active tasks. Seeker never restarts Codex. Invoke `event_pending` in a genuine native task to qualify admission, then complete an arm/signal/original-task return scenario. A healthy service and a config file alone do not establish native delivery readiness. Keep the official Codex CLI on the service's PATH; the native connector continues using the runtime supplied by Codex.
 

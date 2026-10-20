@@ -171,7 +171,7 @@ test("rotation reads and verifies the saved root before deleting only that helpe
 });
 
 test("a different identity, workspace or fork root preserves the lifecycle record and forbids deletion", async () => {
-  for (const savedThread of [{ id: "business-manager" }, { cwd: "/private/unrelated-workspace" }, { forkedFromId: "business-manager" }]) {
+  for (const savedThread of [{ cwd: undefined }, { id: "business-manager" }, { cwd: "/private/unrelated-workspace" }, { forkedFromId: "business-manager" }]) {
     const state: State = { version: 1, threadId: "owned-helper", turns: 16 }, f = fixture([{ savedThread }], state);
     const before = readFileSync(f.statePath, "utf8");
     await expect(f.prepare()).rejects.toThrow("not this service's owned helper");

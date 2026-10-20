@@ -156,7 +156,7 @@ export class NativeDesktopHelper implements DesktopHelperRuntime {
         check(); this.#save(undefined);
       }
       check();
-      if (saved && (saved.id !== this.#state?.threadId || (saved.cwd !== this.#workspace && saved.cwd !== this.#state?.previousWorkspace) || saved.forkedFromId != null)) throw unavailable("The saved root is not this service's owned helper.");
+      if (saved && (saved.id !== this.#state?.threadId || (saved.cwd !== this.#workspace && (this.#state?.previousWorkspace === undefined || saved.cwd !== this.#state.previousWorkspace)) || saved.forkedFromId != null)) throw unavailable("The saved root is not this service's owned helper.");
       if (this.#state && saved) {
         await rpc.request("thread/delete", { threadId: this.#state.threadId }, signal);
         check(); this.#save(undefined);

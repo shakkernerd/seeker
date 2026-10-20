@@ -50,6 +50,7 @@ test("event-only connector preserves human admission and existing settings", asy
   const config = join(f.root, "config.toml"); const other = 'model = "unchanged"\n[mcp_servers.other]\ncommand = "/other"\n'; writeFileSync(config, other);
   connectEvents(f.home, config, true); expect(readFileSync(config, "utf8")).toBe(other);
   connectEvents(f.home, config); const first = readFileSync(config, "utf8");
+  expect(JSON.parse(readFileSync(join(f.home, "cli/codex-connector.json"), "utf8")).hostId).toBe("codex-cli");
   expect(first.startsWith(other)).toBe(true); expect(first).not.toContain('"submit"');
   connectEvents(f.home, config); expect(readFileSync(config, "utf8")).toBe(first);
   expect(Bun.file(join(f.home, "exchanges.sqlite")).size).toBe(0);

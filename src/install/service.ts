@@ -59,6 +59,7 @@ export async function serviceCommand(action: string, home: string, dryRun = fals
   if (dryRun) return plan;
   if (["enable", "start", "restart"].includes(action) && present(join(p.home, ".installation-lock"))) fail("install_busy", "Finish installation or migration before starting the service.");
   const current = launchctl(["print", target()], true);
+  if (current && !current.includes(`program = ${join(p.bin, "seeker")}\n`)) fail("service_collision", "The loaded service label belongs to another executable; it was preserved.");
   if (current && !present(p.plist)) fail("service_collision", "The service label is already registered without this installation's plist.");
   if (["stop", "disable", "restart"].includes(action) && current) {
     launchctl(["bootout", target()]);
@@ -87,6 +88,8 @@ export async function serviceCommand(action: string, home: string, dryRun = fals
       }
       launchctl(["enable", target()]);
       launchctl(["bootstrap", `gui/${process.getuid?.()}`, p.plist]);
+    } else if (!/pid = \d+/.test(loaded)) {
+      launchctl(["kickstart", target()]);
     }
   }
   return plan;
