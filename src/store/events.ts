@@ -51,11 +51,6 @@ export class SqliteEventStore implements EventStore {
       if (wait.version !== expectedVersion) fail("event_version", "Read the current wait before changing it.", 409);
       if (command.type === "cancel") {
         if (!terminal(wait)) { wait.state = "cancelled"; wait.reason = "owner_cancelled"; this.#retire(wait); }
-      } else if (command.type === "resume") {
-        if (terminal(wait)) fail("event_closed", "This wait is closed. Use a new wait identity.", 409);
-        if (wait.owner.bindingId !== owner.bindingId || wait.owner.ownerGeneration !== owner.ownerGeneration) fail("owner_changed", "The original event assignment changed.", 409);
-        wait.owner = owner; wait.state = wait.receipt ? "ready" : "waiting"; delete wait.reason;
-        if (wait.receipt?.disposition === "pending" && wait.delivery && ["queued", "retry", "retired", "rejected"].includes(wait.delivery.state)) this.#renew(wait, now);
       } else if (command.type === "acknowledge") {
         if (!["received", "handled", "unknown"].includes(command.status) || !wait.receipt || wait.receipt.id !== id(command.receiptId, "Receipt")) fail("event_receipt", "The exact saved event receipt is required.", 409);
         if (wait.state === "cleared") fail("event_closed", "This event evidence was cleared.", 409);
@@ -93,8 +88,8 @@ export class SqliteEventStore implements EventStore {
       if (terminal(wait)) fail("event_closed", "This wait no longer accepts a signal.", 409);
       wait.receipt = { id: randomUUID(), signal: input, recordedAt: now, disposition: "pending" };
       wait.signalFingerprint = fingerprint;
-      if (wait.state !== "paused") wait.state = "ready";
-      wait.delivery = { id: randomUUID(), state: wait.state === "paused" ? "retired" : "queued", attempts: 0, nextAt: now };
+      wait.state = "ready";
+      wait.delivery = { id: randomUUID(), state: "queued", attempts: 0, nextAt: now };
       wait.version += 1; wait.updatedAt = now; this.#save(wait);
       return { status: "recorded" as const, receiptId: wait.receipt.id };
     }).immediate();
@@ -107,7 +102,7 @@ export class SqliteEventStore implements EventStore {
     return this.db.transaction(() => {
       const claimed: EventWait[] = [], excluded = new Set(excludedRoutes);
       // Expiration and queue selection stay bounded even with thousands of retained results.
-      const expired = this.db.query<Row, [number, number]>("SELECT data FROM event_waits WHERE state IN ('waiting','ready','paused') AND next_at<=? AND json_extract(data,'$.expiresAt')<=? AND json_extract(data,'$.receipt.source') IS NOT 'deadline' LIMIT 128").all(now, now);
+      const expired = this.db.query<Row, [number, number]>("SELECT data FROM event_waits WHERE state IN ('waiting','ready') AND next_at<=? AND json_extract(data,'$.expiresAt')<=? AND json_extract(data,'$.receipt.source') IS NOT 'deadline' LIMIT 128").all(now, now);
       for (const row of expired) this.#expire(decode(row), now);
       while (claimed.length < limit) {
         const routes = [...excluded];
@@ -134,7 +129,7 @@ export class SqliteEventStore implements EventStore {
         delivery.code = id(result.code, "Event delivery code");
         if (result.status === "retry") {
           integer(result.retryAfterMs, "Retry delay", 0); delivery.nextAt = now + Math.max(1000, result.retryAfterMs);
-          if (terminal(wait) || wait.state === "paused") delivery.state = "retired";
+          if (terminal(wait)) delivery.state = "retired";
           else if (delivery.code === "event_owner_active") delivery.attempts = Math.max(0, delivery.attempts - 1);
           else if (delivery.attempts >= 5) { delivery.state = "rejected"; delivery.code = "retry_exhausted"; }
         }
@@ -149,6 +144,17 @@ export class SqliteEventStore implements EventStore {
     return this.db.transaction(() => {
       const rows = this.db.query<Row, []>("SELECT data FROM event_waits INDEXED BY event_wait_retained WHERE state<>'cleared' AND json_extract(data,'$.delivery.state')='sending'").all();
       for (const row of rows) { const wait = decode(row); wait.delivery!.state = "unknown"; wait.delivery!.code = "receiver_restarted"; wait.updatedAt = now; this.#save(wait); }
+      // Earlier releases paused a wait when its owner's turn changed. A newer turn no
+      // longer holds delivery, so a stored paused wait becomes deliverable again.
+      const paused = this.db.query<Row, []>("SELECT data FROM event_waits WHERE state='paused'").all();
+      for (const row of paused) {
+        const wait = decode(row);
+        wait.state = wait.receipt ? "ready" : "waiting"; delete wait.reason;
+        if (wait.receipt?.disposition === "pending" && (!wait.delivery || ["queued", "retry", "retired", "rejected"].includes(wait.delivery.state))) this.#renew(wait, now);
+        wait.version += 1; wait.updatedAt = now; this.#save(wait);
+        // A passed deadline now takes its ordinary course: a deadline notice, or expiry of a saved result's unsent notification.
+        this.#expire(wait, now);
+      }
       return rows.length;
     }).immediate();
   }
@@ -168,9 +174,6 @@ export class SqliteEventStore implements EventStore {
       return eventPublic(wait);
     }).immediate();
   }
-  pause(address: EventAddress, expectedVersion: number, reason: string, now: number): void {
-    this.db.transaction(() => { const wait = this.#find(address.waitId); if (!wait) return; this.#address(wait, address); this.#expire(wait, now); if (wait.version !== expectedVersion || terminal(wait) || wait.state === "paused") return; wait.state = "paused"; wait.reason = id(reason, "Pause reason"); this.#retire(wait); wait.version += 1; wait.updatedAt = now; this.#save(wait); }).immediate();
-  }
   #find(waitId: string): StoredEventWait | undefined { const row = this.db.query<Row, [string]>("SELECT data FROM event_waits WHERE id=?").get(id(waitId, "Wait")); return row ? decode(row) : undefined; }
   #require(owner: Pick<EventOwner, "hostId" | "taskId">, address: EventAddress): StoredEventWait { const wait = this.#find(address.waitId); if (!wait) fail("event_not_found", "Event wait not found.", 404); this.#owned(wait, owner, address); return wait; }
   #owned(wait: EventWait, owner: Pick<EventOwner, "hostId" | "taskId">, address: EventAddress): void { if (!sameEventOwner(wait.owner, owner)) fail("origin_denied", "This event wait belongs to another native task.", 403); this.#address(wait, address); }
@@ -185,8 +188,8 @@ export class SqliteEventStore implements EventStore {
         signal: { ...eventAddress(wait), eventId: randomUUID(), outcome: "failed", evidenceRefs: [],
           summary: "The wait deadline passed without a producer result. Job completion is unknown. Reconcile the existing job and retained evidence before continuing; this notice does not restart it." },
       };
-      if (wait.state !== "paused") { wait.state = "ready"; wait.reason = "deadline_passed"; }
-      wait.delivery = { id: randomUUID(), state: wait.state === "paused" ? "retired" : "queued", attempts: 0, nextAt: now };
+      wait.state = "ready"; wait.reason = "deadline_passed";
+      wait.delivery = { id: randomUUID(), state: "queued", attempts: 0, nextAt: now };
     } else {
       wait.state = "expired"; wait.reason = "deadline_passed"; this.#retire(wait);
     }

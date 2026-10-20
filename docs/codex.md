@@ -7,18 +7,15 @@ task and window focus stay in place. The manager keeps its workspace, model,
 history, permissions and native execution owner.
 
 The connector runs in the runtime supplied by Codex Desktop. Seeker's service,
-store and messaging channels run on Bun. Background return also uses a private
-Codex helper to prepare a native notification. This preparation incurs model
-usage through the registered native profile; the original manager continues to
-own the conversation and work.
+store and messaging channels run on Bun. Background return is one native
+notification that the connector sends on the service's behalf; no model prepares
+or approves it. The original manager continues to own the conversation and work.
 
 ## Set up a manager
 
 Install the built Seeker package and the qualified Bun version described in the
-[local setup guide](local.md). Background return requires the official
-`@openai/codex` npm CLI, available as `codex` on the Desktop connector's `PATH`.
-Seeker runs its unmodified launcher with the Node runtime supplied by the
-registered Desktop application. Keep both installations available and compatible.
+[local setup guide](local.md). Background return needs nothing beyond the
+registered Desktop application and its configured connector.
 
 With Seeker stopped, register the existing task and its project:
 
@@ -91,80 +88,41 @@ permission.
 
 ## Background delivery and recovery
 
-For each notification, a private Codex CLI app-server helper prepares one normal
-`send_message_to_thread` call addressed to the original Desktop task. This is the
-helper's only enabled MCP tool, and each call requires its own native approval.
-The helper model has no shell or filesystem execution environment.
-Seeker grants that single call only after matching its target and notification
-to the current exchange, pending input and manager generation. Cancellation,
-owner changes and obsolete notices invalidate a prepared call. Manager admission
-and Seeker's conversation tools remain on the original Desktop task.
+Each notification is one `send_message_to_thread` call to the original Desktop
+task, made by the qualified Desktop MCP connector over the host's native tool
+socket. The service decides what to send and when: it rechecks the exact target,
+the pending input or saved result, the manager generation and cancellation, then
+asks the connector over a private, authenticated local socket to make that one
+call. The call is stamped with the receiving task and a turn that task has, the
+turn that asked the question or armed the wait, so the host can attribute it;
+the call identity is fresh for every attempt. No model turn prepares the call,
+no approval prompt gates it, and the connector adds nothing of its own.
 
-Model preparation happens outside the delivery pump's five-second send budget.
-Preparation cannot send while its approval is pending. When it becomes ready,
-Seeker restores known-undelivered retries, including work whose ordinary retry
-budget ended during preparation. The next current delivery attempt grants the
-call and waits briefly for its correlated native tool receipt. That receipt must
-confirm the original target; the helper's final answer is never delivery evidence.
+Delivery does not depend on what the task is doing. An idle task starts a new
+turn with the notification; a task that is working receives it in its current
+turn. A task that moved on to newer turns since it asked or armed still receives
+its notification. Only cancellation, an owner change or an obsolete notice
+withholds it. The manager then reads the complete reply or result through
+Seeker's tools under its current instructions; the notification itself never
+authorizes an action.
 
-The helper uses the registered profile's existing native authentication and
-storage. Its workspace and lifecycle record live in the private
-`<data-dir>/codex-helper` directory. Each notification uses a fresh helper root.
-The connector verifies that root's exact workspace and identity, archives a used
-root through its owning helper server before settling the child, and deletes the
-verified previous root before the next preparation. This bounds helper history without resuming a
-thread whose writer Desktop has adopted. Retirement cannot select the manager's
-root or another workspace.
-The qualified Desktop MCP connector launches and supervises its native process.
-The service controls it through a private, authenticated local socket and retains
-the exact approval and receipt checks. This preserves the Desktop ancestry and
-signed runtime chain required by the native tool socket. A service outside that
-ancestry cannot launch a usable native helper directly. The connector stays
-connected through ordinary background I/O while the manager is idle and
-reconnects after a service restart, without model polling.
-It does not copy credentials or the manager's conversation into the helper.
-Preparation failures have bounded retries; an unavailable native interface does
-not start an unlimited sequence of model turns.
+The connector stays connected through ordinary background I/O while the manager
+is idle and reconnects after a service restart, without model polling. The
+service sends through the most recently seen qualified connector for the
+registered profile. A connector that cannot be reached before the request is
+written is a definite failure and the delivery retries within its ordinary
+budget; a request written without an answer is uncertain and is never resent.
+The connector reports the host's own confirmation of the target; a call the host
+refuses is reported as unsent and retried within the same budget.
 
-While a finished helper is retiring, another notification reports
-`desktop_helper_cleaning_up`. If retirement or child settlement fails, it reports
-`desktop_helper_cleanup_failed` and keeps that helper quarantined. Genuine
-connector restoration rechecks the retained connection; it does not release the
-helper merely because a connector is available. Only confirmed cleanup allows
-another preparation. A timed-out close keeps the original socket available only
-for settlement: a late acknowledgment can establish that the child stopped.
-Restoration can also recheck the same teardown without starting another child or
-repeating archival. Failed archival, a still-live child, or a disconnected socket
-without affirmative settlement remains quarantined for reconciliation. Accepted
-or uncertain notifications are never replayed.
-
-Background input requires a qualified Seeker MCP connector in the registered
-Desktop application; it need not be receiving tools in the target task. The
-connector must remain loaded during the wait. If the registered application is
-absent, Seeker can open it in the background
-with its registered profile and native storage locations. It never restarts a
-running Desktop app. Recovery uses no task URI or navigation operation. The
-original manager's connector qualifies again when its Seeker tools reconnect.
-
-An ordinary manual app restart can change the process IDs. Seeker verifies the
-running application's actual Desktop profile, code home and native database
-location before resuming the original task; a matching process ID alone is not
-the host identity. The helper qualifies its native input tool, and the manager's
-connector qualifies again when it reconnects.
-A different or unreadable profile, ambiguous instances, missing storage evidence,
-or an incompatible native interface remains blocked. Discovery is limited to
-the service's effective OS user. A compatible app update can change its build
-number: the native interfaces must qualify again before use. Seeker does not
-update the application. Keep one Desktop profile per Seeker data directory.
-
-Profile qualification reads the actual native process argument boundaries, so
-spaces and switch-like text in directory names cannot identify a shorter path.
-The connector's forwarded profile selector or process-list hint must match that
-independent service check before the host can register or receive input.
+Replies and results that arrive while no qualified connector is connected stay
+in Seeker. Restoring the connector reopens known-unsent retries, including work
+whose retry budget ended meanwhile. Accepted or uncertain notifications are
+never replayed.
 
 An unavailable host leaves replies in Seeker. When input might already have
-reached Codex after the one-call approval was written but its result was lost,
-delivery remains **unknown**. Seeker does not replay that input after helper or
+reached Codex because the request was written but its answer was lost, delivery
+remains **unknown**. Seeker does not replay that input after a connector or
 service restart. The receipt and manager's later acknowledgement remain
 available for reconciliation. Restarting Seeker does not create a replacement
 manager.
@@ -180,8 +138,8 @@ original scope and conditions before using `reconcile-input`.
 
 The initial native path is for a local macOS Codex Desktop host that provides
 native task tools and per-invocation MCP metadata. The connector checks those
-capabilities at startup. The helper's genuine CLI invokes the registered Desktop
-host's native tool; the target remains the Desktop task. A saved task record in a
+capabilities at startup and makes the native input call itself; the target is
+always the Desktop task. A saved task record in a
 different daemon or an ACP adapter that starts another server does not establish
 that return path. Requalify native behavior after host updates; the host
 integration interfaces are version-sensitive. The qualified layouts include the
@@ -217,7 +175,7 @@ service on loopback and keep connector credentials out of prompts and logs.
 | The task is denied | Verify the exact registered task ID. A lead should report to its manager. |
 | Native runtime is unavailable | Launch the connector through Desktop; do not replace its runtime with a PATH CLI or change host authentication. |
 | Replies are waiting | Start Seeker with the registered data directory and restore the native connector. |
-| Automatic Desktop recovery is unavailable | Check that the official `@openai/codex` npm CLI is available as `codex` on the Desktop connector's `PATH`. After an upgrade, repeat setup, reload the connector and use `pending` from the original manager once. Keep the registered application and profile available. |
+| Notifications stay pending after an upgrade | Reload the connector through Desktop's MCP settings so the current connector serves the service, then use `pending` from the original manager once. Keep the registered application and profile available. |
 | A different Desktop profile or incompatible interface is running | Restore the registered profile and a compatible native connector; saved replies remain available. |
 | Delivery is unknown | Read the retained exchange and native receipt before attempting another delivery. |
 | Setup reports conflicting settings | Preserve the existing configuration and reconcile the specifically named Seeker section. |
@@ -231,6 +189,6 @@ setup.
 
 The same connector exposes separate [machine event tools](events.md) to host-authenticated native task owners, including ordinary workers. These do not register workers as human-decision managers. Existing human conversation tools and native approval/filter choices retain their current gates; conversation-permission setup still concerns only its four human tools.
 
-Prepare a private per-wait producer file with `seeker event prepare`, pass only its digest/identity to `event_arm`, and let the existing job/dependency owner signal through `seeker event signal`. Each new owner turn, including another event wake, reconciles retained waits once and explicitly reanchors still-needed waiting/paused waits before ending again. Current human stops/instructions remain authoritative. Unavailable native metadata cannot authorize a send; retain the result and restore the original qualified connector instead of polling with models or replaying uncertain input.
+Prepare a private per-wait producer file with `seeker event prepare`, pass only its digest/identity to `event_arm`, and let the existing job/dependency owner signal through `seeker event signal`. The saved result reaches the task when it is saved, whatever turn the task is on by then; nothing needs reanchoring. Current human stops/instructions remain authoritative when the task reads the notice. Retain the result and restore the original qualified connector instead of polling with models or replaying uncertain input.
 
 For stable installed commands, managed startup and explicit relocation of existing state/configuration, see [installation and migration](installation.md).

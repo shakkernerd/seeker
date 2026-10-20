@@ -1,6 +1,6 @@
 # Install and manage Seeker
 
-Seeker uses one private home, `~/.seeker`. Its application is in `app/`, its qualified Bun runtime in `runtime/`, stable commands in `bin/`, and bounded operational logs in `logs/`. The database, credentials, native registrations and helper state remain at the home root. An application upgrade replaces only the owned application, runtime and launchers. Existing explicit `--data-dir` and `SEEKER_DATA_DIR` overrides still select a separate store; they are never silently merged.
+Seeker uses one private home, `~/.seeker`. Its application is in `app/`, its qualified Bun runtime in `runtime/`, stable commands in `bin/`, and bounded operational logs in `logs/`. The database, credentials and native registrations remain at the home root. An application upgrade replaces only the owned application, runtime and launchers. Existing explicit `--data-dir` and `SEEKER_DATA_DIR` overrides still select a separate store; they are never silently merged.
 
 ## Install an exact local package
 

@@ -1,5 +1,4 @@
 import { eventReturnCurrent } from "../../core/event-return.ts";
-import { eventAnchorState, parseNativeEventTurn } from "../codex/event-state.ts";
 import { isEventOperation, invokeEvent } from "../codex/event-tools.ts";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import type { DeliveryResult, HostAdapter, NativeEnvelope, NativeReturnTarget, ManagerBinding } from "../../contracts.ts";
@@ -247,12 +246,9 @@ export class CodexCliHost implements HostAdapter {
         if (!wait?.owner.turnId) return { status: "rejected", code: "event_owner_changed" };
         const turns = record(await rpc.request("thread/turns/list", { threadId: binding.origin.managerId, limit: 1, sortDirection: "desc", itemsView: "notLoaded" }, deadline, 1500));
         if (!Array.isArray(turns.data) || turns.data.length !== 1) return retry("event_native_state_unavailable");
-        const state = eventAnchorState(wait.owner.turnId, parseNativeEventTurn(binding.origin.managerId, turns.data[0]));
-        if (state === "active") return retry("event_owner_active");
-        if (state !== "ready") {
-          this.core.store.events.pause(envelope.event, envelope.event.version, state === "changed" ? "native_turn_changed" : "native_turn_stopped", this.core.clock());
-          return { status: "rejected", code: "event_reconciliation_required" };
-        }
+        // A turn still in progress keeps the result queued; a newer, interrupted or failed
+        // turn does not hold it: the task reads the notice under its current instructions.
+        if (record(turns.data[0]).status === "inProgress") return retry("event_owner_active");
         if (deadline.aborted || revision !== this.#ownerRevision || rpc !== this.#rpc || !this.#current(binding, envelope)) return retry("cli_delivery_cancelled");
       }
       requested = true;
