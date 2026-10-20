@@ -5,7 +5,7 @@ if (Bun.version !== runtimeVersion) throw new Error(`Build with qualified Bun ${
 
 rmSync("dist", { recursive: true, force: true });
 mkdirSync("dist", { recursive: true });
-const result = await Bun.build({ entrypoints: ["src/cli.ts", "src/index.ts"], outdir: "dist", target: "bun", packages: "external" });
+const result = await Bun.build({ entrypoints: ["src/cli.ts", "src/index.ts"], outdir: "dist", target: "bun", packages: "bundle" });
 if (!result.success) {
   for (const log of result.logs) console.error(log);
   process.exit(1);

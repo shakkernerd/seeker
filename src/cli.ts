@@ -1,4 +1,7 @@
 #!/usr/bin/env bun
+import { runInstallCommand } from "./cli/install.ts";
+import { managedLog } from "./install/service.ts";
+import { installHome, present } from "./install/layout.ts";
 import { runEventCommand } from "./cli/events.ts";
 import { join, resolve } from "node:path";
 import { SeekerCore } from "./core/seeker.ts";
@@ -19,6 +22,8 @@ const help = `Seeker ${version} — durable conversations with your agent manage
 
 Usage: seeker <command> [options]
 
+  install               Install/upgrade the single-home application or migrate state
+  service               Manage login startup, crash restart, status and logs
   start                 Start the authenticated local inbox
   demo                  Try the local channel with a labelled host fixture
   event                 Prepare a private wait capability or signal a background result
@@ -39,8 +44,16 @@ the access key from the named file. Demo uses a separate data directory.
 Pending exchanges survive shutdown. A fixture is not a real agent manager.
 `;
 
-async function main(): Promise<void> {
-  const args = process.argv.slice(2);
+async function main(args = process.argv.slice(2)): Promise<void> {
+  if (args[0] === "service" && args[1] === "run") {
+    if (args.length !== 4 || args[2] !== "--home") throw new SeekerError("invalid_option", "Managed service requires its installed home.");
+    const home = resolve(args[3] ?? installHome());
+    const log = managedLog(home);
+    console.log = (...values: unknown[]) => log(values.map(String).join(" "));
+    console.error = (...values: unknown[]) => log(values.map(String).join(" "));
+    return main(["start", "--data-dir", home, "--port", "4317"]);
+  }
+  if (args[0] === "install" || args[0] === "service") { await runInstallCommand(args[0], args.slice(1), resolve(import.meta.dir, "..")); return; }
   if (args[0] === "event") { await runEventCommand(args.slice(1)); return; }
   if (args[0] === "telegram") { await runTelegramCommand(args.slice(1)); return; }
   if (args[0] === "codex" || args[0] === "codex-cli") {
@@ -73,6 +86,7 @@ async function main(): Promise<void> {
   if (!Number.isSafeInteger(port) || port < 0 || port > 65535) throw new SeekerError("invalid_port", "Use a port from 1 to 65535 (0 selects a free local port).");
   if (Bun.version !== runtimeVersion) throw new SeekerError("runtime_version", `Use qualified Bun ${runtimeVersion}; current runtime is ${Bun.version}.`);
   dataDir = ensureDataDir(dataDir);
+  if (present(join(dataDir, ".installation-lock"))) throw new SeekerError("install_busy", "Finish installation or migration before opening the store.");
   const accessKey = loadAccessKey(dataDir);
   if (command === "access-key") { console.log(accessKey); return; }
   const store = new SqliteExchangeStore(join(dataDir, "exchanges.sqlite"));

@@ -1,3 +1,4 @@
+import { present } from "../install/layout.ts";
 import { join } from "node:path";
 import { readFileSync } from "node:fs";
 import type { Recipient } from "../contracts.ts";
@@ -36,6 +37,7 @@ export async function runCodexCommand(args: string[], options: CodexCommandOptio
   const permissions = input["--conversation-permissions"] ?? "preserve";
   if (!["preserve", "allow", "replace"].includes(permissions)) throw new ConnectorError("invalid_option", "Choose preserve, allow or replace for Seeker conversation permissions.");
   const dataDir = ensureDataDir(input["--data-dir"] ?? defaultDataDir());
+  if (present(join(dataDir, ".installation-lock"))) throw new ConnectorError("install_busy", "Finish installation or migration before native setup.");
   const port = Number(input["--port"] ?? process.env.SEEKER_PORT ?? 4317);
   if (!Number.isSafeInteger(port) || port < 0 || port > 65535) throw new ConnectorError("invalid_port", "Use a local inbox port from 0 to 65535.");
   const store = new SqliteExchangeStore(join(dataDir, "exchanges.sqlite"));
