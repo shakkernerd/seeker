@@ -1,5 +1,5 @@
-import { accessSync, constants } from "node:fs";
-import { isAbsolute } from "node:path";
+import { accessSync, constants, existsSync, readFileSync } from "node:fs";
+import { isAbsolute, join, resolve } from "node:path";
 import { ConnectorError } from "../codex/protocol.ts";
 
 const startMarker = "# Seeker native connector: begin";
@@ -131,4 +131,15 @@ export function installSection(current: string, launcher: string, configPath: st
   const result = begin < 0 ? `${current}${current && !current.endsWith("\n") ? "\n" : ""}${current ? "\n" : ""}${section}\n` : `${current.slice(0, begin)}${section}${current.slice(end + endMarker.length)}`;
   Bun.TOML.parse(result);
   return result;
+}
+
+/** Installed homes expose one stable connector address across application upgrades. */
+export function nativeLauncher(packageDirectory: string): string {
+  const packagePath = resolve(packageDirectory), identityPath = join(packagePath, "installation.json");
+  if (existsSync(identityPath)) {
+    const identity = JSON.parse(readFileSync(identityPath, "utf8"));
+    if (identity.version !== 1 || typeof identity.home !== "string" || join(identity.home, "app") !== packagePath) throw new ConnectorError("install_identity", "Reconcile the installed application identity before native setup.");
+    return join(identity.home, "bin/seeker-codex");
+  }
+  return join(packagePath, "bin/seeker-codex");
 }

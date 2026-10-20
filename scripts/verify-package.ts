@@ -186,6 +186,22 @@ if (seeker.version !== ${JSON.stringify(manifest.version)} || seeker.runtimeVers
 `);
   await run("Installed library import", [process.execPath, probe], consumer);
 
+  phase = "checking the permanent single-home installation";
+  const home = join(directory, "home");
+  await run("Single-home installation plan", [bin, "install", "--home", home, "--dry-run"], consumer);
+  check(!existsSync(home), "An installation dry-run created its home.");
+  await run("Single-home installation", [bin, "install", "--home", home], consumer, 20_000);
+  const stable = join(home, "bin/seeker");
+  const installedHelp = await run("Stable CLI from independent working directory", [stable, "--help"], directory);
+  check(installedHelp.stdout.includes("install") && installedHelp.stdout.includes("service"), "Stable CLI lacks its maintained installation commands.");
+  const marker = join(home, "retained-state"); writeFileSync(marker, "retain", { mode: 0o600 });
+  await run("Single-home explicit upgrade", [bin, "install", "--home", home], consumer, 20_000);
+  check(readFileSync(marker, "utf8") === "retain", "Application upgrade changed root state.");
+  const eventConfig = join(directory, "events.toml");
+  await run("Installed event-only setup", [stable, "install", "connect", "--config", eventConfig, "--home", home], directory);
+  const events = Bun.TOML.parse(readFileSync(eventConfig, "utf8")) as { mcp_servers: { seeker_events: { command: string; enabled_tools: string[] } } };
+  check(events.mcp_servers.seeker_events.command === join(realpathSync(home), "bin/seeker-codex") && events.mcp_servers.seeker_events.enabled_tools.every(tool => tool.startsWith("event_")) && !existsSync(join(home, "exchanges.sqlite")), "Event-only installation changed manager admission or used an unstable path.");
+
   phase = "checking installed native setup";
   const nativeProject = join(directory, "native-project"), nativeData = join(directory, "native-data");
   mkdirSync(nativeProject);

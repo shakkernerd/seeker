@@ -12,7 +12,7 @@ seeker start --data-dir /a/private/seeker-directory --port 4317
 
 `start` creates an empty local inbox. Trusted host setup must bind a manager before that manager can submit. `demo` seeds one labelled controlled exchange and supplies a deterministic explanation/receipt handler; it is not native agent proof.
 
-Flags override `SEEKER_DATA_DIR` and `SEEKER_PORT`, then defaults. Normal data lives in `~/.local/share/seeker`; demo data lives in `~/.local/share/seeker-demo`. An explicit data directory applies to either command. Port 4317 is the default; port 0 selects a free local port.
+Flags override `SEEKER_DATA_DIR` and `SEEKER_PORT`, then defaults. Normal data lives in `~/.seeker`; demo data lives in `~/.local/share/seeker-demo`. An explicit data directory applies to either command. Port 4317 is the default; port 0 selects a free local port.
 
 The listener is fixed to `127.0.0.1`. Remote binding, reverse-proxy deployment, multi-host failover, and public exposure are outside this version's setup. The terminal prints the local address and key-file path without printing the key itself.
 
@@ -56,3 +56,5 @@ Each exchange admits at most 32 decision revisions, 128 replies, 128 contextual 
 If one exchange fills, authenticated incoming text and conditions are saved as deferred input for its original manager, without applying a decision. Other exchanges and receiver progress continue. The UI distinguishes this state, and the manager explicitly reconciles the saved input against existing work. The pending deferred-input queue is bounded at 1,000; handled input remains retained history. A global storage/queue failure does not acknowledge an input batch. Use the original manager conversation while intake is unavailable; do not delete open exchanges to clear a warning.
 
 For an occupied port, choose another port. For `store_in_use`, stop the existing owner instead of opening another writer. For an unsafe directory/key error, repair the stated ownership/permissions while Seeker is stopped. Logs contain operational status, not message text, keys, or raw provider URLs.
+
+For stable installed commands, managed startup and explicit relocation of existing state/configuration, see [installation and migration](installation.md).

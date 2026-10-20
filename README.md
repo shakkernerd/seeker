@@ -43,3 +43,5 @@ The local channel is available immediately. [Codex Desktop setup](docs/codex.md)
 Seeker runs as one Bun service with one local SQLite store. It listens on loopback and uses grammY for its optional Telegram adapter. Desktop delivery supervises a bounded native Codex notification helper; existing managers continue to own project work and its permissions.
 
 MIT licensed.
+
+Install a built local package into one private `~/.seeker` home using the [installation and migration guide](docs/installation.md). Stable commands, explicit upgrades, native event setup and macOS login/crash supervision preserve the existing store and registrations.

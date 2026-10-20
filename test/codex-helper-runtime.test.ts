@@ -7,7 +7,7 @@ import { HelperRpcError, type HelperConnection, type HelperEvents } from "../src
 import { NativeDesktopHelper, type ConnectHelper } from "../src/hosts/codex/helper-runtime.ts";
 
 type ObjectValue = Record<string, unknown>;
-interface State { version: 1; threadId: string; turns: number }
+interface State { version: 1; threadId: string; turns: number; previousWorkspace?: string }
 interface Call { connection: number; method: string; params: ObjectValue }
 interface NativePlan {
   servers?: ObjectValue;
@@ -288,4 +288,16 @@ test("a cancelled opening retains its exact connection after failed cleanup", as
   await f.prepare();
   expect(closes).toBe(4); expect(f.connections).toHaveLength(2);
   expect(f.order.indexOf("0:closed")).toBeLessThan(f.order.indexOf("1:initialize"));
+});
+
+test("explicit relocated helper retires only the same saved root in its previous workspace", async () => {
+  const previousWorkspace = "/private/previous/codex-helper";
+  const f = fixture([{ savedThread: { cwd: previousWorkspace } }], { version: 1, threadId: "owned-helper", turns: 1, previousWorkspace });
+  const prepared = await f.prepare();
+  expect(requests(f.calls, "thread/delete").map(call => call.params)).toEqual([{ threadId: "owned-helper" }]);
+  expect(f.state()).toEqual({ version: 1, threadId: prepared.threadId, turns: 0 });
+  const denied = fixture([{ savedThread: { id: "unrelated", cwd: previousWorkspace } }], { version: 1, threadId: "owned-helper", turns: 1, previousWorkspace });
+  await expect(denied.prepare()).rejects.toThrow("not this service's owned helper");
+  expect(requests(denied.calls, "thread/delete")).toHaveLength(0);
+
 });

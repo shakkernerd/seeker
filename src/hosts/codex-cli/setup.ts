@@ -8,7 +8,7 @@ import { ensureDataDir } from "../../local/config.ts";
 import { privateDirectory, readConnectorCredential } from "../codex/config.ts";
 import { ConnectorError } from "../codex/protocol.ts";
 import type { CodexSetupOptions } from "../codex/setup.ts";
-import { installSection, type ConversationPermissions } from "../codex-common/install.ts";
+import { installSection, nativeLauncher, type ConversationPermissions } from "../codex-common/install.ts";
 import { listenPrivate } from "../codex-common/listener.ts";
 import { cliConfigPath, cliHostId, readCliConfig } from "./config.ts";
 import { CodexCliHost } from "./host.ts";
@@ -19,7 +19,7 @@ export function setupCodexCli(options: CodexSetupOptions & { conversationPermiss
   const root = privateDirectory(ensureDataDir(options.dataDir)), directory = privateDirectory(ensureDataDir(join(root, "cli")));
   const socketPath = join(directory, "codex.sock"), credentialFile = join(directory, "codex.key"), configPath = cliConfigPath(root);
   if (Buffer.byteLength(socketPath) > 103) throw new ConnectorError("socket_path_too_long", "Choose a shorter Seeker data directory.");
-  const project = realpathSync(options.projectDirectory), launcher = join(resolve(options.packageDirectory), "bin", "seeker-codex");
+  const project = realpathSync(options.projectDirectory), launcher = nativeLauncher(options.packageDirectory);
   if (!lstatSync(project).isDirectory()) throw new ConnectorError("invalid_project", "Choose the existing manager's project directory.");
   if (!existsSync(launcher) || !existsSync(join(options.packageDirectory, "dist", "codex-connector.mjs"))) throw new ConnectorError("package_incomplete", "Build or install Seeker before setup.");
   const projectDirectory = join(project, ".codex"), projectConfigPath = join(projectDirectory, "config.toml");

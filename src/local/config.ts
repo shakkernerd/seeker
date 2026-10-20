@@ -8,7 +8,7 @@ export const version = "0.1.0";
 export const runtimeVersion = "1.4.2";
 
 export function defaultDataDir(fixture = false): string {
-  return resolve(process.env.SEEKER_DATA_DIR ?? join(homedir(), ".local", "share", fixture ? "seeker-demo" : "seeker"));
+  return resolve(process.env.SEEKER_DATA_DIR ?? (fixture ? join(homedir(), ".local", "share", "seeker-demo") : join(homedir(), ".seeker")));
 }
 
 export function ensureDataDir(directory: string): string {
