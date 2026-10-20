@@ -26,7 +26,7 @@ export async function listenHelperBridge(dataDir: string, owner: DesktopOwner, p
   const endpoint = { socketPath: join(directory, `.h${randomBytes(4).toString("hex")}`), credential: randomBytes(32).toString("hex") };
   const sockets = new Set<Socket>(), settling = new Set<Promise<void>>();
   const sessions = new Map<Socket, () => Promise<void>>();
-  let cleanupError: unknown;
+  const cleanupErrors = new Map<Socket, unknown>();
   let active = false, closed = false, readers = 0;
   const native = new CodexNativeClient(pipePath);
   const readState = readEvent ?? ((origin: NativeInvocation, signal: AbortSignal) => native.eventState(origin, signal));
@@ -34,7 +34,7 @@ export async function listenHelperBridge(dataDir: string, owner: DesktopOwner, p
     sockets.add(socket);
     let rpc: HelperConnection | undefined, buffer = "", authenticated = false, stopping = false;
     let helperId: string | undefined, helperTurn: string | undefined;
-    let closing: Promise<void> | undefined, reading: Promise<void> | undefined;
+    let closing: Promise<void> | undefined, reading: Promise<void> | undefined, retirement: Promise<void> | undefined;
     const readAbort = new AbortController();
     const timer = setTimeout(() => socket.destroy(), 2_000); timer.unref();
     const write = (value: unknown) => {
@@ -45,27 +45,37 @@ export async function listenHelperBridge(dataDir: string, owner: DesktopOwner, p
     const settle = (): Promise<void> => {
       if (closing) return closing;
       stopping = true; clearTimeout(timer); readAbort.abort();
-      const owned = rpc; rpc = undefined;
+      const owned = rpc;
       const pending = (async () => {
         await reading?.catch(() => {});
-        let retirementError: unknown;
-        try {
+        // Archive at most once. A failed archive is never repaired by merely
+        // observing child exit or by rechecking this session's close result.
+        retirement ??= (async () => {
           if (owned && helperId && helperTurn) {
             if (!owned.connected) throw unavailable();
             await retire(owned, helperId, helperTurn);
           }
-        } catch (error) { retirementError = error; }
+        })();
+        let retirementError: unknown;
+        try { await retirement; } catch (error) { retirementError = error; }
         await owned?.close();
         if (retirementError) throw retirementError;
-        if (owned) active = false;
+        if (owned) { active = false; rpc = undefined; }
+        cleanupErrors.delete(socket);
         if (!socket.destroyed && !socket.writableEnded) { write({ method: "seeker/settled", params: true }); socket.end(); }
       })();
       closing = pending; settling.add(pending);
-      void pending.finally(() => settling.delete(pending)).catch((error) => { cleanupError ??= error; socket.destroy(); });
+      void pending.finally(() => settling.delete(pending)).catch((error) => {
+        cleanupErrors.set(socket, error);
+        if (closing === pending) closing = undefined;
+        // Keep the original teardown available for an explicit same-connection
+        // recheck. No normal RPC or replacement helper is admitted meanwhile.
+        if (!socket.destroyed && !socket.writableEnded) write({ method: "seeker/settled", params: false });
+      });
       return pending;
     };
     sessions.set(socket, settle);
-    const close = () => { sockets.delete(socket); sessions.delete(socket); void settle().catch(() => {}); };
+    const close = () => { sockets.delete(socket); void settle().then(() => sessions.delete(socket), () => {}); };
     socket.setEncoding("utf8"); socket.on("error", () => socket.destroy()); socket.once("close", close); socket.once("end", () => { void settle().catch(() => {}); });
     socket.on("data", (chunk: string) => {
       buffer += chunk;
@@ -74,8 +84,12 @@ export async function listenHelperBridge(dataDir: string, owner: DesktopOwner, p
         if (end < 0) { if (Buffer.byteLength(buffer) > maxWireBytes) socket.destroy(); return; }
         const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
         try {
-          if (closed || stopping || Buffer.byteLength(line) > maxWireBytes) throw unavailable();
+          if (closed || Buffer.byteLength(line) > maxWireBytes) throw unavailable();
           const message = record(JSON.parse(line));
+          if (stopping) {
+            if (authenticated && message.method === "seeker/close") { void settle().catch(() => {}); continue; }
+            throw unavailable();
+          }
           if (!authenticated) {
             onlyKeys(message, ["credential", "eventOrigin"]);
             if (message.credential !== endpoint.credential) throw unavailable();
@@ -153,6 +167,9 @@ export async function listenHelperBridge(dataDir: string, owner: DesktopOwner, p
     // End each authenticated connection through its settlement path, not a raw
     // socket destroy that could let the service reuse a still-running helper.
     const results = await Promise.allSettled([...sessions.values()].map((settle) => settle()));
+    // An explicit connector shutdown cannot keep failed observation sockets
+    // open indefinitely. Failure remains reported; disconnect is not settlement.
+    for (const socket of sockets) socket.destroy();
     let bound: ReturnType<typeof lstatSync> | undefined;
     try { bound = lstatSync(staging); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     if (!bound || bound.dev !== inode.dev || bound.ino !== inode.ino) {
@@ -161,12 +178,13 @@ export async function listenHelperBridge(dataDir: string, owner: DesktopOwner, p
     }
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await Promise.allSettled([...settling]);
-    for (const result of results) if (result.status === "rejected") cleanupError ??= result.reason;
+    const failure = results.find((result) => result.status === "rejected");
     try {
       const current = lstatSync(endpoint.socketPath);
       if (current.dev === inode.dev && current.ino === inode.ino) unlinkSync(endpoint.socketPath);
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-    if (cleanupError) throw cleanupError;
+    if (failure?.status === "rejected") throw failure.reason;
+    if (cleanupErrors.size) throw cleanupErrors.values().next().value;
   })() };
 }
 

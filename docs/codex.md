@@ -131,10 +131,12 @@ While a finished helper is retiring, another notification reports
 `desktop_helper_cleanup_failed` and keeps that helper quarantined. Genuine
 connector restoration rechecks the retained connection; it does not release the
 helper merely because a connector is available. Only confirmed cleanup allows
-another preparation. The production transport retains a rejected close result:
-a failed close or lost settlement acknowledgment stays quarantined pending
-reconciliation. Reconnecting alone cannot recover it. Accepted or uncertain
-notifications are never replayed.
+another preparation. A timed-out close keeps the original socket available only
+for settlement: a late acknowledgment can establish that the child stopped.
+Restoration can also recheck the same teardown without starting another child or
+repeating archival. Failed archival, a still-live child, or a disconnected socket
+without affirmative settlement remains quarantined for reconciliation. Accepted
+or uncertain notifications are never replayed.
 
 Background input requires a qualified Seeker MCP connector in the registered
 Desktop application; it need not be receiving tools in the target task. The
