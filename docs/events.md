@@ -47,7 +47,11 @@ A newer native turn or interrupted wait pauses automatic return and retains the 
 
 ## Lifetime and limits
 
-Every wait has a caller-explicit expiry. Expired waits cannot start a new send. Results, cancelled/expired records and uncertain delivery evidence remain retained until the owner explicitly clears them. There is no automatic age-based deletion and no invented maximum wait duration.
+Every wait has a caller-explicit expiry. If an uncancelled wait reaches that deadline without a producer result, the service atomically saves one failure receipt (`source: "deadline"`, `signal.outcome: "failed"`) and its native return intent. This means the wait failed to obtain a result; **job completion remains unknown**. The notice does not restart the job or establish success. A late producer signal is rejected and cannot replace the deadline receipt.
+
+The existing native checks still apply to this notice: an active owner waits until its turn ends, a stopped or newer owner turn pauses return until explicit reconciliation, and cancellation prevents new delivery. A wait already paused when its deadline passes retains the failure receipt without sending until the owner explicitly resumes it. The deadline receipt can be retrieved, acknowledged and cleared through the ordinary event tools. Its notification may occur after the original expiry, but accepted and uncertain sends are never replayed.
+
+If a producer result was already saved before the deadline, expiry continues to retire any known-unsent notification while retaining that result. Previously closed waits remain closed. Results, cancelled/expired records and uncertain delivery evidence remain retained until the owner explicitly clears them. There is no automatic age-based deletion and no invented maximum wait duration.
 
 The service admits at most 128 retained waits per native task and 4096 across the store. Each result is limited to 16 KiB, including its bounded summary and evidence references. Capacity rejection never evicts existing results. `event_pending` returns bounded summaries; `event_get` returns one complete result.
 

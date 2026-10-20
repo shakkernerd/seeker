@@ -24,6 +24,8 @@ export interface EventSignal extends EventAddress {
 }
 export interface EventReceipt {
   id: string;
+  /** Set only by the service when no producer result arrived before expiry. */
+  source?: "deadline";
   signal: EventSignal;
   recordedAt: number;
   disposition: "pending" | "received" | "handled" | "unknown";

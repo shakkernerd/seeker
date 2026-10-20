@@ -72,6 +72,72 @@ test("cancellation, explicit expiry and stale versions revoke known-unsent work 
   expect(() => f.store.events.signal(capability, signal, 1001)).toThrow("no longer accepts");
 });
 
+test("a missed deadline saves one truthful failure, rejects late producers and survives restart without replay", () => {
+  for (const outcome of ["accepted", "unknown", "interrupted"] as const) {
+    const f = fixture(true); f.port().arm(arm); f.restart(); f.setTime(arm.expiresAt);
+    // A late signal can itself discover the deadline; rejection still commits its notice.
+    expect(() => f.store.events.signal(capability, signal, arm.expiresAt)).toThrow("deadline passed");
+    const saved = f.port().get(address);
+    expect(saved.state).toBe("ready"); expect(saved.reason).toBe("deadline_passed");
+    expect(saved.receipt).toMatchObject({ source: "deadline", disposition: "pending", recordedAt: arm.expiresAt,
+      signal: { ...address, outcome: "failed", evidenceRefs: [] } });
+    expect(saved.receipt!.signal.summary).toContain("Job completion is unknown");
+    expect(f.port().arm(arm)).toEqual(saved);
+    f.restart();
+    let attempt = f.store.events.claim(1, arm.expiresAt, [])[0]!;
+    expect(attempt.receipt).toEqual(saved.receipt);
+    expect(eventReturnCurrent(f.core, eventReturnTarget(attempt), eventEnvelope(attempt))).toBe(true);
+    f.store.events.complete(address.waitId, address.generation, attempt.delivery!.attemptId!, { status: "retry", code: "event_owner_active", retryAfterMs: 1000 }, arm.expiresAt);
+    expect(f.store.events.claim(1, arm.expiresAt + 999, [])).toEqual([]);
+    attempt = f.store.events.claim(1, arm.expiresAt + 1000, [])[0]!;
+    expect(attempt.delivery!.id).toBe(saved.delivery!.id);
+    if (outcome !== "interrupted") f.store.events.complete(address.waitId, address.generation, attempt.delivery!.attemptId!, outcome === "accepted" ? { status: "accepted", reference: "native:deadline" } : { status: "unknown", code: "io_timeout" }, arm.expiresAt + 1000);
+    f.restart(); expect(f.store.events.recover(arm.expiresAt + 1001)).toBe(outcome === "interrupted" ? 1 : 0);
+    expect(f.store.events.claim(1, arm.expiresAt + 2000, [])).toEqual([]);
+    expect(f.store.events.resumeHost(owner.hostId, arm.expiresAt + 2000)).toBe(0);
+    let current = f.port().get(address);
+    current = f.port().resume(address, current.version);
+    expect(current.receipt).toEqual(saved.receipt);
+    expect(current.delivery!.state).toBe(outcome === "accepted" ? "accepted" : "unknown");
+    expect(f.store.events.claim(1, arm.expiresAt + 3000, [])).toEqual([]);
+    current = f.port().acknowledge(address, current.version, current.receipt!.id, "handled");
+    expect(f.port().clear(address, current.version).state).toBe("cleared");
+  }
+});
+
+test("deadline discovery respects cancellation and paused ownership, and the pump creates a receipt without a reader", () => {
+  const f = fixture(); f.port().arm(arm); f.port().cancel(address, 1);
+  const paused = { ...arm, waitId: "paused-deadline" };
+  const due = { ...arm, waitId: "pump-deadline" };
+  f.port().arm(paused); f.store.events.pause(paused, 1, "native_turn_stopped", 1001); f.port().arm(due);
+  f.setTime(arm.expiresAt);
+  const claims = f.store.events.claim(4, arm.expiresAt, []);
+  expect(claims).toHaveLength(1); expect(claims[0]!.waitId).toBe(due.waitId);
+  expect(claims[0]!.receipt!.source).toBe("deadline");
+  expect(f.port().get(address).receipt).toBeUndefined();
+  let saved = f.port().get(paused);
+  expect(saved.state).toBe("paused"); expect(saved.reason).toBe("native_turn_stopped");
+  expect(saved.delivery!.state).toBe("retired"); expect(saved.receipt!.source).toBe("deadline");
+  const fresh = f.core.events({ ...owner, turnId: "new-turn", callId: "new-call" });
+  saved = fresh.resume(paused, saved.version);
+  const resumed = f.store.events.claim(1, arm.expiresAt + 1, [])[0]!;
+  expect(resumed.waitId).toBe(paused.waitId); expect(resumed.owner.turnId).toBe("new-turn");
+  expect(resumed.receipt!.id).toBe(saved.receipt!.id);
+  saved = fresh.cancel(paused, saved.version);
+  expect(eventReturnCurrent(f.core, eventReturnTarget(resumed), eventEnvelope(resumed))).toBe(false);
+  expect(saved.receipt!.source).toBe("deadline");
+});
+
+test("retained deadline notices do not starve later deadlines at the bounded expiry scan", () => {
+  const f = fixture();
+  for (let i = 0; i < 128; i++) f.port().arm({ ...arm, waitId: `deadline-${i}` });
+  f.store.events.claim(1, arm.expiresAt, []);
+  const other = f.core.events({ ...owner, taskId: "other-owner" });
+  other.arm({ ...arm, waitId: "later-deadline", expiresAt: arm.expiresAt + 1 });
+  const claims = f.store.events.claim(4, arm.expiresAt + 1, []);
+  expect(claims.find((wait) => wait.waitId === "later-deadline")?.receipt?.source).toBe("deadline");
+});
+
 test("restarts retain waits and unknown sends; exact late acceptance refines only its own timed-out attempt", () => {
   const f = fixture(true); f.port().arm(arm); f.restart();
   f.store.events.signal(capability, signal, 1000);

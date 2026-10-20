@@ -78,11 +78,13 @@ export class SqliteEventStore implements EventStore {
   signal(capability: string, raw: EventSignal, now: number): { status: "recorded" | "duplicate"; receiptId: string } {
     const input = eventSignal(raw);
     if (typeof capability !== "string" || !/^[a-f0-9]{64}$/.test(capability)) fail("event_unauthorized", "The event capability was not accepted.", 401);
-    return this.db.transaction(() => {
+    const result = this.db.transaction(() => {
       const wait = this.#find(input.waitId);
       const digest = eventDigest(capability);
       if (!wait?.capabilityDigest || !timingSafeEqual(Buffer.from(digest), Buffer.from(wait.capabilityDigest))) fail("event_unauthorized", "The event capability was not accepted.", 401);
       this.#address(wait, input); this.#expire(wait, now);
+      // Commit the deadline receipt even when this late producer is rejected.
+      if (wait.receipt?.source === "deadline") return undefined;
       const fingerprint = eventFingerprint(input);
       if (wait.receipt) {
         if (wait.signalFingerprint !== fingerprint) fail("event_conflict", "This wait already has a different saved event.", 409);
@@ -96,6 +98,8 @@ export class SqliteEventStore implements EventStore {
       wait.version += 1; wait.updatedAt = now; this.#save(wait);
       return { status: "recorded" as const, receiptId: wait.receipt.id };
     }).immediate();
+    if (!result) fail("event_closed", "The deadline passed without a producer result. This wait no longer accepts a signal.", 409);
+    return result;
   }
 
   claim(limit: number, now: number, excludedRoutes: readonly string[]): EventWait[] {
@@ -103,7 +107,7 @@ export class SqliteEventStore implements EventStore {
     return this.db.transaction(() => {
       const claimed: EventWait[] = [], excluded = new Set(excludedRoutes);
       // Expiration and queue selection stay bounded even with thousands of retained results.
-      const expired = this.db.query<Row, [number, number]>("SELECT data FROM event_waits WHERE state IN ('waiting','ready','paused') AND next_at<=? AND json_extract(data,'$.expiresAt')<=? LIMIT 128").all(now, now);
+      const expired = this.db.query<Row, [number, number]>("SELECT data FROM event_waits WHERE state IN ('waiting','ready','paused') AND next_at<=? AND json_extract(data,'$.expiresAt')<=? AND json_extract(data,'$.receipt.source') IS NOT 'deadline' LIMIT 128").all(now, now);
       for (const row of expired) this.#expire(decode(row), now);
       while (claimed.length < limit) {
         const routes = [...excluded];
@@ -173,6 +177,24 @@ export class SqliteEventStore implements EventStore {
   #address(wait: EventWait, raw: EventAddress): void { const address = eventAddress(raw); if (wait.generation !== address.generation || wait.revision !== address.revision) fail("event_generation", "The event generation or source revision changed.", 409); }
   #renew(wait: StoredEventWait, now: number): void { wait.delivery = { id: randomUUID(), state: "queued", attempts: 0, nextAt: now }; }
   #retire(wait: StoredEventWait): void { if (wait.delivery && ["queued", "retry", "rejected"].includes(wait.delivery.state)) wait.delivery.state = "retired"; }
-  #expire(wait: StoredEventWait, now: number): void { if (!terminal(wait) && (wait.expiresAt === undefined || wait.expiresAt <= now)) { wait.state = "expired"; wait.reason = "deadline_passed"; this.#retire(wait); wait.version += 1; wait.updatedAt = now; this.#save(wait); } }
-  #save(wait: StoredEventWait): void { const next = wait.state === "ready" && wait.delivery && ["queued", "retry"].includes(wait.delivery.state) ? Math.min(wait.expiresAt ?? 0, wait.delivery.nextAt) : wait.expiresAt ?? 0; this.db.query("UPDATE event_waits SET state=?,next_at=?,data=? WHERE id=?").run(wait.state, next, JSON.stringify(wait), wait.waitId); }
+  #expire(wait: StoredEventWait, now: number): void {
+    if (terminal(wait) || wait.receipt?.source === "deadline" || (wait.expiresAt !== undefined && wait.expiresAt > now)) return;
+    if (!wait.receipt && wait.expiresAt !== undefined) {
+      wait.receipt = {
+        id: randomUUID(), source: "deadline", recordedAt: now, disposition: "pending",
+        signal: { ...eventAddress(wait), eventId: randomUUID(), outcome: "failed", evidenceRefs: [],
+          summary: "The wait deadline passed without a producer result. Job completion is unknown. Reconcile the existing job and retained evidence before continuing; this notice does not restart it." },
+      };
+      if (wait.state !== "paused") { wait.state = "ready"; wait.reason = "deadline_passed"; }
+      wait.delivery = { id: randomUUID(), state: wait.state === "paused" ? "retired" : "queued", attempts: 0, nextAt: now };
+    } else {
+      wait.state = "expired"; wait.reason = "deadline_passed"; this.#retire(wait);
+    }
+    wait.version += 1; wait.updatedAt = now; this.#save(wait);
+  }
+  #save(wait: StoredEventWait): void {
+    const queued = wait.state === "ready" && wait.delivery && ["queued", "retry"].includes(wait.delivery.state);
+    const next = queued ? wait.receipt?.source === "deadline" ? wait.delivery!.nextAt : Math.min(wait.expiresAt ?? 0, wait.delivery!.nextAt) : wait.expiresAt ?? 0;
+    this.db.query("UPDATE event_waits SET state=?,next_at=?,data=? WHERE id=?").run(wait.state, next, JSON.stringify(wait), wait.waitId);
+  }
 }
