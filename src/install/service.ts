@@ -18,7 +18,7 @@ export function servicePlist(home: string, path: string): string {
 </dict></plist>\n`;
 }
 function launchctl(args: string[], allowMissing = false): string {
-  const result = Bun.spawnSync(["/bin/launchctl", ...args], { stdout: "pipe", stderr: "pipe", timeout: 10_000 });
+  const result = Bun.spawnSync(["/bin/launchctl", ...args], { stdout: "pipe", stderr: "pipe", timeout: args[0] === "kickstart" ? 20_000 : 10_000 });
   if (result.exitCode !== 0 && !allowMissing) fail("service_operation", "launchctl could not complete the operation. Check service status in this user's login session.");
   return result.exitCode === 0 ? result.stdout.toString() : "";
 }
