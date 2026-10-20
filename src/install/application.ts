@@ -23,7 +23,7 @@ export function verifyInstallation(home: string): Installation {
   return identity;
 }
 function launcher(home: string): string {
-  return `#!/bin/sh\nset -eu\nexport SEEKER_DATA_DIR=\${SEEKER_DATA_DIR:-${quote(home)}}\nexec ${quote(join(home, "runtime/bun"))} ${quote(join(home, "app/dist/cli.js"))} "$@"\n`;
+  return `#!/bin/sh\nset -eu\ncase "\${1:-}" in\n  demo) ;;\n  *) export SEEKER_DATA_DIR=\${SEEKER_DATA_DIR:-${quote(home)}} ;;\nesac\nexec ${quote(join(home, "runtime/bun"))} ${quote(join(home, "app/dist/cli.js"))} "$@"\n`;
 }
 function connector(home: string): string {
   // Keep exec ancestry: the package launcher chooses Codex's supplied runtime.

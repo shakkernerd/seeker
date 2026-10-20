@@ -32,9 +32,9 @@ function budget(maximum: number): number {
   return Math.min(maximum, remaining);
 }
 
-function launch(command: string[], cwd: string, maximum = 10_000): Running {
+function launch(command: string[], cwd: string, maximum = 10_000, overrides: NodeJS.ProcessEnv = {}): Running {
   const child = Bun.spawn(command, {
-    cwd, env: environment, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+    cwd, env: { ...environment, ...overrides }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
     timeout: budget(maximum), killSignal: "SIGKILL", maxBuffer: 1_048_576,
   });
   const output = { stdout: "", stderr: "", readFailed: false };
@@ -194,6 +194,11 @@ if (seeker.version !== ${JSON.stringify(manifest.version)} || seeker.runtimeVers
   const stable = join(home, "bin/seeker");
   const installedHelp = await run("Stable CLI from independent working directory", [stable, "--help"], directory);
   check(installedHelp.stdout.includes("install") && installedHelp.stdout.includes("service"), "Stable CLI lacks its maintained installation commands.");
+  const demoUser = join(directory, "demo-user"); mkdirSync(demoUser);
+  const stableDemo = launch([stable, "demo", "--port", "0"], directory, 20_000, { HOME: demoUser, SEEKER_DATA_DIR: undefined });
+  await until("Stable demo startup", async () => stableDemo.output.stdout.includes("Open http://127.0.0.1:"), Boolean);
+  check(existsSync(join(demoUser, ".local/share/seeker-demo/exchanges.sqlite")) && !existsSync(join(home, "exchanges.sqlite")), "Stable demo selected the production installation store.");
+  await stop(stableDemo, true);
   const marker = join(home, "retained-state"); writeFileSync(marker, "retain", { mode: 0o600 });
   await run("Single-home explicit upgrade", [bin, "install", "--home", home], consumer, 20_000);
   check(readFileSync(marker, "utf8") === "retain", "Application upgrade changed root state.");
