@@ -418,3 +418,17 @@ test("CLI worker event admission delivers a saved result whatever turn the task 
   f.store.events.complete(address.waitId, address.generation, claimed.delivery!.attemptId!, result, Date.now());
   expect(f.store.events.claim(1, Date.now(), [])).toEqual([]);
 });
+
+test("the CLI host reads a watched task's latest turn through its app-server, and reports unavailable while disconnected", async () => {
+  const f = fixture(), value = reply(f);
+  await expect(f.host.threadState({ hostId: cliHostId, taskId: managerId }, "lead-task", new AbortController().signal)).rejects.toMatchObject({ code: "cli_unavailable" });
+  await prepare(f, value);
+  f.behavior.request = async (call) => call.method === "thread/turns/list" ? { data: [{ id: "lead-turn", status: "interrupted", items: [{ text: "Untrusted" }] }] } : f.defaultResponse(call);
+  const state = await f.host.threadState({ hostId: cliHostId, taskId: managerId }, "lead-task", new AbortController().signal);
+  expect(state).toEqual({ taskId: "lead-task", turnId: "lead-turn", status: "interrupted" });
+  const call = f.calls.filter((item) => item.method === "thread/turns/list").at(-1)!;
+  expect(call.params).toEqual({ threadId: "lead-task", limit: 1, sortDirection: "desc", itemsView: "notLoaded" });
+  f.behavior.request = async (call) => call.method === "thread/turns/list" ? { data: [] } : f.defaultResponse(call);
+  await expect(f.host.threadState({ hostId: cliHostId, taskId: managerId }, "lead-task", new AbortController().signal)).rejects.toMatchObject({ code: "cli_thread_state_unavailable" });
+  await expect(f.host.threadState({ hostId: "codex-desktop", taskId: managerId }, "lead-task", new AbortController().signal)).rejects.toMatchObject({ code: "origin_denied" });
+});

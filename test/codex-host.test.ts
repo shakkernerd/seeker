@@ -57,6 +57,23 @@ describe("native sending", () => {
   });
 });
 
+describe("thread watches", () => {
+  test("a task arms a watch on another task through the shared connection and the host reads it only through a current bridge", async () => {
+    const lifecycle: CodexHostLifecycle = { connected: async () => {}, admitted: async () => {}, ready: () => {} };
+    const f = fixture(Date.now, lifecycle), session = await f.connect("qualified");
+    const watch = { waitId: "watch-lead", generation: "g", revision: "lead-rev", title: "Lead", expiresAt: Date.now() + 60_000, threadId: "lead-one" };
+    const armed = await f.invoke(session, "manager-one", "event_watch", watch);
+    expect(armed.status).toBe(200);
+    expect(await armed.json()).toMatchObject({ waitId: "watch-lead", state: "waiting", watch: { threadId: "lead-one" } });
+    expect((await f.invoke(session, "manager-one", "event_watch", { ...watch, threadId: "manager-one" })).status).toBe(400);
+    expect((await f.invoke(session, "manager-one", "event_watch", { ...watch, capabilityDigest: "a".repeat(64) })).status).toBe(400);
+    expect(f.store.events.watching(Date.now(), 8).map((wait) => wait.waitId)).toEqual(["watch-lead"]);
+    const read = () => f.host.threadState({ hostId: "codex-test", taskId: "manager-one", turnId: "native-turn" }, "lead-one", new AbortController().signal);
+    await expect(read()).rejects.toMatchObject({ code: "desktop_connector_unavailable" });
+    await expect(f.host.threadState({ hostId: "other-host", taskId: "manager-one" }, "lead-one", new AbortController().signal)).rejects.toMatchObject({ code: "origin_denied" });
+  });
+});
+
 describe("native caller admission", () => {
   test("the shared host connection admits exact managers and denies workers and forged tool fields", async () => {
     const f = fixture();

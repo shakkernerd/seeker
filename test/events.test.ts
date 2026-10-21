@@ -238,3 +238,43 @@ test("the existing version-six store upgrades atomically without replacing human
   expect(upgraded.get("retained-human-request")?.exchange.revisions[0]?.decision).toEqual(fixtureDecision);
   expect(new SeekerCore(upgraded, () => 1000).events(owner).arm(arm).state).toBe("waiting");
 });
+
+test("a watch is a wait Seeker itself settles: one observation of a failed or interrupted turn, quiet expiry, no producer signal", () => {
+  const f = fixture(); f.setTime(1000);
+  const watch = { waitId: "watch-lead", generation: "g-one", revision: "lead-one", title: "Lead one", expiresAt: 5000, threadId: "lead-task" };
+  expect(() => f.port().watch({ ...watch, threadId: owner.taskId })).toThrow("cannot watch itself");
+  const armed = f.port().watch(watch);
+  expect(armed).toMatchObject({ state: "waiting", watch: { threadId: "lead-task" }, title: "Lead one" });
+  expect(f.port().watch(watch).version).toBe(1);
+  expect(() => f.port().watch({ ...watch, title: "renamed" })).toThrow("different content");
+  expect(f.port().pending()[0]).toMatchObject({ waitId: "watch-lead", watch: { threadId: "lead-task" } });
+  expect(f.store.events.watching(1001, 8).map((wait) => wait.waitId)).toEqual(["watch-lead"]);
+  // A producer cannot signal a watch: it has no capability.
+  expect(() => f.store.events.signal(capability, { waitId: watch.waitId, generation: watch.generation, revision: watch.revision, eventId: "e", outcome: "completed", summary: "s", evidenceRefs: [] }, 1002)).toThrow("not accepted");
+  // Only failed or interrupted turns are observations, and an observation settles the watch.
+  expect(() => f.store.events.observe(watch, { turnId: "t1", status: "completed" as never }, 1003)).toThrow("failed or interrupted");
+  const observed = f.store.events.observe(watch, { turnId: "lead-turn-3", status: "interrupted" }, 1003)!;
+  expect(observed.state).toBe("ready"); expect(observed.receipt).toMatchObject({ source: "watch", disposition: "pending", signal: { outcome: "failed", eventId: "watch:lead-turn-3:interrupted", evidenceRefs: ["codex:lead-task:lead-turn-3"] } });
+  expect(observed.receipt!.signal.summary).toContain("was interrupted"); expect(observed.receipt!.signal.summary).toContain("sent it nothing");
+  expect(f.store.events.observe(watch, { turnId: "lead-turn-4", status: "failed" }, 1004)).toBeUndefined();
+  expect(f.store.events.watching(1004, 8)).toEqual([]);
+  const attempt = f.store.events.claim(1, 1004, [])[0]!;
+  expect(attempt.waitId).toBe("watch-lead");
+  expect(eventReturnCurrent(f.core, eventReturnTarget(attempt), eventEnvelope(attempt))).toBe(true);
+  f.store.events.complete("watch-lead", "g-one", attempt.delivery!.attemptId!, { status: "accepted", reference: "native:watch" }, 1005);
+  let saved = f.port().get(watch);
+  saved = f.port().acknowledge(watch, saved.version, saved.receipt!.id, "handled");
+  expect(saved.state).toBe("handled");
+  // A watch that reaches its expiry without an observation simply expires: no deadline notice, no delivery.
+  const quiet = { ...watch, waitId: "watch-quiet" }; f.port().watch(quiet);
+  f.setTime(5000);
+  expect(f.store.events.claim(4, 5000, [])).toEqual([]);
+  expect(f.port().get(quiet)).toMatchObject({ state: "expired", reason: "deadline_passed" });
+  expect(f.port().get(quiet).receipt).toBeUndefined();
+  expect(f.store.events.observe(quiet, { turnId: "late", status: "failed" }, 5001)).toBeUndefined();
+  // A cancelled watch reports nothing either.
+  const cancelled = { ...watch, waitId: "watch-cancelled", expiresAt: 9000 }; f.port().watch(cancelled);
+  f.port().cancel(cancelled, 1);
+  expect(f.store.events.observe(cancelled, { turnId: "t", status: "failed" }, 5002)).toBeUndefined();
+  expect(f.store.events.watching(5002, 8)).toEqual([]);
+});

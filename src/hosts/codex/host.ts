@@ -1,9 +1,10 @@
 import type { EventPort } from "../../events.ts";
 import { isEventOperation, invokeEvent } from "./event-tools.ts";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import type { DeliveryResult, HostAdapter, NativeEnvelope, NativeReturnTarget, ManagerBinding, ManagerOrigin, ManagerPort } from "../../contracts.ts";
+import type { DeliveryResult, HostAdapter, NativeEnvelope, NativeReturnTarget, ManagerBinding, ManagerOrigin, ManagerPort, ThreadReader, ThreadState } from "../../contracts.ts";
 import { ConnectorError, codexRoute, connectorProtocol, identifier, maxWireBytes, onlyKeys, parseInvocation, record, type NativeInvocation } from "./protocol.ts";
-import { bridgeProtocol, nativeSendBridge, parseBridgeEndpoint, type BridgeEndpoint } from "./native-bridge.ts";
+import { randomUUID } from "node:crypto";
+import { bridgeProtocol, nativeSendBridge, parseBridgeEndpoint, threadStateBridge, type BridgeEndpoint } from "./native-bridge.ts";
 import type { NativeSendArguments, NativeSendOutcome } from "./native.ts";
 import { invokeManager } from "./tools.ts";
 
@@ -37,11 +38,13 @@ export interface DesktopHostInput {
 export class CodexHostAdapter implements HostAdapter {
   readonly #connections = new Map<string, Connection>();
   readonly #invocations = new Map<string, NativeInvocation>();
+  #dataDir?: string;
   readonly #timer: ReturnType<typeof setInterval>;
   #closed = false;
 
-  constructor(readonly id: string, private readonly credential: string, private readonly access: CodexManagerAccess, private readonly lifecycle?: CodexHostLifecycle, private readonly input?: DesktopHostInput) {
+  constructor(readonly id: string, private readonly credential: string, private readonly access: CodexManagerAccess, private readonly lifecycle?: CodexHostLifecycle, private readonly input?: DesktopHostInput, dataDir?: string) {
     identifier(id);
+    this.#dataDir = dataDir;
     if (!/^[a-f0-9]{64}$/.test(credential)) throw new ConnectorError("invalid_credential", "A dedicated private connector credential is required.");
     this.#timer = setInterval(() => this.#prune(), 30_000);
     this.#timer.unref();
@@ -148,18 +151,24 @@ export class CodexHostAdapter implements HostAdapter {
   lastInvocation(threadId: string): NativeInvocation | undefined { return this.#invocations.get(threadId); }
 
   async nativeSend(dataDir: string, origin: NativeInvocation, args: NativeSendArguments, signal: AbortSignal, current: () => boolean = () => true): Promise<NativeSendOutcome> {
+    this.#dataDir = dataDir;
+    return this.#bridge((endpoint) => nativeSendBridge(endpoint, dataDir, origin, args, signal, current), signal);
+  }
+
+  /** Runs one bridge operation on the most recently seen current connector; a connector from an earlier release is never used. */
+  async #bridge<T>(operation: (endpoint: BridgeEndpoint, dataDir: string) => Promise<T>, signal: AbortSignal): Promise<T> {
     if (this.#closed || signal.aborted) throw new ConnectorError("host_closed", "The native connection ended.", 503);
+    if (!this.#dataDir) throw new ConnectorError("desktop_connector_unavailable", "Restore the qualified Desktop MCP connector; saved results and replies remain pending.", 503);
     this.#prune();
     const qualified = [...this.#connections.values()].filter((connection) => {
       if (!connection.helper || !connection.desktop) return false;
       try { this.lifecycle?.ready?.(connection.desktop); return true; } catch { return false; }
     }).sort((first, second) => second.lastSeen - first.lastSeen);
-    // A connector from an earlier release answers only its own bridge requests; it is not a sender.
     const candidates = qualified.filter((connection) => connection.helper!.protocol === bridgeProtocol);
-    // A profile can have multiple native MCP clients; each reaches the same Desktop input tool.
+    // A profile can have multiple native MCP clients; each reaches the same Desktop tools.
     for (const connection of candidates) {
       signal.throwIfAborted();
-      try { return await nativeSendBridge(connection.helper!, dataDir, origin, args, signal, current); }
+      try { return await operation(connection.helper!, this.#dataDir); }
       catch (error) {
         if (!(error instanceof ConnectorError) || error.code !== "desktop_connector_unavailable") throw error;
         this.#drop(connection);
@@ -167,6 +176,14 @@ export class CodexHostAdapter implements HostAdapter {
     }
     if (qualified.length) throw new ConnectorError("desktop_connector_outdated", "Reload the Seeker MCP server in Desktop; the loaded connector predates native sending and saved results and replies remain pending.", 503);
     throw new ConnectorError("desktop_connector_unavailable", "Restore the qualified Desktop MCP connector; saved results and replies remain pending.", 503);
+  }
+
+  /** A watched task's latest turn, read through a current connector and stamped with the watching task. */
+  async threadState(reader: ThreadReader, threadId: string, signal: AbortSignal): Promise<ThreadState> {
+    if (reader.hostId !== this.id) throw new ConnectorError("origin_denied", "This host does not serve that task.", 403);
+    const turnId = reader.turnId ?? this.#invocations.get(reader.taskId)?.turnId;
+    if (!turnId) throw new ConnectorError("desktop_owner_turn_unknown", "The watching task has no recorded turn to stamp the read with.", 503);
+    return this.#bridge((endpoint, dataDir) => threadStateBridge(endpoint, dataDir, { threadId: reader.taskId, turnId, callId: randomUUID() }, threadId, signal), signal);
   }
 
   async deliver(binding: NativeReturnTarget, envelope: NativeEnvelope, signal: AbortSignal): Promise<DeliveryResult> {

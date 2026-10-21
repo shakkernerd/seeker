@@ -3,6 +3,7 @@ import { chmodSync, linkSync, lstatSync, unlinkSync } from "node:fs";
 import { createConnection, createServer, type Socket } from "node:net";
 import { dirname, join } from "node:path";
 import { privateDirectory } from "./config.ts";
+import type { ThreadState } from "../../contracts.ts";
 import type { CodexNativeClient, NativeSendArguments, NativeSendOutcome } from "./native.ts";
 import { ConnectorError, identifier, maxWireBytes, onlyKeys, parseInvocation, record, type NativeInvocation } from "./protocol.ts";
 
@@ -25,7 +26,7 @@ export function parseBridgeEndpoint(value: unknown): BridgeEndpoint {
  * the connector answers one authenticated send request per connection on the
  * service's behalf. Nothing here starts a process or a model turn.
  */
-export async function listenNativeBridge(dataDir: string, native: Pick<CodexNativeClient, "send">) {
+export async function listenNativeBridge(dataDir: string, native: Pick<CodexNativeClient, "send" | "threadState">) {
   const directory = privateDirectory(dataDir);
   const endpoint: BridgeEndpoint = { socketPath: join(directory, `.h${randomBytes(4).toString("hex")}`), credential: randomBytes(32).toString("hex"), protocol: bridgeProtocol };
   const sockets = new Set<Socket>(), sends = new Set<Promise<unknown>>();
@@ -45,8 +46,18 @@ export async function listenNativeBridge(dataDir: string, native: Pick<CodexNati
       try {
         if (closed) throw unavailable();
         const message = record(JSON.parse(buffer.slice(0, end)));
-        onlyKeys(message, ["credential", "nativeSend"]);
+        onlyKeys(message, ["credential", "nativeSend", "threadState"]);
         if (message.credential !== endpoint.credential) throw unavailable();
+        if (message.threadState !== undefined) {
+          if (message.nativeSend !== undefined) throw unavailable();
+          const read = record(message.threadState); onlyKeys(read, ["origin", "threadId"]);
+          const origin = parseInvocation(read.origin), threadId = identifier(read.threadId);
+          if (sends.size >= 4) throw unavailable();
+          const reading = native.threadState(origin, threadId, AbortSignal.timeout(4_000))
+            .then((state) => write({ threadState: state }), () => { socket.destroy(); });
+          sends.add(reading); void reading.finally(() => sends.delete(reading));
+          return;
+        }
         const request = record(message.nativeSend); onlyKeys(request, ["origin", "arguments"]);
         const origin = parseInvocation(request.origin), args = record(request.arguments); onlyKeys(args, ["threadId", "prompt"]);
         if (typeof args.prompt !== "string" || !args.prompt || Buffer.byteLength(args.prompt) > 16_384) throw unavailable();
@@ -82,6 +93,38 @@ export async function listenNativeBridge(dataDir: string, native: Pick<CodexNati
       if (current.dev === inode.dev && current.ino === inode.ino) unlinkSync(endpoint.socketPath);
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   })() };
+}
+
+/** The service's side: one latest-turn read of a task through the connector; nothing is sent to anyone. */
+export async function threadStateBridge(endpoint: BridgeEndpoint, dataDir: string, origin: NativeInvocation, threadId: string, signal: AbortSignal): Promise<ThreadState> {
+  const parsed = parseBridgeEndpoint(endpoint);
+  if (dirname(parsed.socketPath) !== privateDirectory(dataDir)) throw unavailable();
+  let info: ReturnType<typeof lstatSync>;
+  try { info = lstatSync(parsed.socketPath); } catch { throw unavailable(); }
+  if (!info.isSocket() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0) throw unavailable();
+  const socket = createConnection(parsed.socketPath);
+  return new Promise((resolve, reject) => {
+    let buffer = "", settled = false;
+    const finish = (value?: ThreadState) => {
+      if (settled) return; settled = true; clearTimeout(timer); signal.removeEventListener("abort", abort); socket.destroy();
+      if (value) resolve(value); else reject(unavailable());
+    };
+    const abort = () => finish(), timer = setTimeout(abort, 5_000); timer.unref();
+    socket.setEncoding("utf8"); socket.once("error", abort); socket.once("close", abort);
+    socket.on("data", (chunk: string) => {
+      buffer += chunk; if (Buffer.byteLength(buffer) > 2_048) return abort();
+      const end = buffer.indexOf("\n"); if (end < 0) return;
+      try {
+        const message = record(JSON.parse(buffer.slice(0, end))); onlyKeys(message, ["threadState"]);
+        const state = record(message.threadState); onlyKeys(state, ["taskId", "turnId", "status"]);
+        if (state.taskId !== threadId || !["inProgress", "completed", "interrupted", "failed"].includes(String(state.status))) throw unavailable();
+        finish({ taskId: identifier(state.taskId), turnId: identifier(state.turnId), status: state.status as ThreadState["status"] });
+      } catch { abort(); }
+    });
+    signal.addEventListener("abort", abort, { once: true });
+    socket.once("connect", () => { if (signal.aborted) abort(); else socket.write(`${JSON.stringify({ credential: parsed.credential, threadState: { origin, threadId } })}\n`); });
+    if (signal.aborted) abort();
+  });
 }
 
 /**

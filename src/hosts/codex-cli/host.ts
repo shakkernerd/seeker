@@ -1,7 +1,7 @@
 import { eventReturnCurrent } from "../../core/event-return.ts";
 import { isEventOperation, invokeEvent } from "../codex/event-tools.ts";
 import { randomUUID, timingSafeEqual } from "node:crypto";
-import type { DeliveryResult, HostAdapter, NativeEnvelope, NativeReturnTarget, ManagerBinding } from "../../contracts.ts";
+import type { DeliveryResult, HostAdapter, NativeEnvelope, NativeReturnTarget, ManagerBinding, ThreadReader, ThreadState } from "../../contracts.ts";
 import { SeekerCore } from "../../core/seeker.ts";
 import { SeekerError } from "../../core/validation.ts";
 import { ConnectorError, envelopeIdentity, envelopeReference, identifier, nativeWakeup, onlyKeys, parseInvocation, record, type NativeInvocation } from "../codex/protocol.ts";
@@ -82,6 +82,18 @@ export class CodexCliHost implements HostAdapter {
       const known = error instanceof SeekerError;
       return json({ error: known ? error.code : "cli_unavailable", message: known ? error.message : "Seeker could not verify the original CLI owner. Retain request IDs and inspect the exchange before repeating a mutation." }, known ? error.status : 503);
     }
+  }
+
+  /** A watched task's latest turn on the registered app-server; nothing is sent. */
+  async threadState(reader: ThreadReader, threadId: string, signal: AbortSignal): Promise<ThreadState> {
+    if (reader.hostId !== this.id) throw new ConnectorError("origin_denied", "This host does not serve that task.", 403);
+    const rpc = this.#rpc;
+    if (this.#closed || !rpc?.connected) throw new ConnectorError("cli_unavailable", "The registered CLI app-server is not connected.", 503);
+    const turns = record(await rpc.request("thread/turns/list", { threadId: identifier(threadId), limit: 1, sortDirection: "desc", itemsView: "notLoaded" }, signal, 1500));
+    if (!Array.isArray(turns.data) || turns.data.length !== 1) throw new ConnectorError("cli_thread_state_unavailable", "The task's latest turn could not be read.", 503);
+    const turn = record(turns.data[0]), status = String(turn.status);
+    if (!["inProgress", "completed", "interrupted", "failed"].includes(status)) throw new ConnectorError("cli_thread_state_unavailable", "The task's latest turn could not be qualified.", 503);
+    return { taskId: identifier(threadId), turnId: identifier(turn.id), status: status as ThreadState["status"] };
   }
 
   async deliver(binding: NativeReturnTarget, envelope: NativeEnvelope, signal: AbortSignal): Promise<DeliveryResult> {

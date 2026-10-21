@@ -6,7 +6,7 @@ import { prepareNativeRegistration } from "../hosts/codex/setup.ts";
 import { atomicWrite, layout, present, regular } from "./layout.ts";
 import { verifyInstallation } from "./application.ts";
 
-const eventTools = ["event_arm", "event_get", "event_pending", "event_cancel", "event_acknowledge", "event_clear"];
+const eventTools = ["event_arm", "event_watch", "event_get", "event_pending", "event_cancel", "event_acknowledge", "event_clear"];
 /** Explicit event-only installation; human-manager admission remains project-owned. */
 export function connectEvents(home: string, configPath: string, dryRun = false) {
   verifyInstallation(home);
