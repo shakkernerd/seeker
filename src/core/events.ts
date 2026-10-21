@@ -1,14 +1,14 @@
 import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
-import type { EventAddress, EventArmRequest, EventArm, EventOwner, EventRef, EventResult, EventSignal, EventWait, EventWatch, EventWatchRequest, ThreadObservation, TurnEnding } from "../events.ts";
-import { turnEndings } from "../events.ts";
+import type { EventAddress, EventArmRequest, EventArm, EventOwner, EventRef, EventResult, EventSignal, EventWait, EventWatch, EventWatchRequest, ThreadObservation, TurnEnding, WatchEnding } from "../events.ts";
+import { turnEndings, watchEndings } from "../events.ts";
 import { fail, id, integer, object, text } from "./validation.ts";
 
 /** `retainedMs`: a settled wait (delivered, handled, cancelled or expired) is cleared by the service this long after it settled. */
 /** A notice carries the summary within `noticeSummaryChars` and `noticeSummaryBytes`, and every reference complete; `noticeBytes` is the largest notice, which the native input path must admit. */
 export const eventLimits = { resultBytes: 16_384, retained: 4096, perTask: 128, retainedMs: 86_400_000, noticeSummaryChars: 2000, noticeSummaryBytes: 6000, noticeBytes: 32_768 } as const;
-/** The endings a watch reports unless the task chose; a completed turn is ordinary and stays quiet by default. */
-export const defaultWatchEndings: readonly TurnEnding[] = ["failed", "interrupted"];
+/** The endings a watch reports unless the task chose; a completed turn is ordinary and stays quiet by default, and so is expiry. */
+export const defaultWatchEndings: readonly WatchEnding[] = ["failed", "interrupted"];
 export const eventRoute = (wait: Pick<EventWait, "owner">): string => JSON.stringify(["event", wait.owner.hostId, wait.owner.taskId]);
 export const eventDigest = (value: string): string => createHash("sha256").update(value).digest("hex");
 export const eventFingerprint = (value: unknown): string => eventDigest(JSON.stringify(value));
@@ -51,9 +51,9 @@ export function eventWatchRequest(raw: unknown, now: number): EventWatchRequest 
   if (value.waitId !== undefined) request.waitId = id(value.waitId, "Wait");
   return request;
 }
-function endings(raw: unknown): TurnEnding[] {
-  if (!Array.isArray(raw) || !raw.length || raw.some((item) => !turnEndings.includes(item as TurnEnding))) fail("invalid_input", "Choose which turn endings to report: completed, failed or interrupted.");
-  return turnEndings.filter((ending) => raw.includes(ending));
+function endings(raw: unknown): WatchEnding[] {
+  if (!Array.isArray(raw) || !raw.length || raw.some((item) => !watchEndings.includes(item as WatchEnding))) fail("invalid_input", "Choose what the watch reports: completed, failed, interrupted, or expired.");
+  return watchEndings.filter((ending) => raw.includes(ending));
 }
 export function eventOwner(raw: EventOwner): EventOwner {
   const value: EventOwner = { hostId: id(raw.hostId, "Host"), taskId: id(raw.taskId, "Task"), turnId: id(raw.turnId, "Turn"), callId: id(raw.callId, "Call") };

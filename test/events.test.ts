@@ -251,8 +251,8 @@ test("a watch is a wait Seeker itself settles: one observation of an ending it r
   const f = fixture(); f.setTime(1000);
   const watch = { waitId: "watch-lead", title: "Lead one", expiresAt: 5000, threadId: "lead-task" };
   await expect(f.port().watch({ ...watch, threadId: owner.taskId })).rejects.toThrow("cannot watch itself");
-  await expect(f.port().watch({ ...watch, on: [] })).rejects.toThrow("which turn endings");
-  await expect(f.port().watch({ ...watch, on: ["aborted" as never] })).rejects.toThrow("which turn endings");
+  await expect(f.port().watch({ ...watch, on: [] })).rejects.toThrow("what the watch reports");
+  await expect(f.port().watch({ ...watch, on: ["aborted" as never] })).rejects.toThrow("what the watch reports");
   const armed = await f.port().watch(watch);
   expect(armed).toMatchObject({ state: "waiting", watch: { threadId: "lead-task", on: ["failed", "interrupted"] }, title: "Lead one" });
   expect(armed.generation).toMatch(/^[0-9a-f-]{36}$/);
@@ -286,10 +286,20 @@ test("a watch is a wait Seeker itself settles: one observation of an ending it r
   expect(finished.receipt!.signal.summary).toContain("turn two-7 completed");
   // A watch that reaches its expiry without an observation simply expires: no deadline notice, no delivery.
   const quiet = { ...watch, waitId: "watch-quiet" }; await f.port().watch(quiet);
+  // Unless it asked to report its expiry: then the expiry is its one result, naming the latest turn seen.
+  f.core.threadReader = async () => ({ taskId: "lead-task", turnId: "lead-turn-9", status: "inProgress" });
+  const told = await f.port().watch({ waitId: "watch-told", title: "Lead told", expiresAt: 5000, threadId: "lead-task", on: ["expired", "failed"] });
+  expect(told.watch).toEqual({ threadId: "lead-task", on: ["failed", "expired"], seen: { turnId: "lead-turn-9", status: "inProgress" } });
+  f.core.threadReader = undefined;
   f.setTime(5000);
   expect(f.store.events.claim(4, 5000, []).map((wait) => wait.waitId)).toEqual(["watch-done"]);
   expect(f.port().get(quiet)).toMatchObject({ state: "expired", reason: "deadline_passed" });
   expect(f.port().get(quiet).receipt).toBeUndefined();
+  const expired = f.port().get({ waitId: "watch-told" });
+  expect(expired).toMatchObject({ state: "ready", reason: "deadline_passed", receipt: { source: "watch", disposition: "pending", signal: { outcome: "failed", eventId: "watch:expired:lead-turn-9", evidenceRefs: ["codex:lead-task:lead-turn-9"] } }, delivery: { state: "queued" } });
+  expect(expired.receipt!.signal.summary).toContain("the watch expired while its latest turn lead-turn-9 was still running");
+  expect(f.store.events.observe({ waitId: "watch-told" }, { turnId: "lead-turn-9", status: "failed", completedAt: 5001 }, 5001)).toBeUndefined();
+  expect(f.store.events.claim(4, 5001, []).map((wait) => wait.waitId)).toEqual(["watch-told"]);
   expect(f.store.events.observe(quiet, { turnId: "late", status: "failed", completedAt: 5001 }, 5001)).toBeUndefined();
   // A cancelled watch reports nothing either.
   const cancelled = { ...watch, waitId: "watch-cancelled", expiresAt: 9000 }; await f.port().watch(cancelled);
