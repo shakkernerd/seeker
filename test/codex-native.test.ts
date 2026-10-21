@@ -9,7 +9,7 @@ import { installSection } from "../src/hosts/codex/setup.ts";
 const cleanup: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
 
-async function nativeFixture(mode: "compatible" | "drop" | "bad-frame" | "extra-required" | "wrong-input-type" | "send" | "refuse" | "drop-call" | "garbled" | "wrong-id" | "no-result" = "compatible") {
+async function nativeFixture(mode: "compatible" | "drop" | "bad-frame" | "extra-required" | "wrong-input-type" | "send" | "refuse" | "drop-call" | "garbled" | "wrong-id" | "no-result" | "contradictory" = "compatible") {
   const path = join(tmpdir(), `sk-${randomUUID().slice(0, 8)}.sock`);
   const requests: Record<string, any>[] = [], sockets = new Set<Socket>(), calls = new Set(["arm-call"]);
   const server = createServer((socket) => {
@@ -28,6 +28,7 @@ async function nativeFixture(mode: "compatible" | "drop" | "bad-frame" | "extra-
         if (mode === "drop-call") { socket.destroy(); return; }
         if (mode === "refuse") error = { code: -32000, message: "Codex app tool request failed" };
         else if (mode === "wrong-id") { const body = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 7, result: { success: true, contentItems: [] } })); const frame = Buffer.alloc(4 + body.length); frame.writeUInt32LE(body.length); body.copy(frame, 4); socket.end(frame); return; }
+        else if (mode === "contradictory") { const body = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { success: true, contentItems: [] }, error: { code: -32000, message: "also failed" } })); const frame = Buffer.alloc(4 + body.length); frame.writeUInt32LE(body.length); body.copy(frame, 4); socket.end(frame); return; }
         else if (mode === "no-result") { const body = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1 })); const frame = Buffer.alloc(4 + body.length); frame.writeUInt32LE(body.length); body.copy(frame, 4); socket.end(frame); return; }
         else if (mode === "garbled") result = { success: true, contentItems: [{ type: "inputText", text: "not json" }] };
         else if (calls.has(request.params.callId)) error = { code: -32603, message: "Native call identity was already used." };
@@ -50,13 +51,13 @@ describe("native catalogue qualification", () => {
     expect(await client.send(origin, args)).toEqual({ status: "accepted", threadId: "owner" });
     expect(fixture.requests.map((request) => request.method)).toEqual(["tools/list", "tools/call"]);
     expect(fixture.requests[1]!.params).toEqual({ arguments: args, callerSource: "codex", namespace: "codex_app", tool: "send_message_to_thread", threadId: "owner", turnId: "armed-turn", callId: "fresh-call" });
-    // A reused call identity is refused by the host and reported as unsent.
-    expect(await client.send(origin, args)).toEqual({ status: "refused", code: "native_input_refused" });
-    expect(await new CodexNativeClient((await nativeFixture("refuse")).path).send(origin, args)).toEqual({ status: "refused", code: "native_input_refused" });
-    // After the request reached the host, a lost or unreadable answer is not evidence that nothing was sent.
+    // After the request reached the host, nothing but its confirmation of the target is evidence of what it did:
+    // an error answer, a reused call identity, a contradictory, uncorrelated or incomplete answer, or silence.
+    expect(await client.send(origin, args)).toEqual({ status: "uncertain", code: "native_call_failed" });
+    expect(await new CodexNativeClient((await nativeFixture("refuse")).path).send(origin, args)).toEqual({ status: "uncertain", code: "native_call_failed" });
+    expect(await new CodexNativeClient((await nativeFixture("contradictory")).path).send(origin, args)).toEqual({ status: "uncertain", code: "native_invalid_response" });
     expect(await new CodexNativeClient((await nativeFixture("drop-call")).path).send(origin, args)).toEqual({ status: "uncertain", code: "native_disconnected" });
     expect(await new CodexNativeClient((await nativeFixture("garbled")).path).send(origin, args)).toEqual({ status: "uncertain", code: "native_target_unconfirmed" });
-    // Only the host's own correlated error says the call did not happen; an uncorrelated or incomplete answer does not.
     expect(await new CodexNativeClient((await nativeFixture("wrong-id")).path).send(origin, args)).toEqual({ status: "uncertain", code: "native_rpc_uncorrelated" });
     expect(await new CodexNativeClient((await nativeFixture("no-result")).path).send(origin, args)).toEqual({ status: "uncertain", code: "native_invalid_response" });
     const missing = await new CodexNativeClient(join(tmpdir(), `missing-${randomUUID()}.sock`)).send(origin, args);

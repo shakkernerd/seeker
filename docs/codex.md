@@ -112,8 +112,9 @@ service sends through the most recently seen qualified connector for the
 registered profile. A connector that cannot be reached before the request is
 written is a definite failure and the delivery retries within its ordinary
 budget; a request written without an answer is uncertain and is never resent.
-The connector reports the host's own confirmation of the target; a call the host
-refuses is reported as unsent and retried within the same budget. A connector
+The connector reports the host's own confirmation of the target; any other
+answer after the request was written, an error included, leaves the delivery
+uncertain, because nothing proves the host did not act on it. A connector
 loaded from an earlier release announces no sending capability: the service
 does not use it, reports `desktop_connector_outdated`, and delivers once a
 reloaded connector connects.

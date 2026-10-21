@@ -64,8 +64,8 @@ test("a saved result reaches its task through one stamped native call, whatever 
 
 test("a refused call retries, a lost answer stays uncertain and is never resent, a missing connector retries", async () => {
   const f = fixture();
-  f.outcome({ status: "refused", code: "native_input_refused" });
-  expect(await f.deliver()).toEqual({ status: "retry", retryAfterMs: 1_000, code: "native_input_refused" });
+  f.outcome({ status: "refused", code: "native_unavailable" });
+  expect(await f.deliver()).toEqual({ status: "retry", retryAfterMs: 1_000, code: "native_unavailable" });
   f.outcome(new ConnectorError("desktop_connector_unavailable", "gone", 503));
   expect(await f.deliver()).toEqual({ status: "retry", retryAfterMs: 1_000, code: "desktop_connector_unavailable" });
   f.outcome({ status: "uncertain", code: "native_timeout" });

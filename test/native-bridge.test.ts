@@ -34,8 +34,8 @@ test("the service's send crosses the authenticated bridge and returns the connec
   expect(f.sends).toHaveLength(0);
   expect(await nativeSendBridge(f.bridge.endpoint, f.dataDir, origin, args, new AbortController().signal)).toEqual({ status: "accepted", threadId: "owner-task" });
   expect(f.sends).toEqual([{ origin, args }]);
-  f.outcome({ status: "refused", code: "native_input_refused" });
-  expect(await nativeSendBridge(f.bridge.endpoint, f.dataDir, origin, args, new AbortController().signal)).toEqual({ status: "refused", code: "native_input_refused" });
+  f.outcome({ status: "refused", code: "native_unavailable" });
+  expect(await nativeSendBridge(f.bridge.endpoint, f.dataDir, origin, args, new AbortController().signal)).toEqual({ status: "refused", code: "native_unavailable" });
   f.outcome(new Error("pipe gone"));
   expect(await nativeSendBridge(f.bridge.endpoint, f.dataDir, origin, args, new AbortController().signal)).toEqual({ status: "uncertain", code: "native_send_failed" });
   // A confirmed target other than the one requested is not acceptance of this send.
