@@ -479,6 +479,13 @@ test("arming a watch reads where the task stands, so an ending from before the w
   const running = await f.port().watch({ waitId: "w-running", title: "running", expiresAt: 9000, threadId: "lead" });
   expect(running.watch!.seen).toEqual({ turnId: "running", status: "inProgress" });
   expect(f.store.events.observe({ waitId: "w-running" }, { turnId: "running", status: "interrupted" }, 1700)!.state).toBe("ready");
+  // The request's signal reaches the read; a request that ended before the read answered arms nothing.
+  const ended = new AbortController(); let readSignal: AbortSignal | undefined;
+  f.core.threadReader = async (_reader, _threadId, signal) => { readSignal = signal; ended.abort(); return undefined; };
+  await expect(f.port().watch({ waitId: "w-ended-request", title: "late", expiresAt: 9000, threadId: "lead" }, ended.signal)).rejects.toThrow("request ended");
+  expect(readSignal).toBe(ended.signal);
+  expect(() => f.port().get({ waitId: "w-ended-request" })).toThrow("not found");
+  f.core.threadReader = async () => state;
   // When the host cannot say where the task stands, the watch is armed without a baseline and the later rules apply.
   state = undefined;
   const blind = await f.port().watch({ waitId: "w-blind", title: "blind", expiresAt: 9000, threadId: "lead" });
@@ -500,13 +507,13 @@ test("a wait id with a colon arms with a key Seeker places, and a notice never o
   const attempt = f.store.events.claim(1, 1001, [])[0]!;
   const { result } = eventEnvelope(attempt).event;
   expect(result.summary).toBe(signal.summary);
-  for (const ref of result.evidenceRefs) expect(refs).toContain(ref);
+  expect(result.evidenceRefs).toEqual(refs);
   // A long multibyte summary is cut by bytes, not only by characters.
   const bounded = eventResult({ ...attempt, receipt: { ...attempt.receipt!, signal: { ...attempt.receipt!.signal, summary: "é".repeat(2500) } } });
   expect(bounded.summary.endsWith("(truncated; the full summary is in the saved record)")).toBe(true);
   expect(Buffer.byteLength(bounded.summary)).toBeLessThanOrEqual(eventLimits.noticeSummaryBytes + 100);
-  expect(result.evidenceRefs.length + (result.omittedRefs ?? 0)).toBe(8); expect(result.omittedRefs).toBeGreaterThan(0);
+  // Every reference is in the notice, complete, and the notice stays within what the native input path admits.
   const notice = nativeWakeup({ attemptId: "x", binding: eventReturnTarget(attempt), envelope: eventEnvelope(attempt) });
-  expect(Buffer.byteLength(notice)).toBeLessThanOrEqual(16_384);
-  expect(notice).toContain(`${result.omittedRefs} more in the saved record`);
+  for (const ref of refs) expect(notice).toContain(ref);
+  expect(Buffer.byteLength(notice)).toBeLessThanOrEqual(eventLimits.noticeBytes);
 });

@@ -11,7 +11,7 @@ import { fail, id, origin as validateOrigin, sameRecipient } from "./validation.
 export class SeekerCore {
   /** `keyDirectory`: where Seeker places producer key files for waits armed without a path; without it a task must name the path. */
   /** Reads a task's latest turn through its host, so a watch knows where the task stood when armed; undefined when the host cannot say now. */
-  threadReader?: (reader: ThreadReader, threadId: string) => Promise<ThreadState | undefined>;
+  threadReader?: (reader: ThreadReader, threadId: string, signal?: AbortSignal) => Promise<ThreadState | undefined>;
 
   constructor(readonly store: ExchangeStore, readonly clock: () => number = Date.now, private readonly options: { keyDirectory?: string } = {}) {
     if (options.keyDirectory) store.events.keyDirectory = options.keyDirectory;
@@ -93,16 +93,18 @@ export class SeekerCore {
           throw error;
         }
       },
-      watch: async (raw) => {
+      watch: async (raw, signal) => {
         current();
         const request = eventWatchRequest(raw, this.clock());
         if (request.threadId === origin.taskId) fail("invalid_input", "A task cannot watch itself.");
         // Where the task stands now: a turn already ended is old news, one running is reported when it ends.
         let seen: { turnId: string; status: ThreadState["status"] } | undefined;
         if (this.threadReader) {
-          const state = await this.threadReader({ hostId: origin.hostId, taskId: origin.taskId, turnId: origin.turnId }, request.threadId);
+          const state = await this.threadReader({ hostId: origin.hostId, taskId: origin.taskId, turnId: origin.turnId }, request.threadId, signal);
           if (state?.taskId === request.threadId) seen = { turnId: state.turnId, status: state.status };
         }
+        // The caller must still be there to receive the watch's identity; an ended request arms nothing.
+        if (signal?.aborted) fail("request_ended", "The request ended before the watch was armed. Arm it again.", 499);
         current();
         return this.store.events.watch(origin, { waitId: request.waitId ?? `watch-${randomUUID()}`, generation: randomUUID(), revision: "watch", title: request.title, expiresAt: request.expiresAt, threadId: request.threadId, on: request.on ?? [...defaultWatchEndings], ...(seen ? { seen } : {}) }, this.clock());
       },

@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { privateDirectory } from "./config.ts";
 import type { ThreadState } from "../../contracts.ts";
 import type { CodexNativeClient, NativeSendArguments, NativeSendOutcome } from "./native.ts";
+import { eventLimits } from "../../core/events.ts";
 import { ConnectorError, identifier, maxWireBytes, onlyKeys, parseInvocation, record, type NativeInvocation } from "./protocol.ts";
 
 /** The bridge request a connector answers; a connector from an earlier release has no `protocol` and only answers older requests. */
@@ -64,7 +65,8 @@ export async function listenNativeBridge(dataDir: string, native: Pick<CodexNati
         }
         const request = record(message.nativeSend); onlyKeys(request, ["origin", "arguments"]);
         const origin = parseInvocation(request.origin), args = record(request.arguments); onlyKeys(args, ["threadId", "prompt"]);
-        if (typeof args.prompt !== "string" || !args.prompt || Buffer.byteLength(args.prompt) > 16_384) throw unavailable();
+        // The largest notice: a full result (16 KiB) with the message around it.
+        if (typeof args.prompt !== "string" || !args.prompt || Buffer.byteLength(args.prompt) > eventLimits.noticeBytes) throw unavailable();
         // Capacity is answered before any native call, so the service knows nothing was sent.
         if (sends.size >= 4) { write({ nativeSend: { status: "refused", code: "desktop_bridge_busy" } }); return; }
         // The service already chose the target; the stamp is what the host receives as provenance.

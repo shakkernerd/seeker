@@ -18,10 +18,11 @@ export function startRuntime(options: RuntimeOptions) {
   }
   const server = createLocalServer(options);
   // A watch armed through the core reads the watched task once through its host to know where it stands.
-  options.core.threadReader = async (reader, threadId) => {
+  // The read ends with the request, and within the connector's invocation deadline; without an answer the watch is armed without a baseline.
+  options.core.threadReader = async (reader, threadId, signal) => {
     const host = hosts.find((item) => item.id === reader.hostId);
     if (!host?.threadState) return undefined;
-    try { return await host.threadState(reader, threadId, AbortSignal.timeout(5_000)); } catch { return undefined; }
+    try { return await host.threadState(reader, threadId, AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(2_500)])); } catch { return undefined; }
   };
   const pump = new DeliveryPump(options.core, channels, hosts);
   const watcher = new ThreadWatcher(options.core, hosts);

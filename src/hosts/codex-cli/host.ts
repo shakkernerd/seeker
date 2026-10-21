@@ -67,7 +67,7 @@ export class CodexCliHost implements HostAdapter {
       if (thread.id !== origin.threadId || record(thread.status).type === "notLoaded") throw new ConnectorError("origin_denied", "The original CLI owner has not loaded this manager.", 403);
       signal.throwIfAborted();
       if (event) {
-        const result = await invokeEvent(this.core.events({ hostId: this.id, taskId: origin.threadId, turnId: origin.turnId, callId: origin.callId }), operation, body.arguments);
+        const result = await invokeEvent(this.core.events({ hostId: this.id, taskId: origin.threadId, turnId: origin.turnId, callId: origin.callId }), operation, body.arguments, signal);
         this.#restored(); return json(result);
       }
       if (!binding || epoch(this.#binding(origin)) !== epoch(binding)) throw new ConnectorError("owner_changed", "The manager assignment changed during admission.", 409);

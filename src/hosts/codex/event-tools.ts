@@ -18,11 +18,11 @@ export const eventTools = [
 ] as const;
 
 export function isEventOperation(operation: string): boolean { return eventTools.some((tool) => tool.name === operation); }
-export function invokeEvent(port: EventPort, operation: string, raw: unknown): unknown {
+export function invokeEvent(port: EventPort, operation: string, raw: unknown, signal?: AbortSignal): unknown {
   const input = record(raw);
   if (operation === "event_pending") { onlyKeys(input, []); return port.pending(); }
   if (operation === "event_arm") { onlyKeys(input, ["title", "expiresAt", "capabilityFile", "revision", "waitId"]); return port.arm(input as never); }
-  if (operation === "event_watch") { onlyKeys(input, ["title", "expiresAt", "threadId", "on", "waitId"]); return port.watch(input as never); }
+  if (operation === "event_watch") { onlyKeys(input, ["title", "expiresAt", "threadId", "on", "waitId"]); return port.watch(input as never, signal); }
   const reference: EventRef = { waitId: identifier(input.waitId) };
   if (input.generation !== undefined) reference.generation = identifier(input.generation);
   if (input.revision !== undefined) reference.revision = identifier(input.revision);

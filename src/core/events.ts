@@ -5,8 +5,8 @@ import { turnEndings } from "../events.ts";
 import { fail, id, integer, object, text } from "./validation.ts";
 
 /** `retainedMs`: a settled wait (delivered, handled, cancelled or expired) is cleared by the service this long after it settled. */
-/** `noticeBytes` bounds the summary and references a notice carries, under the native input limit with room for the rest of the message. */
-export const eventLimits = { resultBytes: 16_384, retained: 4096, perTask: 128, retainedMs: 86_400_000, noticeSummaryChars: 2000, noticeSummaryBytes: 6000, noticeBytes: 12_000 } as const;
+/** A notice carries the summary within `noticeSummaryChars` and `noticeSummaryBytes`, and every reference complete; `noticeBytes` is the largest notice, which the native input path must admit. */
+export const eventLimits = { resultBytes: 16_384, retained: 4096, perTask: 128, retainedMs: 86_400_000, noticeSummaryChars: 2000, noticeSummaryBytes: 6000, noticeBytes: 32_768 } as const;
 /** The endings a watch reports unless the task chose; a completed turn is ordinary and stays quiet by default. */
 export const defaultWatchEndings: readonly TurnEnding[] = ["failed", "interrupted"];
 export const eventRoute = (wait: Pick<EventWait, "owner">): string => JSON.stringify(["event", wait.owner.hostId, wait.owner.taskId]);
@@ -89,8 +89,8 @@ export function uuidTime(value: string): number | undefined {
   return match ? Number.parseInt(match[1]! + match[2]!, 16) : undefined;
 }
 /**
- * The result a notice carries, within the native input limit: the summary bounded, then as many
- * references as fit, each complete so it can be used as given; the rest stay in the saved record.
+ * The result a notice carries: the summary bounded, every reference complete so it can be used as
+ * given. A saved result is at most `resultBytes`, so the notice stays under `noticeBytes`.
  */
 export function eventResult(wait: EventWait): EventResult {
   if (!wait.receipt) throw new Error("An event result requires a saved receipt.");
@@ -98,11 +98,7 @@ export function eventResult(wait: EventWait): EventResult {
   let summary = signal.summary.length > eventLimits.noticeSummaryChars ? signal.summary.slice(0, eventLimits.noticeSummaryChars) : signal.summary;
   while (Buffer.byteLength(summary) > eventLimits.noticeSummaryBytes) summary = summary.slice(0, -100);
   if (summary.length < signal.summary.length) summary = `${summary} … (truncated; the full summary is in the saved record)`;
-  const evidenceRefs: string[] = [];
-  let bytes = Buffer.byteLength(summary);
-  for (const ref of signal.evidenceRefs) { const size = Buffer.byteLength(ref) + 2; if (bytes + size > eventLimits.noticeBytes) break; evidenceRefs.push(ref); bytes += size; }
-  const result: EventResult = { outcome: signal.outcome, summary, evidenceRefs };
-  if (evidenceRefs.length < signal.evidenceRefs.length) result.omittedRefs = signal.evidenceRefs.length - evidenceRefs.length;
+  const result: EventResult = { outcome: signal.outcome, summary, evidenceRefs: [...signal.evidenceRefs] };
   if (wait.title !== undefined) result.title = wait.title;
   if (wait.receipt.source) result.source = wait.receipt.source;
   return result;

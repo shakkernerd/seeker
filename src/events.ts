@@ -105,9 +105,8 @@ export interface EventResult {
   source?: EventReceipt["source"];
   outcome: EventSignal["outcome"];
   summary: string;
-  /** Complete references, as many as the notice can carry in order; `omittedRefs` counts the rest, kept in the saved record. */
+  /** Every reference, complete, so each can be used as given. */
   evidenceRefs: string[];
-  omittedRefs?: number;
 }
 /** Machine result identity and its bounded result. */
 export interface EventEnvelope {
@@ -118,7 +117,8 @@ export type EventSummary = Pick<EventWait, "waitId" | "generation" | "revision" 
 export interface EventMutation { expectedVersion?: number }
 export interface EventPort {
   arm(input: EventArmRequest): EventWait & { capabilityFile: string };
-  watch(input: EventWatchRequest): Promise<EventWait>;
+  /** `signal` is the calling request's; a watch is not armed once it has ended. */
+  watch(input: EventWatchRequest, signal?: AbortSignal): Promise<EventWait>;
   get(ref: EventRef): EventWait;
   /** This task's open waits and watches: waiting, or with a result not yet delivered. */
   pending(): EventSummary[];
