@@ -15,11 +15,21 @@ const generatedToolLists = [
 function upgradeToolList(current: string, existing: { enabled_tools?: unknown }): string {
   const list = existing.enabled_tools;
   if (!Array.isArray(list) || !generatedToolLists.some((known) => JSON.stringify(known) === JSON.stringify(list))) return current;
-  const start = current.indexOf("[mcp_servers.seeker_events]");
-  if (start < 0) return current;
-  const next = current.indexOf("\n[", start + 1), section = current.slice(start, next < 0 ? undefined : next);
-  const upgraded = section.replace(/^enabled_tools = \[[^\n]*\]$/m, `enabled_tools = ${JSON.stringify(eventTools)}`);
-  return upgraded === section ? current : current.slice(0, start) + upgraded + (next < 0 ? "" : current.slice(next));
+  // The actual table header, at the start of its own line; a mention inside a comment or another table is not it.
+  const header = /^[ \t]*\[mcp_servers\.seeker_events\][ \t]*(?:#.*)?$/m.exec(current);
+  if (!header) return current;
+  const start = header.index + header[0].length;
+  const rest = current.slice(start), nextTable = /^[ \t]*\[/m.exec(rest);
+  const section = rest.slice(0, nextTable ? nextTable.index : undefined);
+  const upgraded = section.replace(/^[ \t]*enabled_tools[ \t]*=[ \t]*\[[^\n]*\][ \t]*$/m, `enabled_tools = ${JSON.stringify(eventTools)}`);
+  if (upgraded === section) return current;
+  const result = current.slice(0, start) + upgraded + (nextTable ? rest.slice(nextTable.index) : "");
+  // Prove the rewrite changed that one setting and nothing else before offering it.
+  const before = Bun.TOML.parse(current) as Record<string, unknown>, after = Bun.TOML.parse(result) as Record<string, unknown>;
+  const strip = (value: Record<string, unknown>) => { const copy = structuredClone(value) as { mcp_servers?: Record<string, Record<string, unknown>> }; delete copy.mcp_servers?.seeker_events?.enabled_tools; return JSON.stringify(copy); };
+  const upgradedList = (after as { mcp_servers?: Record<string, { enabled_tools?: unknown }> }).mcp_servers?.seeker_events?.enabled_tools;
+  if (strip(before) !== strip(after) || JSON.stringify(upgradedList) !== JSON.stringify(eventTools)) return current;
+  return result;
 }
 /** Explicit event-only installation; human-manager admission remains project-owned. */
 export function connectEvents(home: string, configPath: string, dryRun = false) {

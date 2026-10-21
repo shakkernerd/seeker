@@ -12,6 +12,8 @@ export const bridgeProtocol = 2;
 export interface BridgeEndpoint { socketPath: string; credential: string; protocol?: number }
 export type NativeSender = (origin: NativeInvocation, args: NativeSendArguments, signal: AbortSignal, current: () => boolean) => Promise<NativeSendOutcome>;
 const unavailable = () => new ConnectorError("desktop_connector_unavailable", "The qualified Desktop connector's native bridge is unavailable.", 503);
+/** The caller gave up on this request; the connector itself is fine and keeps serving. */
+const cancelled = () => new ConnectorError("desktop_request_cancelled", "The request was cancelled before the bridge answered.", 503);
 const outcomes = ["accepted", "refused", "uncertain"];
 
 export function parseBridgeEndpoint(value: unknown): BridgeEndpoint {
@@ -55,7 +57,7 @@ export async function listenNativeBridge(dataDir: string, native: Pick<CodexNati
           // Reads have their own capacity; they never take a send's slot. A task the host cannot
           // read is answered explicitly, so the service keeps this connector for its sends.
           if (reads.size >= 4) { write({ threadState: { unavailable: "busy" } }); return; }
-          const reading = native.threadState(origin, threadId, AbortSignal.timeout(4_000))
+          const reading = native.threadState(origin, threadId, AbortSignal.timeout(8_000))
             .then((state) => write({ threadState: state }), (error) => write({ threadState: { unavailable: typeof (error as { code?: unknown })?.code === "string" ? (error as { code: string }).code : "native_read_failed" } }));
           reads.add(reading); void reading.finally(() => reads.delete(reading));
           return;
@@ -108,13 +110,15 @@ export async function threadStateBridge(endpoint: BridgeEndpoint, dataDir: strin
   const socket = createConnection(parsed.socketPath);
   return new Promise((resolve, reject) => {
     let buffer = "", settled = false, unreadable: string | undefined;
+    let slow = false;
     const finish = (value?: ThreadState) => {
       if (settled) return; settled = true; clearTimeout(timer); signal.removeEventListener("abort", abort); socket.destroy();
       if (value) resolve(value);
-      else if (unreadable) reject(new ConnectorError("desktop_thread_unreadable", `The watched task could not be read now (${unreadable}); it is read again at the next interval.`, 503));
+      else if (unreadable || slow) reject(new ConnectorError("desktop_thread_unreadable", `The watched task could not be read now (${unreadable ?? "slow"}); it is read again at the next interval.`, 503));
+      else if (signal.aborted) reject(cancelled());
       else reject(unavailable());
     };
-    const abort = () => finish(), timer = setTimeout(abort, 5_000); timer.unref();
+    const abort = () => finish(), timer = setTimeout(() => { slow = true; abort(); }, 12_000); timer.unref();
     socket.setEncoding("utf8"); socket.once("error", abort); socket.once("close", abort);
     socket.on("data", (chunk: string) => {
       buffer += chunk; if (Buffer.byteLength(buffer) > 2_048) return abort();
@@ -156,6 +160,7 @@ export async function nativeSendBridge(endpoint: BridgeEndpoint, dataDir: string
       if (value) resolve(value);
       else if (written) resolve({ status: "uncertain", code: "desktop_bridge_lost" });
       else if (stale) reject(new ConnectorError("delivery_not_current", "The delivery is no longer current; nothing was sent.", 409));
+      else if (signal.aborted) reject(cancelled());
       else reject(unavailable());
     };
     const abort = () => finish(), timer = setTimeout(abort, 10_000); timer.unref();

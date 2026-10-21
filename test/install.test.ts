@@ -117,4 +117,12 @@ test("event connector setup upgrades a tool list it generated earlier and preser
   expect(connectEvents(f.home, config, true)).toMatchObject({ changed: false, enabledTools: expect.stringContaining("preserved") });
   connectEvents(f.home, config);
   expect(readFileSync(config, "utf8")).toBe(custom);
+  // A mention of the event table inside another table's comment never redirects the rewrite to that table.
+  const decoy = '[mcp_servers.seeker]\ncommand = "/human"\n# Configure [mcp_servers.seeker_events] separately\nenabled_tools = ["submit", "get", "pending", "update"]\n\n' + older;
+  writeFileSync(config, decoy);
+  connectEvents(f.home, config);
+  const result = readFileSync(config, "utf8");
+  expect(result).toContain('enabled_tools = ["submit", "get", "pending", "update"]');
+  expect(result).toContain('"event_watch"');
+  expect(result).not.toContain('"event_resume"');
 });

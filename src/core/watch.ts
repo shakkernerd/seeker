@@ -16,7 +16,7 @@ export class ThreadWatcher {
   #controller?: AbortController;
   lastError?: "store_write_failed";
 
-  constructor(private readonly core: SeekerCore, private readonly hosts: readonly HostAdapter[], private readonly intervalMs = 30_000, private readonly readTimeoutMs = 4_000) {}
+  constructor(private readonly core: SeekerCore, private readonly hosts: readonly HostAdapter[], private readonly intervalMs = 30_000, private readonly readTimeoutMs = 15_000) {}
 
   start(): void {
     this.#stopped = false;

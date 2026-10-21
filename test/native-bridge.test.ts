@@ -95,6 +95,10 @@ test("a thread-state read crosses the bridge with the watcher's stamp and return
   expect(await nativeSendBridge(f.bridge.endpoint, f.dataDir, origin, args, new AbortController().signal)).toEqual({ status: "accepted", threadId: "owner-task" });
   f.state({ taskId: "other-task", turnId: "t", status: "failed" });
   await expect(threadStateBridge(f.bridge.endpoint, f.dataDir, reader, "lead-task", new AbortController().signal)).rejects.toMatchObject({ code: "desktop_connector_unavailable" });
+  // The caller's own cancellation is reported as such, not as a lost connector.
+  const early = new AbortController(); early.abort();
+  await expect(threadStateBridge(f.bridge.endpoint, f.dataDir, reader, "lead-task", early.signal)).rejects.toMatchObject({ code: "desktop_request_cancelled" });
+  await expect(nativeSendBridge(f.bridge.endpoint, f.dataDir, origin, args, early.signal)).rejects.toMatchObject({ code: "desktop_request_cancelled" });
   // One connection carries one operation.
   await new Promise<void>((resolve) => {
     const socket = createConnection(f.bridge.endpoint.socketPath);
