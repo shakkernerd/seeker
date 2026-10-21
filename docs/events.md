@@ -8,9 +8,9 @@ The original native host needs the current Seeker connector and event tools load
 
 ## Arm a wait
 
-Call `event_arm` with a short `title`, an `expiresAt` Unix timestamp in milliseconds, and `capabilityFile`, an absolute path in a task-private directory. Seeker creates the producer key file there exclusively with mode `0600` and returns the wait: `waitId`, `generation`, `revision`, `state: "waiting"` and the `capabilityFile` path. The key itself never appears in a tool result, log, notice or public text. Optional `waitId` and `revision` fix the identity and the source revision; otherwise Seeker chooses the id and records `unversioned`.
+Call `event_arm` with a short `title` and an `expiresAt` Unix timestamp in milliseconds. Seeker creates the producer key file under its own home, `<data dir>/keys/<waitId>.json`, exclusively with mode `0600`, and returns the wait: `waitId`, `generation`, `revision`, `state: "waiting"` and the key's path as `capabilityFile`. The key itself never appears in a tool result, log, notice or public text; Seeker removes the file when the wait is cleared. Optional `waitId` and `revision` fix the identity and the source revision; otherwise Seeker chooses the id and records `unversioned`. Optional `capabilityFile`, an absolute path in an existing private directory, places the key where the task says; a key placed that way is the task's to remove.
 
-Give the path to whatever observes the job's end, then continue independent work or end the turn. Arming again with the same path returns the same wait; a different title, expiry or revision under that path is refused. A cleared id is never reused.
+Give the path to whatever observes the job's end, then continue independent work or end the turn. Arming again with the same `waitId` (or the same task-chosen path) returns the same wait; a different title, expiry or revision under it is refused. A cleared id is never reused.
 
 The producer writes bounded JSON containing `eventId`, `outcome` (`completed`, `released` or `failed`), `summary` and `evidenceRefs` (up to eight reference strings), then runs:
 
@@ -41,7 +41,7 @@ Seeker never sends anything to the watched task. A task cannot watch itself. A w
 
 ## Lifetime, limits and retention
 
-Every wait has a caller-explicit expiry. If an open wait reaches that deadline without a producer result, the service saves one failure receipt (`source: "deadline"`, `signal.outcome: "failed"`) and delivers it like any other notice. This means the wait obtained no result; **job completion remains unknown**. The notice does not restart the job or establish success. A late producer signal is rejected and cannot replace the deadline receipt. If a result was saved before the deadline but not yet delivered, expiry retires the notification and keeps the result.
+Every wait has a caller-explicit expiry, which ends only the waiting. If an open wait reaches that deadline without a producer result, the service saves one failure receipt (`source: "deadline"`, `signal.outcome: "failed"`) and delivers it like any other notice. This means the wait obtained no result; **job completion remains unknown**. The notice does not restart the job or establish success. A late producer signal is rejected and cannot replace the deadline receipt. A result saved by the deadline is delivered whatever the deadline, even when the task is busy past it.
 
 A settled wait (`delivered`, `handled`, `cancelled` or `expired`) stays readable with `event_get` for one day after it settled, then the service clears it on its own, leaving a compact identity tombstone so a delayed arm or signal retry cannot recreate a send. `event_clear` removes a settled wait sooner. A wait whose delivery is `unknown` is never cleared until the task acknowledges it. Tombstones do not consume capacity; their identity rows remain, so this is not a total database-size bound.
 

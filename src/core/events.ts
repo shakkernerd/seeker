@@ -5,7 +5,7 @@ import { turnEndings } from "../events.ts";
 import { fail, id, integer, object, text } from "./validation.ts";
 
 /** `retainedMs`: a settled wait (delivered, handled, cancelled or expired) is cleared by the service this long after it settled. */
-export const eventLimits = { resultBytes: 16_384, retained: 4096, perTask: 128, retainedMs: 86_400_000, noticeSummaryChars: 2000, noticeRefChars: 200 } as const;
+export const eventLimits = { resultBytes: 16_384, retained: 4096, perTask: 128, retainedMs: 86_400_000, noticeSummaryChars: 2000 } as const;
 /** The endings a watch reports unless the task chose; a completed turn is ordinary and stays quiet by default. */
 export const defaultWatchEndings: readonly TurnEnding[] = ["failed", "interrupted"];
 export const eventRoute = (wait: Pick<EventWait, "owner">): string => JSON.stringify(["event", wait.owner.hostId, wait.owner.taskId]);
@@ -34,8 +34,11 @@ function expiry(value: unknown, now: number, allowPast: boolean, what: string): 
 }
 export function eventArmRequest(raw: unknown, now: number): EventArmRequest {
   const value = object(raw); keys(value, ["title", "expiresAt", "capabilityFile", "revision", "waitId"]);
-  if (typeof value.capabilityFile !== "string" || !isAbsolute(value.capabilityFile) || value.capabilityFile.includes("\0") || value.capabilityFile.length > 1024) fail("invalid_capability_path", "Give an absolute path for the producer key file inside a private directory.");
-  const request: EventArmRequest = { title: text(value.title, "Wait title", 200), expiresAt: expiry(value.expiresAt, now, false, "wait"), capabilityFile: value.capabilityFile };
+  const request: EventArmRequest = { title: text(value.title, "Wait title", 200), expiresAt: expiry(value.expiresAt, now, false, "wait") };
+  if (value.capabilityFile !== undefined) {
+    if (typeof value.capabilityFile !== "string" || !isAbsolute(value.capabilityFile) || value.capabilityFile.includes("\0") || value.capabilityFile.length > 1024) fail("invalid_capability_path", "Give an absolute path for the producer key file inside a private directory, or omit it and let Seeker place the key.");
+    request.capabilityFile = value.capabilityFile;
+  }
   if (value.revision !== undefined) request.revision = id(value.revision, "Source revision");
   if (value.waitId !== undefined) request.waitId = id(value.waitId, "Wait");
   return request;
@@ -58,11 +61,13 @@ export function eventOwner(raw: EventOwner): EventOwner {
   return value;
 }
 export function eventArm(raw: unknown, now: number, allowPast = false): EventArm {
-  const value = object(raw); keys(value, ["waitId", "generation", "revision", "title", "expiresAt", "capabilityDigest"]);
+  const value = object(raw); keys(value, ["waitId", "generation", "revision", "title", "expiresAt", "capabilityDigest", "keyFile"]);
   const expiresAt = integer(value.expiresAt, "Expiry", 1);
   if (!allowPast && expiresAt <= now) fail("event_expired", "Choose an explicit future wait expiry.", 409);
   if (typeof value.capabilityDigest !== "string" || !/^[a-f0-9]{64}$/.test(value.capabilityDigest)) fail("invalid_capability", "Use the digest from a private event capability file.");
-  return { ...eventAddress(value), title: text(value.title, "Wait title", 200), expiresAt, capabilityDigest: value.capabilityDigest };
+  const arm: EventArm = { ...eventAddress(value), title: text(value.title, "Wait title", 200), expiresAt, capabilityDigest: value.capabilityDigest };
+  if (value.keyFile !== undefined) { if (typeof value.keyFile !== "string" || !isAbsolute(value.keyFile)) fail("invalid_capability", "A Seeker-placed key file is an absolute path."); arm.keyFile = value.keyFile; }
+  return arm;
 }
 export function eventWatch(raw: unknown, now: number, allowPast = false): EventWatch {
   const value = object(raw); keys(value, ["waitId", "generation", "revision", "title", "expiresAt", "threadId", "on"]);
@@ -73,12 +78,12 @@ export function threadObservation(raw: unknown): ThreadObservation {
   if (!turnEndings.includes(value.status as TurnEnding)) fail("invalid_input", "Only a completed, failed or interrupted turn is an observation.");
   return { turnId: id(value.turnId, "Turn"), status: value.status as TurnEnding };
 }
-/** The bounded result a notice carries; the full summary and references stay in the saved receipt. */
+/** The result a notice carries: the summary bounded, the references complete so each one can be used as given. */
 export function eventResult(wait: EventWait): EventResult {
   if (!wait.receipt) throw new Error("An event result requires a saved receipt.");
   const { signal } = wait.receipt;
   const summary = signal.summary.length > eventLimits.noticeSummaryChars ? `${signal.summary.slice(0, eventLimits.noticeSummaryChars)} … (truncated; the full summary is in the saved record)` : signal.summary;
-  const result: EventResult = { outcome: signal.outcome, summary, evidenceRefs: signal.evidenceRefs.map((ref) => ref.length > eventLimits.noticeRefChars ? `${ref.slice(0, eventLimits.noticeRefChars)}…` : ref) };
+  const result: EventResult = { outcome: signal.outcome, summary, evidenceRefs: [...signal.evidenceRefs] };
   if (wait.title !== undefined) result.title = wait.title;
   if (wait.receipt.source) result.source = wait.receipt.source;
   return result;
@@ -91,8 +96,8 @@ export function eventSignal(raw: unknown): EventSignal {
   if (Buffer.byteLength(JSON.stringify(result)) > eventLimits.resultBytes) fail("too_large", "The saved event result exceeds its byte limit.", 413);
   return result;
 }
-export function eventPublic(value: EventWait & { capabilityDigest?: string; armFingerprint?: string; signalFingerprint?: string }): EventWait {
-  const { capabilityDigest: _capability, armFingerprint: _arm, signalFingerprint: _signal, ...publicValue } = value;
+export function eventPublic(value: EventWait & { capabilityDigest?: string; keyFile?: string; armFingerprint?: string; signalFingerprint?: string }): EventWait {
+  const { capabilityDigest: _capability, keyFile: _key, armFingerprint: _arm, signalFingerprint: _signal, ...publicValue } = value;
   return structuredClone(publicValue);
 }
 export function sameEventOwner(a: Pick<EventOwner, "hostId" | "taskId">, b: Pick<EventOwner, "hostId" | "taskId">): boolean { return a.hostId === b.hostId && a.taskId === b.taskId; }

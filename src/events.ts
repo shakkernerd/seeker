@@ -13,11 +13,11 @@ export interface EventOwner {
 export interface EventAddress { waitId: string; generation: string; revision: string }
 /** How a task names one of its waits: the id alone, or the full address when it has it. */
 export interface EventRef { waitId: string; generation?: string; revision?: string }
-/** What a task supplies to arm a wait: Seeker prepares the producer key file at `capabilityFile` itself. */
+/** What a task supplies to arm a wait. Seeker prepares the producer key file itself, under its own home unless `capabilityFile` names the place. */
 export interface EventArmRequest {
   title: string;
   expiresAt: number;
-  capabilityFile: string;
+  capabilityFile?: string;
   revision?: string;
   waitId?: string;
 }
@@ -25,6 +25,8 @@ export interface EventArm extends EventAddress {
   title: string;
   expiresAt: number;
   capabilityDigest: string;
+  /** A key file Seeker placed under its own home; removed when the wait is cleared. A task-chosen file is the task's. */
+  keyFile?: string;
 }
 /** The ways a task's turn can end; a watch reports the ones it was armed for. */
 export type TurnEnding = "completed" | "failed" | "interrupted";
@@ -91,6 +93,7 @@ export interface EventWait extends EventAddress {
 }
 export interface StoredEventWait extends EventWait {
   capabilityDigest?: string;
+  keyFile?: string;
   armFingerprint?: string;
   signalFingerprint?: string;
 }

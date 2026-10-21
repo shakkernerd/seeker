@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { randomUUID, timingSafeEqual } from "node:crypto";
+import { unlinkSync } from "node:fs";
 import type { DeliveryResult } from "../contracts.ts";
 import type { EventAddress, EventArm, EventOwner, EventRef, EventSignal, EventStore, EventWait, EventWatch, StoredEventWait, ThreadObservation } from "../events.ts";
 import { defaultWatchEndings, eventAddress, eventArm, eventDigest, eventFingerprint, eventLimits, eventOwner, eventPublic, eventRef, eventRoute, eventSignal, eventWatch, sameEventOwner, threadObservation } from "../core/events.ts";
@@ -23,17 +24,18 @@ export class SqliteEventStore implements EventStore {
     const input = eventArm(raw, now, true);
     const address = eventAddress(input);
     return this.db.transaction(() => {
+      const { keyFile, ...content } = input;
+      const fingerprint = eventFingerprint({ ...content, owner: { hostId: owner.hostId, taskId: owner.taskId, bindingId: owner.bindingId, ownerGeneration: owner.ownerGeneration } });
       const previous = this.#find(address.waitId);
       if (previous) {
         this.#owned(previous, owner, address);
-        const fingerprint = eventFingerprint({ ...input, owner: { hostId: owner.hostId, taskId: owner.taskId, bindingId: owner.bindingId, ownerGeneration: owner.ownerGeneration } });
         if (previous.armFingerprint !== fingerprint || previous.state === "cleared") fail("event_conflict", "This wait identity already has different content or was cleared. Use a new identity.", 409);
         this.#expire(previous, now); return eventPublic(previous);
       }
       if (input.expiresAt <= now) fail("event_expired", "Choose an explicit future wait expiry.", 409);
       this.#admit(owner);
-      const { capabilityDigest, ...content } = input;
-      const wait: StoredEventWait = { ...content, owner, capabilityDigest, armFingerprint: eventFingerprint({ ...input, owner: { hostId: owner.hostId, taskId: owner.taskId, bindingId: owner.bindingId, ownerGeneration: owner.ownerGeneration } }), version: 1, state: "waiting", createdAt: now, updatedAt: now };
+      const { capabilityDigest, ...stored } = content;
+      const wait: StoredEventWait = { ...stored, owner, capabilityDigest, ...(keyFile ? { keyFile } : {}), armFingerprint: fingerprint, version: 1, state: "waiting", createdAt: now, updatedAt: now };
       this.db.query("INSERT INTO event_waits(id,host_id,task_id,state,next_at,data) VALUES (?,?,?,?,?,?)").run(wait.waitId, owner.hostId, owner.taskId, wait.state, input.expiresAt, JSON.stringify(wait));
       return eventPublic(wait);
     }).immediate();
@@ -145,10 +147,11 @@ export class SqliteEventStore implements EventStore {
     return this.db.transaction(() => {
       const claimed: EventWait[] = [], excluded = new Set(excludedRoutes);
       // Expiration and queue selection stay bounded even with thousands of retained results.
-      const expired = this.db.query<Row, [number, number]>("SELECT data FROM event_waits WHERE state IN ('waiting','ready') AND next_at<=? AND json_extract(data,'$.expiresAt')<=? AND json_extract(data,'$.receipt.source') IS NOT 'deadline' AND NOT (json_extract(data,'$.watch.threadId') IS NOT NULL AND json_extract(data,'$.receipt.id') IS NOT NULL) LIMIT 128").all(now, now);
+      const expired = this.db.query<Row, [number, number]>("SELECT data FROM event_waits WHERE state='waiting' AND next_at<=? AND json_extract(data,'$.expiresAt')<=? AND json_extract(data,'$.receipt.id') IS NULL LIMIT 128").all(now, now);
       for (const row of expired) this.#expire(decode(row), now);
       // Retention: a settled wait is cleared by the service once its day has passed; the task does nothing.
-      const settled = this.db.query<Row, [number]>(`SELECT data FROM event_waits WHERE state IN ${settledStates} AND next_at<=? LIMIT 128`).all(now);
+      // Rows that may not be cleared yet (a send in flight, an unknown send not reconciled) are left out of the scan so they never hold the rest back.
+      const settled = this.db.query<Row, [number]>(`SELECT data FROM event_waits WHERE state IN ${settledStates} AND next_at<=? AND json_extract(data,'$.delivery.state') IS NOT 'sending' AND NOT (json_extract(data,'$.delivery.state')='unknown' AND json_extract(data,'$.receipt.disposition') IS NOT 'handled') LIMIT 128`).all(now);
       for (const row of settled) { const wait = decode(row); if (!this.#clearable(wait)) continue; this.#clear(wait); wait.version += 1; wait.updatedAt = now; this.#save(wait); }
       while (claimed.length < limit) {
         const routes = [...excluded];
@@ -244,15 +247,15 @@ export class SqliteEventStore implements EventStore {
     wait.owner = { hostId: wait.owner.hostId, taskId: wait.owner.taskId };
     delete wait.title; delete wait.expiresAt; delete wait.createdAt; delete wait.watch;
     delete wait.receipt; delete wait.delivery; delete wait.capabilityDigest; delete wait.armFingerprint; delete wait.signalFingerprint; delete wait.reason;
+    // A key Seeker placed goes with the record; a file the task named is the task's to remove.
+    if (wait.keyFile) { try { unlinkSync(wait.keyFile); } catch { /* already gone, or not ours to remove */ } delete wait.keyFile; }
   }
   #renew(wait: StoredEventWait, now: number): void { wait.delivery = { id: randomUUID(), state: "queued", attempts: 0, nextAt: now }; }
   #retire(wait: StoredEventWait): void { if (wait.delivery && ["queued", "retry", "rejected"].includes(wait.delivery.state)) wait.delivery.state = "retired"; }
   #expire(wait: StoredEventWait, now: number): void {
-    if (terminal(wait) || wait.receipt?.source === "deadline" || (wait.expiresAt !== undefined && wait.expiresAt > now)) return;
-    // A watch's expiry only ends the watching: an observation already recorded is still delivered,
-    // and there is no producer whose silence needs reporting.
-    if (wait.watch && wait.receipt) return;
-    if (!wait.receipt && wait.expiresAt !== undefined && !wait.watch) {
+    // A saved result, whoever recorded it, is delivered whatever the deadline: expiry only ends the waiting.
+    if (terminal(wait) || wait.receipt || (wait.expiresAt !== undefined && wait.expiresAt > now)) return;
+    if (wait.expiresAt !== undefined && !wait.watch) {
       wait.receipt = {
         id: randomUUID(), source: "deadline", recordedAt: now, disposition: "pending",
         signal: { ...eventAddress(wait), eventId: randomUUID(), outcome: "failed", evidenceRefs: [],
@@ -267,9 +270,8 @@ export class SqliteEventStore implements EventStore {
   }
   #save(wait: StoredEventWait): void {
     const queued = wait.state === "ready" && wait.delivery && ["queued", "retry"].includes(wait.delivery.state);
-    // A deadline notice and an observed watch are delivered on their own schedule; their expiry no longer governs them.
-    // A settled wait's next_at is when retention clears it.
-    const next = queued ? wait.receipt?.source === "deadline" || wait.watch ? wait.delivery!.nextAt : Math.min(wait.expiresAt ?? 0, wait.delivery!.nextAt) : terminal(wait) && wait.state !== "cleared" ? wait.updatedAt + eventLimits.retainedMs : wait.expiresAt ?? 0;
+    // A queued result is delivered on its own schedule; a settled wait's next_at is when retention clears it; an open wait's is its expiry.
+    const next = queued ? wait.delivery!.nextAt : terminal(wait) && wait.state !== "cleared" ? wait.updatedAt + eventLimits.retainedMs : wait.expiresAt ?? 0;
     this.db.query("UPDATE event_waits SET state=?,next_at=?,data=? WHERE id=?").run(wait.state, next, JSON.stringify(wait), wait.waitId);
   }
 }

@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
 import type { EventOwner, EventPort } from "../events.ts";
 import { prepareEventCapability } from "./event-client.ts";
 import { defaultWatchEndings, eventArmRequest, eventOwner, eventRef, eventWatchRequest } from "./events.ts";
@@ -7,7 +9,8 @@ import { fail, id, origin as validateOrigin, sameRecipient } from "./validation.
 
 /** Trusted composition owns this object. Expose only a bound ManagerPort to agent tools. */
 export class SeekerCore {
-  constructor(readonly store: ExchangeStore, readonly clock: () => number = Date.now) {}
+  /** `keyDirectory`: where Seeker places producer key files for waits armed without a path; without it a task must name the path. */
+  constructor(readonly store: ExchangeStore, readonly clock: () => number = Date.now, private readonly options: { keyDirectory?: string } = {}) {}
 
   bind(binding: ManagerBinding): void { this.store.bind(binding); }
   setRecipient(bindingId: string, expectedGeneration: number, recipient: Recipient): void {
@@ -59,17 +62,26 @@ export class SeekerCore {
       arm: (raw) => {
         current();
         const request = eventArmRequest(raw, this.clock());
-        // The producer key is created here, once, at the path the task chose; only its digest enters the store.
+        // The producer key is created here, once: under Seeker's own key directory unless the task named a place. Only its digest enters the store.
+        const waitId = request.waitId ?? `wait-${randomUUID()}`;
+        let capabilityFile = request.capabilityFile;
+        if (capabilityFile === undefined) {
+          if (!this.options.keyDirectory) fail("capability_path_required", "This service has no key directory; give capabilityFile, an absolute path in a private directory.", 409);
+          mkdirSync(this.options.keyDirectory, { recursive: true, mode: 0o700 });
+          capabilityFile = join(this.options.keyDirectory, `${waitId}.json`);
+        }
         let grant;
-        try { grant = prepareEventCapability(request.capabilityFile, { revision: request.revision ?? "unversioned", ...(request.waitId ? { waitId: request.waitId } : {}) }); }
+        // A task-chosen path without a chosen id recovers whatever wait that file already names.
+        try { grant = prepareEventCapability(capabilityFile, { revision: request.revision ?? "unversioned", ...(request.waitId !== undefined || request.capabilityFile === undefined ? { waitId } : {}) }); }
         catch (error) {
           const code = (error as NodeJS.ErrnoException).code;
-          if (code === "ENOENT") fail("capability_directory_missing", "Create the private directory for the producer key file first.", 409);
+          if (code === "ENOENT") fail("capability_directory_missing", "The directory for the producer key file does not exist; create it, or omit capabilityFile and let Seeker place the key.", 409);
           if (code === "EACCES" || code === "EPERM" || code === "EROFS") fail("capability_unwritable", "The producer key file path is not writable by the service.", 409);
           throw error;
         }
         const { capabilityDigest, ...address } = grant;
-        return { ...this.store.events.arm(origin, { ...address, title: request.title, expiresAt: request.expiresAt, capabilityDigest }, this.clock()), capabilityFile: request.capabilityFile };
+        const arm = { ...address, title: request.title, expiresAt: request.expiresAt, capabilityDigest, ...(request.capabilityFile === undefined ? { keyFile: capabilityFile } : {}) };
+        return { ...this.store.events.arm(origin, arm, this.clock()), capabilityFile };
       },
       watch: (raw) => {
         current();
