@@ -67,7 +67,7 @@ describe("thread watches", () => {
     expect(await armed.json()).toMatchObject({ waitId: "watch-lead", state: "waiting", watch: { threadId: "lead-one" } });
     expect((await f.invoke(session, "manager-one", "event_watch", { ...watch, threadId: "manager-one" })).status).toBe(400);
     expect((await f.invoke(session, "manager-one", "event_watch", { ...watch, capabilityDigest: "a".repeat(64) })).status).toBe(400);
-    expect(f.store.events.watching(Date.now(), 8).map((wait) => wait.waitId)).toEqual(["watch-lead"]);
+    expect(f.store.events.watching(Date.now()).map((wait) => wait.waitId)).toEqual(["watch-lead"]);
     const read = () => f.host.threadState({ hostId: "codex-test", taskId: "manager-one", turnId: "native-turn" }, "lead-one", new AbortController().signal);
     await expect(read()).rejects.toMatchObject({ code: "desktop_connector_unavailable" });
     await expect(f.host.threadState({ hostId: "other-host", taskId: "manager-one" }, "lead-one", new AbortController().signal)).rejects.toMatchObject({ code: "origin_denied" });

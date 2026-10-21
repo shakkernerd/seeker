@@ -87,8 +87,8 @@ export interface EventPort {
 export interface EventStore {
   arm(owner: EventOwner, input: EventArm, now: number): EventWait;
   watch(owner: EventOwner, input: EventWatch, now: number): EventWait;
-  /** Unexpired watches still waiting for an observation. */
-  watching(now: number, limit: number): EventWait[];
+  /** Every unexpired watch still waiting for an observation. */
+  watching(now: number): EventWait[];
   /** Records one observed failed or interrupted turn as the watch's result and queues its delivery. */
   observe(address: EventAddress, observation: ThreadObservation, now: number): EventWait | undefined;
   get(owner: Pick<EventOwner, "hostId" | "taskId">, address: EventAddress, now: number): EventWait;

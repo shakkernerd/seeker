@@ -60,9 +60,8 @@ export class SqliteEventStore implements EventStore {
       return eventPublic(wait);
     }).immediate();
   }
-  watching(now: number, limit: number): EventWait[] {
-    integer(limit, "Watch read limit", 1);
-    return this.db.transaction(() => this.db.query<Row, [number, number]>("SELECT data FROM event_waits WHERE state='waiting' AND json_extract(data,'$.watch.threadId') IS NOT NULL AND json_extract(data,'$.expiresAt')>? ORDER BY rowid LIMIT ?").all(now, limit).map((row) => eventPublic(decode(row)))).immediate();
+  watching(now: number): EventWait[] {
+    return this.db.transaction(() => this.db.query<Row, [number]>("SELECT data FROM event_waits WHERE state='waiting' AND json_extract(data,'$.watch.threadId') IS NOT NULL AND json_extract(data,'$.expiresAt')>? ORDER BY rowid").all(now).map((row) => eventPublic(decode(row)))).immediate();
   }
   observe(rawAddress: EventAddress, raw: ThreadObservation, now: number): EventWait | undefined {
     const address = eventAddress(rawAddress), observation = threadObservation(raw);
@@ -147,7 +146,7 @@ export class SqliteEventStore implements EventStore {
     return this.db.transaction(() => {
       const claimed: EventWait[] = [], excluded = new Set(excludedRoutes);
       // Expiration and queue selection stay bounded even with thousands of retained results.
-      const expired = this.db.query<Row, [number, number]>("SELECT data FROM event_waits WHERE state IN ('waiting','ready') AND next_at<=? AND json_extract(data,'$.expiresAt')<=? AND json_extract(data,'$.receipt.source') IS NOT 'deadline' LIMIT 128").all(now, now);
+      const expired = this.db.query<Row, [number, number]>("SELECT data FROM event_waits WHERE state IN ('waiting','ready') AND next_at<=? AND json_extract(data,'$.expiresAt')<=? AND json_extract(data,'$.receipt.source') IS NOT 'deadline' AND NOT (json_extract(data,'$.watch.threadId') IS NOT NULL AND json_extract(data,'$.receipt.id') IS NOT NULL) LIMIT 128").all(now, now);
       for (const row of expired) this.#expire(decode(row), now);
       while (claimed.length < limit) {
         const routes = [...excluded];
@@ -245,7 +244,8 @@ export class SqliteEventStore implements EventStore {
   }
   #save(wait: StoredEventWait): void {
     const queued = wait.state === "ready" && wait.delivery && ["queued", "retry"].includes(wait.delivery.state);
-    const next = queued ? wait.receipt?.source === "deadline" ? wait.delivery!.nextAt : Math.min(wait.expiresAt ?? 0, wait.delivery!.nextAt) : wait.expiresAt ?? 0;
+    // A deadline notice and an observed watch are delivered on their own schedule; their expiry no longer governs them.
+    const next = queued ? wait.receipt?.source === "deadline" || wait.watch ? wait.delivery!.nextAt : Math.min(wait.expiresAt ?? 0, wait.delivery!.nextAt) : wait.expiresAt ?? 0;
     this.db.query("UPDATE event_waits SET state=?,next_at=?,data=? WHERE id=?").run(wait.state, next, JSON.stringify(wait), wait.waitId);
   }
 }

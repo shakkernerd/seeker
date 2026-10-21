@@ -16,7 +16,7 @@ export class ThreadWatcher {
   #controller?: AbortController;
   lastError?: "store_write_failed";
 
-  constructor(private readonly core: SeekerCore, private readonly hosts: readonly HostAdapter[], private readonly intervalMs = 30_000, private readonly readTimeoutMs = 4_000, private readonly limit = 32) {}
+  constructor(private readonly core: SeekerCore, private readonly hosts: readonly HostAdapter[], private readonly intervalMs = 30_000, private readonly readTimeoutMs = 4_000) {}
 
   start(): void {
     this.#stopped = false;
@@ -31,7 +31,7 @@ export class ThreadWatcher {
     this.#controller?.abort();
   }
 
-  /** One pass over the unexpired watches; overlapping passes are skipped, not queued. */
+  /** One pass over every unexpired watch; a pass that outlasts the interval delays the next, it never overlaps it. */
   async tick(): Promise<number> {
     if (this.#stopped || this.#running || this.lastError) return 0;
     this.#running = true;
@@ -39,7 +39,7 @@ export class ThreadWatcher {
     let observed = 0;
     try {
       let watches: EventWait[];
-      try { watches = this.core.store.events.watching(this.core.clock(), this.limit); }
+      try { watches = this.core.store.events.watching(this.core.clock()); }
       catch { this.lastError = "store_write_failed"; return 0; }
       const byHost = new Map<string, EventWait[]>();
       for (const wait of watches) { const list = byHost.get(wait.owner.hostId) ?? []; list.push(wait); byHost.set(wait.owner.hostId, list); }

@@ -15,7 +15,7 @@ function fixture() {
   const states = new Map<string, ThreadState | Error>();
   const host: HostAdapter = { id: "codex-desktop", deliver: async () => ({ status: "retry", retryAfterMs: 1_000, code: "unused" }), threadState: async (reader, threadId) => { reads.push({ reader, threadId }); const state = states.get(threadId); if (!state) throw new Error("unknown task"); if (state instanceof Error) throw state; return state; } };
   const blind: HostAdapter = { id: "codex-cli", deliver: async () => ({ status: "retry", retryAfterMs: 1_000, code: "unused" }) };
-  const watcher = new ThreadWatcher(core, [host, blind], 60_000, 500, 8);
+  const watcher = new ThreadWatcher(core, [host, blind], 60_000, 500);
   cleanups.push(() => watcher.stop());
   const manager = core.events({ hostId: "codex-desktop", taskId: "manager", turnId: "manager-turn", callId: "manager-call" });
   const watch = (threadId: string, expiresAt = 60_000) => manager.watch({ waitId: `watch-${threadId}`, generation: "g", revision: threadId, title: `Watch ${threadId}`, expiresAt, threadId });
@@ -61,7 +61,7 @@ test("the watcher stops cleanly and never overlaps its own passes", async () => 
   const gate = new Promise<void>((resolve) => { release = resolve; });
   f.states.set("lead-slow", { taskId: "lead-slow", turnId: "s-1", status: "failed" });
   const slowHost: HostAdapter = { id: "codex-desktop", deliver: async () => ({ status: "retry", retryAfterMs: 1_000, code: "unused" }), threadState: async () => { await gate; return { taskId: "lead-slow", turnId: "s-1", status: "failed" }; } };
-  const watcher = new ThreadWatcher(f.core, [slowHost], 60_000, 5_000, 8);
+  const watcher = new ThreadWatcher(f.core, [slowHost], 60_000, 5_000);
   const first = watcher.tick();
   expect(await watcher.tick()).toBe(0);
   release();

@@ -74,7 +74,8 @@ test("the bridge bounds concurrent sends and settles them before closing", async
   cleanups.push(() => slow.close().catch(() => {}));
   const inflight = Array.from({ length: 4 }, () => nativeSendBridge(slow.endpoint, f.dataDir, origin, args, new AbortController().signal));
   await Bun.sleep(20);
-  expect(await nativeSendBridge(slow.endpoint, f.dataDir, origin, args, new AbortController().signal)).toEqual({ status: "uncertain", code: "desktop_bridge_lost" });
+  // The fifth send is refused before any native call, so the service knows it was not sent.
+  expect(await nativeSendBridge(slow.endpoint, f.dataDir, origin, args, new AbortController().signal)).toEqual({ status: "refused", code: "desktop_bridge_busy" });
   const closing = slow.close();
   release();
   expect((await Promise.all(inflight)).every((outcome) => outcome.status === "accepted")).toBe(true);
@@ -88,9 +89,10 @@ test("a thread-state read crosses the bridge with the watcher's stamp and return
   expect(await threadStateBridge(f.bridge.endpoint, f.dataDir, reader, "lead-task", new AbortController().signal)).toEqual({ taskId: "lead-task", turnId: "lead-turn", status: "interrupted" });
   expect(f.reads).toEqual([{ origin: reader, threadId: "lead-task" }]);
   expect(f.sends).toHaveLength(0);
-  // A read the host refuses, or an answer about another task, is unavailable rather than a state.
-  f.state(new Error("not loaded"));
-  await expect(threadStateBridge(f.bridge.endpoint, f.dataDir, reader, "lead-task", new AbortController().signal)).rejects.toMatchObject({ code: "desktop_connector_unavailable" });
+  // A task the host cannot read is reported as unreadable, which keeps the connector for its sends.
+  f.state(Object.assign(new Error("not loaded"), { code: "native_call_failed" }));
+  await expect(threadStateBridge(f.bridge.endpoint, f.dataDir, reader, "lead-task", new AbortController().signal)).rejects.toMatchObject({ code: "desktop_thread_unreadable" });
+  expect(await nativeSendBridge(f.bridge.endpoint, f.dataDir, origin, args, new AbortController().signal)).toEqual({ status: "accepted", threadId: "owner-task" });
   f.state({ taskId: "other-task", turnId: "t", status: "failed" });
   await expect(threadStateBridge(f.bridge.endpoint, f.dataDir, reader, "lead-task", new AbortController().signal)).rejects.toMatchObject({ code: "desktop_connector_unavailable" });
   // One connection carries one operation.
@@ -99,5 +101,5 @@ test("a thread-state read crosses the bridge with the watcher's stamp and return
     socket.once("close", () => resolve());
     socket.once("connect", () => socket.write(`${JSON.stringify({ credential: f.bridge.endpoint.credential, threadState: { origin: reader, threadId: "lead-task" }, nativeSend: { origin: reader, arguments: args } })}\n`));
   });
-  expect(f.reads).toHaveLength(3); expect(f.sends).toHaveLength(0);
+  expect(f.reads).toHaveLength(3); expect(f.sends).toHaveLength(1);
 });

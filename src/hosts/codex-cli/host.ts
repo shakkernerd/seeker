@@ -87,8 +87,14 @@ export class CodexCliHost implements HostAdapter {
   /** A watched task's latest turn on the registered app-server; nothing is sent. */
   async threadState(reader: ThreadReader, threadId: string, signal: AbortSignal): Promise<ThreadState> {
     if (reader.hostId !== this.id) throw new ConnectorError("origin_denied", "This host does not serve that task.", 403);
-    const rpc = this.#rpc;
-    if (this.#closed || !rpc?.connected) throw new ConnectorError("cli_unavailable", "The registered CLI app-server is not connected.", 503);
+    if (this.#closed) throw new ConnectorError("cli_unavailable", "The CLI bridge is stopping.", 503);
+    let rpc = this.#rpc;
+    if (!rpc?.connected) {
+      // A read may reconnect to the existing app-server after a service restart; it never starts one.
+      const owner = this.#registration?.owner;
+      if (!owner || this.#stateFailed || await this.runtime.gone(owner, signal)) throw new ConnectorError("cli_unavailable", "The registered CLI app-server is not running.", 503);
+      rpc = await this.#connection(signal);
+    }
     const turns = record(await rpc.request("thread/turns/list", { threadId: identifier(threadId), limit: 1, sortDirection: "desc", itemsView: "notLoaded" }, signal, 1500));
     if (!Array.isArray(turns.data) || turns.data.length !== 1) throw new ConnectorError("cli_thread_state_unavailable", "The task's latest turn could not be read.", 503);
     const turn = record(turns.data[0]), status = String(turn.status);
