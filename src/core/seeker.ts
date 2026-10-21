@@ -1,5 +1,7 @@
+import { randomUUID } from "node:crypto";
 import type { EventOwner, EventPort } from "../events.ts";
-import { eventOwner } from "./events.ts";
+import { prepareEventCapability } from "./event-client.ts";
+import { defaultWatchEndings, eventArmRequest, eventOwner, eventRef, eventWatchRequest } from "./events.ts";
 import type { ChannelIngress, ExchangeStore, ExchangeView, InboundReply, ManagerBinding, ManagerOrigin, ManagerPort, ReadOptions, Recipient } from "../contracts.ts";
 import { fail, id, origin as validateOrigin, sameRecipient } from "./validation.ts";
 
@@ -52,16 +54,33 @@ export class SeekerCore {
       const live = this.managerBinding(origin.hostId, origin.taskId);
       if ((live?.id !== origin.bindingId) || (live?.origin.generation !== origin.ownerGeneration)) fail("owner_changed", "This event port's native assignment changed. Reconnect from the current owner.", 409);
     };
-    const mutate: (address: Parameters<EventPort["cancel"]>[0], expectedVersion: number, command: Parameters<ExchangeStore["events"]["mutate"]>[3]) => ReturnType<EventPort["get"]> =
-      (address, expectedVersion, command) => { current(); return this.store.events.mutate(origin, address, expectedVersion, command, this.clock()); };
+    const mutate = (ref: unknown, expectedVersion: number | undefined, command: Parameters<ExchangeStore["events"]["mutate"]>[3]) => { current(); return this.store.events.mutate(origin, eventRef(ref), expectedVersion, command, this.clock()); };
     return {
-      arm: (value) => { current(); return this.store.events.arm(origin, value, this.clock()); },
-      watch: (value) => { current(); return this.store.events.watch(origin, value, this.clock()); },
-      get: (address) => { current(); return this.store.events.get(origin, address, this.clock()); },
-      pending: () => { current(); return this.store.events.pending(origin, this.clock()).map(({ waitId, generation, revision, title, expiresAt, version, state, updatedAt, reason, receipt, watch }) => ({ waitId, generation, revision, title, expiresAt, version, state, updatedAt, ...(reason ? { reason } : {}), ...(receipt ? { receiptId: receipt.id } : {}), ...(watch ? { watch } : {}) })); },
-      cancel: (address, version) => mutate(address, version, { type: "cancel" }),
-      acknowledge: (address, version, receiptId, status) => mutate(address, version, { type: "acknowledge", receiptId, status }),
-      clear: (address, version) => mutate(address, version, { type: "clear" }),
+      arm: (raw) => {
+        current();
+        const request = eventArmRequest(raw, this.clock());
+        // The producer key is created here, once, at the path the task chose; only its digest enters the store.
+        let grant;
+        try { grant = prepareEventCapability(request.capabilityFile, { revision: request.revision ?? "unversioned", ...(request.waitId ? { waitId: request.waitId } : {}) }); }
+        catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code === "ENOENT") fail("capability_directory_missing", "Create the private directory for the producer key file first.", 409);
+          if (code === "EACCES" || code === "EPERM" || code === "EROFS") fail("capability_unwritable", "The producer key file path is not writable by the service.", 409);
+          throw error;
+        }
+        const { capabilityDigest, ...address } = grant;
+        return { ...this.store.events.arm(origin, { ...address, title: request.title, expiresAt: request.expiresAt, capabilityDigest }, this.clock()), capabilityFile: request.capabilityFile };
+      },
+      watch: (raw) => {
+        current();
+        const request = eventWatchRequest(raw, this.clock());
+        return this.store.events.watch(origin, { waitId: request.waitId ?? `watch-${randomUUID()}`, generation: randomUUID(), revision: "watch", title: request.title, expiresAt: request.expiresAt, threadId: request.threadId, on: request.on ?? [...defaultWatchEndings] }, this.clock());
+      },
+      get: (ref) => { current(); return this.store.events.get(origin, eventRef(ref), this.clock()); },
+      pending: () => { current(); return this.store.events.pending(origin, this.clock()).map(({ waitId, generation, revision, title, expiresAt, version, state, updatedAt, reason, receipt, watch, delivery }) => ({ waitId, generation, revision, title, expiresAt, version, state, updatedAt, ...(reason ? { reason } : {}), ...(receipt ? { receiptId: receipt.id } : {}), ...(watch ? { watch } : {}), ...(delivery ? { delivery: { state: delivery.state, ...(delivery.code ? { code: delivery.code } : {}) } } : {}) })); },
+      cancel: (ref, options) => mutate(ref, options?.expectedVersion, { type: "cancel" }),
+      acknowledge: (ref, status, options) => mutate(ref, options?.expectedVersion, { type: "acknowledge", status, ...(options?.receiptId !== undefined ? { receiptId: options.receiptId } : {}) }),
+      clear: (ref, options) => mutate(ref, options?.expectedVersion, { type: "clear" }),
     };
   }
 

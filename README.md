@@ -34,7 +34,7 @@ The local channel is available immediately. [Codex Desktop setup](docs/codex.md)
 
 ## Background results
 
-[Background event return](docs/events.md) lets an existing native task arm a durable wait and receive a correlated job completion or dependency release. The existing owner signals through a private per-wait capability; Seeker retains the result and delivery evidence without executing the job. Machine events are separate from human decisions and do not grant conversation-manager access.
+[Background event return](docs/events.md) lets an existing native task arm a durable wait in one call, end its turn, and be woken with the job's result, or watch another task and be woken when that task's turn ends. The existing owner signals through a private per-wait key that Seeker prepares; Seeker retains the result and delivery evidence without executing the job, and clears settled waits itself. Machine events are separate from human decisions and do not grant conversation-manager access.
 
 ## Use and extend
 

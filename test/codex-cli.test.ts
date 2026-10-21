@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Decision, DeliveryResult, ManagerBinding, ReceiptEnvelope } from "../src/contracts.ts";
@@ -388,13 +388,16 @@ test.each(["preparation", "input"] as const)("shutdown aborts and settles outsta
 
 test("CLI worker event admission delivers a saved result whatever turn the task is on, and waits only for an active turn", async () => {
   const f = fixture(), origin = invocation("individual-cli-worker");
-  const address = { waitId: "cli-dependency", generation: "wait-generation", revision: "release-one" };
-  const armed = await f.invoke(origin, "event_arm", { ...address, title: "Release", expiresAt: Date.now() + 60_000, capabilityDigest: eventDigest("d".repeat(64)) });
+  const keyDirectory = mkdtempSync(join(tmpdir(), "seeker-cli-key-")); cleanups.push(() => rmSync(keyDirectory, { recursive: true, force: true }));
+  const armed = await f.invoke(origin, "event_arm", { title: "Release", expiresAt: Date.now() + 60_000, capabilityFile: join(keyDirectory, "release.json"), waitId: "cli-dependency", revision: "release-one" });
   expect(armed.status).toBe(200);
+  const wait = await armed.json() as { generation: string };
+  const address = { waitId: "cli-dependency", generation: wait.generation, revision: "release-one" };
+  const key = JSON.parse(readFileSync(join(keyDirectory, "release.json"), "utf8")).capability as string;
   expect(f.core.managerBinding(cliHostId, origin.threadId)).toBeUndefined();
   expect((await f.invoke(origin, "submit", { requestId: "not-a-manager", decision })).status).toBe(403);
   expect((await f.invoke(origin, "event_resume", { ...address, expectedVersion: 1 })).status).not.toBe(200);
-  f.store.events.signal("d".repeat(64), { ...address, eventId: "released", outcome: "released", summary: "Untrusted producer text", evidenceRefs: [] }, Date.now());
+  f.store.events.signal(key, { ...address, eventId: "released", outcome: "released", summary: "Untrusted producer text", evidenceRefs: [] }, Date.now());
   let nativeTurn = "newer-turn", status = "inProgress";
   f.behavior.request = async (call) => call.method === "thread/turns/list" ? { data: [{ id: nativeTurn, status }] } : f.defaultResponse(call);
   const claimed = f.store.events.claim(1, Date.now(), [])[0]!, target = eventReturnTarget(claimed), envelope = eventEnvelope(claimed);
@@ -413,7 +416,7 @@ test("CLI worker event admission delivers a saved result whatever turn the task 
   expect(result.status).toBe("accepted");
   const calls = f.calls.filter((call) => call.method === "turn/start"); expect(calls).toHaveLength(1);
   expect(Object.keys(calls[0]!.params as object).sort()).toEqual(["input", "threadId"]);
-  expect(JSON.stringify(calls[0]!.params)).not.toContain("Untrusted producer text");
+  expect(JSON.stringify(calls[0]!.params)).toContain("Untrusted producer text");
   expect(JSON.stringify(calls[0]!.params)).not.toContain("event_resume");
   f.store.events.complete(address.waitId, address.generation, claimed.delivery!.attemptId!, result, Date.now());
   expect(f.store.events.claim(1, Date.now(), [])).toEqual([]);

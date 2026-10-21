@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SqliteExchangeStore } from "../src/store/sqlite.ts";
@@ -9,6 +9,7 @@ import { Database } from "bun:sqlite";
 import { fixtureBinding, fixtureDecision } from "../src/local/fixture.ts";
 import { eventDigest } from "../src/core/events.ts";
 import type { EventArm, EventOwner, EventSignal } from "../src/events.ts";
+import { eventLimits } from "../src/core/events.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); });
@@ -25,22 +26,24 @@ function fixture(persistent = false) {
   let core = new SeekerCore(store, () => now);
   cleanups.push(() => store.close());
   const port = () => core.events(owner);
-  return { directory, get store() { return store; }, get core() { return core; }, port, setTime: (value: number) => { now = value; },
+  // Store-level arming with a known key; the port's own arming prepares the key file (tested below).
+  const armed = (input: EventArm, who: EventOwner = owner) => store.events.arm(who, input, now);
+  return { directory, get store() { return store; }, get core() { return core; }, port, arm: armed, setTime: (value: number) => { now = value; },
     restart: () => { store.close(); store = new SqliteExchangeStore(join(directory, "store.sqlite")); core = new SeekerCore(store, () => now); },
     reopen: () => { store = new SqliteExchangeStore(join(directory, "store.sqlite")); core = new SeekerCore(store, () => now); },
   };
 }
 
 test("machine admission fixes the native owner, deduplicates exact signals and retains complete evidence", () => {
-  const f = fixture(); const wait = f.port().arm(arm);
+  const f = fixture(); const wait = f.arm(arm);
   expect(wait.state).toBe("waiting");
   expect(JSON.stringify(wait)).not.toContain(capability);
   expect(f.core.managerBinding(owner.hostId, owner.taskId)).toBeUndefined();
   expect(() => f.core.manager({ hostId: owner.hostId, managerId: owner.taskId, assignmentId: owner.taskId, generation: 1 })).toThrow();
-  expect(f.port().arm({ ...arm })).toEqual(wait);
+  expect(f.arm({ ...arm })).toEqual(wait);
   const reordered = { capabilityDigest: arm.capabilityDigest, expiresAt: arm.expiresAt, title: arm.title, revision: arm.revision, generation: arm.generation, waitId: arm.waitId };
-  expect(f.port().arm(reordered)).toEqual(wait);
-  expect(() => f.port().arm({ ...arm, title: "Different wait" })).toThrow("different content");
+  expect(f.arm(reordered)).toEqual(wait);
+  expect(() => f.arm({ ...arm, title: "Different wait" })).toThrow("different content");
   expect(() => f.core.events({ ...owner, taskId: "other-task" }).get(address)).toThrow("another native task");
   expect(() => f.store.events.signal("b".repeat(64), signal, 1000)).toThrow("not accepted");
   expect(() => f.store.events.signal(capability, { ...signal, generation: "old" }, 1000)).toThrow("generation");
@@ -57,23 +60,23 @@ test("machine admission fixes the native owner, deduplicates exact signals and r
 
 test("cancellation, explicit expiry and stale versions revoke known-unsent work without evicting results", () => {
   for (const mode of ["cancel", "expire"] as const) {
-    const f = fixture(); f.port().arm(arm); f.store.events.signal(capability, signal, 1000);
+    const f = fixture(); f.arm(arm); f.store.events.signal(capability, signal, 1000);
     let saved = f.port().get(address);
-    expect(() => f.port().cancel(address, 1)).toThrow("current wait");
-    if (mode === "cancel") saved = f.port().cancel(address, saved.version);
+    expect(() => f.port().cancel(address, { expectedVersion: 1 })).toThrow("current wait");
+    if (mode === "cancel") saved = f.port().cancel(address, { expectedVersion: saved.version });
     else { f.setTime(arm.expiresAt); saved = f.port().get(address); }
     expect(saved.state).toBe(mode === "cancel" ? "cancelled" : "expired");
     expect(saved.receipt?.signal).toEqual(signal);
     expect(f.store.events.claim(4, arm.expiresAt, [])).toEqual([]);
     expect(f.store.events.signal(capability, signal, arm.expiresAt).status).toBe("duplicate");
   }
-  const f = fixture(); f.port().arm(arm); f.port().cancel(address, 1);
+  const f = fixture(); f.arm(arm); f.port().cancel(address, { expectedVersion: 1 });
   expect(() => f.store.events.signal(capability, signal, 1001)).toThrow("no longer accepts");
 });
 
 test("a missed deadline saves one truthful failure, rejects late producers and survives restart without replay", () => {
   for (const outcome of ["accepted", "unknown", "interrupted"] as const) {
-    const f = fixture(true); f.port().arm(arm); f.restart(); f.setTime(arm.expiresAt);
+    const f = fixture(true); f.arm(arm); f.restart(); f.setTime(arm.expiresAt);
     // A late signal can itself discover the deadline; rejection still commits its notice.
     expect(() => f.store.events.signal(capability, signal, arm.expiresAt)).toThrow("deadline passed");
     const saved = f.port().get(address);
@@ -81,7 +84,7 @@ test("a missed deadline saves one truthful failure, rejects late producers and s
     expect(saved.receipt).toMatchObject({ source: "deadline", disposition: "pending", recordedAt: arm.expiresAt,
       signal: { ...address, outcome: "failed", evidenceRefs: [] } });
     expect(saved.receipt!.signal.summary).toContain("Job completion is unknown");
-    expect(f.port().arm(arm)).toEqual(saved);
+    expect(f.arm(arm)).toEqual(saved);
     f.restart();
     let attempt = f.store.events.claim(1, arm.expiresAt, [])[0]!;
     expect(attempt.receipt).toEqual(saved.receipt);
@@ -95,18 +98,19 @@ test("a missed deadline saves one truthful failure, rejects late producers and s
     expect(f.store.events.claim(1, arm.expiresAt + 2000, [])).toEqual([]);
     expect(f.store.events.resumeHost(owner.hostId, arm.expiresAt + 2000)).toBe(0);
     let current = f.port().get(address);
-    expect(current.receipt).toEqual(saved.receipt);
+    expect(current.receipt).toMatchObject({ ...saved.receipt, disposition: outcome === "accepted" ? "received" : "pending" });
     expect(current.delivery!.state).toBe(outcome === "accepted" ? "accepted" : "unknown");
+    expect(current.state).toBe(outcome === "accepted" ? "delivered" : "ready");
     expect(f.store.events.claim(1, arm.expiresAt + 3000, [])).toEqual([]);
-    current = f.port().acknowledge(address, current.version, current.receipt!.id, "handled");
-    expect(f.port().clear(address, current.version).state).toBe("cleared");
+    current = f.port().acknowledge(address, "handled", { receiptId: current.receipt!.id, expectedVersion: current.version });
+    expect(f.port().clear(address, { expectedVersion: current.version }).state).toBe("cleared");
   }
 });
 
 test("deadline discovery respects cancellation, and the pump creates a receipt without a reader", () => {
-  const f = fixture(); f.port().arm(arm); f.port().cancel(address, 1);
+  const f = fixture(); f.arm(arm); f.port().cancel(address, { expectedVersion: 1 });
   const due = { ...arm, waitId: "pump-deadline" };
-  f.port().arm(due);
+  f.arm(due);
   f.setTime(arm.expiresAt);
   const claims = f.store.events.claim(4, arm.expiresAt, []);
   expect(claims).toHaveLength(1); expect(claims[0]!.waitId).toBe(due.waitId);
@@ -114,22 +118,21 @@ test("deadline discovery respects cancellation, and the pump creates a receipt w
   expect(f.port().get(address).receipt).toBeUndefined();
   f.store.events.complete(due.waitId, due.generation, claims[0]!.delivery!.attemptId!, { status: "accepted", reference: "native:deadline" }, arm.expiresAt + 1);
   const saved = f.port().get(due);
-  expect(saved.state).toBe("ready"); expect(saved.delivery!.state).toBe("accepted");
+  expect(saved.state).toBe("delivered"); expect(saved.delivery!.state).toBe("accepted"); expect(saved.receipt!.disposition).toBe("received");
   expect(eventReturnCurrent(f.core, eventReturnTarget(claims[0]!), eventEnvelope(claims[0]!))).toBe(false);
 });
 
 test("retained deadline notices do not starve later deadlines at the bounded expiry scan", () => {
   const f = fixture();
-  for (let i = 0; i < 128; i++) f.port().arm({ ...arm, waitId: `deadline-${i}` });
+  for (let i = 0; i < 128; i++) f.arm({ ...arm, waitId: `deadline-${i}` });
   f.store.events.claim(1, arm.expiresAt, []);
-  const other = f.core.events({ ...owner, taskId: "other-owner" });
-  other.arm({ ...arm, waitId: "later-deadline", expiresAt: arm.expiresAt + 1 });
+  f.arm({ ...arm, waitId: "later-deadline", expiresAt: arm.expiresAt + 1 }, { ...owner, taskId: "other-owner" });
   const claims = f.store.events.claim(4, arm.expiresAt + 1, []);
   expect(claims.find((wait) => wait.waitId === "later-deadline")?.receipt?.source).toBe("deadline");
 });
 
 test("restarts retain waits and unknown sends; exact late acceptance refines only its own timed-out attempt", () => {
-  const f = fixture(true); f.port().arm(arm); f.restart();
+  const f = fixture(true); f.arm(arm); f.restart();
   f.store.events.signal(capability, signal, 1000);
   const attempt = f.store.events.claim(1, 1000, [])[0]!;
   expect(attempt.delivery?.state).toBe("sending");
@@ -141,7 +144,7 @@ test("restarts retain waits and unknown sends; exact late acceptance refines onl
   f.restart(); expect(f.store.events.recover(1003)).toBe(0);
   expect(f.store.events.claim(1, 1003, [])).toEqual([]);
   expect(f.store.events.resumeHost(owner.hostId, 1003)).toBe(0);
-  const second = { ...arm, waitId: "second-wait" }; f.port().arm(second);
+  const second = { ...arm, waitId: "second-wait" }; f.arm(second);
   f.store.events.signal(capability, { ...signal, waitId: second.waitId }, 1003);
   f.store.events.claim(1, 1003, []); f.restart();
   expect(f.store.events.recover(1004)).toBe(1);
@@ -150,10 +153,10 @@ test("restarts retain waits and unknown sends; exact late acceptance refines onl
 });
 
 test("waits an earlier release stored as paused become deliverable at startup, while unknown sends remain unreplayed", () => {
-  const f = fixture(true); f.port().arm(arm);
+  const f = fixture(true); f.arm(arm);
   f.store.events.signal(capability, signal, 1001);
   const waiting = { ...arm, waitId: "still-waiting" }, expired = { ...arm, waitId: "paused-expired", expiresAt: 1500 };
-  f.port().arm(waiting); f.port().arm(expired);
+  f.arm(waiting); f.arm(expired);
   // Earlier releases wrote this state when the owner's turn changed; the current service never does.
   f.store.close();
   const db = new Database(join(f.directory, "store.sqlite"));
@@ -179,15 +182,15 @@ test("waits an earlier release stored as paused become deliverable at startup, w
   f.store.events.complete(expired.waitId, expired.generation, notice.delivery!.attemptId!, { status: "accepted", reference: "native:deadline" }, 2003);
   expect(f.store.events.claim(1, 2003, [])).toEqual([]);
   f.setTime(2003);
-  expect(() => f.port().clear(address, saved.version)).toThrow("Settle");
+  expect(() => f.port().clear(address, { expectedVersion: saved.version })).toThrow("Settle");
   const newer = f.core.events({ ...owner, turnId: "turn-two", callId: "call-two" });
-  saved = newer.acknowledge(address, saved.version, saved.receipt!.id, "handled");
+  saved = newer.acknowledge(address, "handled", { receiptId: saved.receipt!.id, expectedVersion: saved.version });
   expect(saved.receipt?.evidenceRef).toBe("fixture-events:task-one:turn-two:call-two");
-  saved = newer.clear(address, saved.version);
+  saved = newer.clear(address, { expectedVersion: saved.version });
   expect(saved.state).toBe("cleared"); expect(saved.receipt).toBeUndefined();
   expect(saved.owner).toEqual({ hostId: owner.hostId, taskId: owner.taskId });
   expect(Object.keys(saved).sort()).toEqual(["generation", "owner", "revision", "state", "updatedAt", "version", "waitId"].sort());
-  expect(() => f.port().arm(arm)).toThrow("cleared");
+  expect(() => f.arm(arm)).toThrow("cleared");
   expect(() => f.store.events.signal(capability, signal, 2005)).toThrow("not accepted");
   // The still-waiting producer delivers to the task's current state without any reanchor.
   f.store.events.signal(capability, { ...signal, waitId: waiting.waitId, eventId: "later-release" }, 2006);
@@ -197,12 +200,12 @@ test("waits an earlier release stored as paused become deliverable at startup, w
 
 test("bounded result/admission reject without displacing retained results", () => {
   const f = fixture();
-  expect(() => f.port().arm({ ...arm, expiresAt: 1000 })).toThrow("future");
-  f.port().arm(arm);
+  expect(() => f.arm({ ...arm, expiresAt: 1000 })).toThrow("future");
+  f.arm(arm);
   expect(() => f.store.events.signal(capability, { ...signal, summary: "x".repeat(8193) }, 1000)).toThrow();
   expect(f.port().get(address).state).toBe("waiting");
-  for (let i = 1; i < 128; i++) f.port().arm({ ...arm, waitId: `wait-${i}` });
-  expect(() => f.port().arm({ ...arm, waitId: "overflow" })).toThrow("capacity");
+  for (let i = 1; i < 128; i++) f.arm({ ...arm, waitId: `wait-${i}` });
+  expect(() => f.arm({ ...arm, waitId: "overflow" })).toThrow("capacity");
   expect(f.port().get(address).title).toBe(arm.title);
 });
 
@@ -210,7 +213,7 @@ test("bounded result/admission reject without displacing retained results", () =
 test("event native authority fences exact receipt, version, target, cancellation and manager assignment", () => {
   const f = fixture(); f.core.bind(fixtureBinding);
   const nativeOwner = { hostId: fixtureBinding.origin.hostId, taskId: fixtureBinding.origin.managerId, turnId: "armed-turn", callId: "armed-call" };
-  const port = f.core.events(nativeOwner); port.arm(arm); f.store.events.signal(capability, signal, 1000);
+  const port = f.core.events(nativeOwner); f.arm(arm, { ...nativeOwner, bindingId: fixtureBinding.id, ownerGeneration: fixtureBinding.origin.generation }); f.store.events.signal(capability, signal, 1000);
   const attempt = f.store.events.claim(1, 1000, [])[0]!, target = eventReturnTarget(attempt), envelope = eventEnvelope(attempt);
   expect(eventReturnCurrent(f.core, target, envelope)).toBe(true);
   expect(eventReturnCurrent(f.core, { ...target, origin: { ...target.origin, managerId: "wrong" } }, envelope)).toBe(false);
@@ -219,7 +222,7 @@ test("event native authority fences exact receipt, version, target, cancellation
   f.store.transfer(fixtureBinding.id, fixtureBinding.origin.generation, { ...fixtureBinding.origin, generation: fixtureBinding.origin.generation + 1 });
   expect(eventReturnCurrent(f.core, target, envelope)).toBe(false);
   expect(() => port.get(address)).toThrow("assignment changed");
-  const successor = f.core.events(nativeOwner), saved = successor.get(address); successor.cancel(address, saved.version);
+  const successor = f.core.events(nativeOwner), saved = successor.get(address); successor.cancel(address, { expectedVersion: saved.version });
   expect(eventReturnCurrent(f.core, target, envelope)).toBe(false);
 });
 
@@ -236,64 +239,162 @@ test("the existing version-six store upgrades atomically without replacing human
   finally { legacy.close(); }
   const upgraded = new SqliteExchangeStore(path); cleanups.push(() => upgraded.close());
   expect(upgraded.get("retained-human-request")?.exchange.revisions[0]?.decision).toEqual(fixtureDecision);
-  expect(new SeekerCore(upgraded, () => 1000).events(owner).arm(arm).state).toBe("waiting");
+  expect(upgraded.events.arm(owner, arm, 1000).state).toBe("waiting");
 });
 
-test("a watch is a wait Seeker itself settles: one observation of a failed or interrupted turn, quiet expiry, no producer signal", () => {
+test("a watch is a wait Seeker itself settles: one observation of an ending it reports, quiet expiry, no producer signal", () => {
   const f = fixture(); f.setTime(1000);
-  const watch = { waitId: "watch-lead", generation: "g-one", revision: "lead-one", title: "Lead one", expiresAt: 5000, threadId: "lead-task" };
+  const watch = { waitId: "watch-lead", title: "Lead one", expiresAt: 5000, threadId: "lead-task" };
   expect(() => f.port().watch({ ...watch, threadId: owner.taskId })).toThrow("cannot watch itself");
+  expect(() => f.port().watch({ ...watch, on: [] })).toThrow("which turn endings");
+  expect(() => f.port().watch({ ...watch, on: ["aborted" as never] })).toThrow("which turn endings");
   const armed = f.port().watch(watch);
-  expect(armed).toMatchObject({ state: "waiting", watch: { threadId: "lead-task" }, title: "Lead one" });
+  expect(armed).toMatchObject({ state: "waiting", watch: { threadId: "lead-task", on: ["failed", "interrupted"] }, title: "Lead one" });
+  expect(armed.generation).toMatch(/^[0-9a-f-]{36}$/);
   expect(f.port().watch(watch).version).toBe(1);
   expect(() => f.port().watch({ ...watch, title: "renamed" })).toThrow("different content");
   expect(f.port().pending()[0]).toMatchObject({ waitId: "watch-lead", watch: { threadId: "lead-task" } });
   expect(f.store.events.watching(1001).map((wait) => wait.waitId)).toEqual(["watch-lead"]);
   // A producer cannot signal a watch: it has no capability.
-  expect(() => f.store.events.signal(capability, { waitId: watch.waitId, generation: watch.generation, revision: watch.revision, eventId: "e", outcome: "completed", summary: "s", evidenceRefs: [] }, 1002)).toThrow("not accepted");
-  // Only failed or interrupted turns are observations, and an observation settles the watch.
-  expect(() => f.store.events.observe(watch, { turnId: "t1", status: "completed" as never }, 1003)).toThrow("failed or interrupted");
-  const observed = f.store.events.observe(watch, { turnId: "lead-turn-3", status: "interrupted" }, 1003)!;
+  expect(() => f.store.events.signal(capability, { waitId: watch.waitId, generation: armed.generation, revision: armed.revision, eventId: "e", outcome: "completed", summary: "s", evidenceRefs: [] }, 1002)).toThrow("not accepted");
+  // A completed turn is not an observation for this watch; the first reported ending settles it.
+  expect(() => f.store.events.observe(watch, { turnId: "t1", status: "aborted" as never }, 1003)).toThrow("completed, failed or interrupted");
+  expect(f.store.events.observe({ waitId: "watch-lead" }, { turnId: "t1", status: "completed" }, 1003)).toBeUndefined();
+  const observed = f.store.events.observe({ waitId: "watch-lead" }, { turnId: "lead-turn-3", status: "interrupted" }, 1003)!;
   expect(observed.state).toBe("ready"); expect(observed.receipt).toMatchObject({ source: "watch", disposition: "pending", signal: { outcome: "failed", eventId: "watch:lead-turn-3:interrupted", evidenceRefs: ["codex:lead-task:lead-turn-3"] } });
   expect(observed.receipt!.signal.summary).toContain("was interrupted"); expect(observed.receipt!.signal.summary).toContain("sent it nothing");
-  expect(f.store.events.observe(watch, { turnId: "lead-turn-4", status: "failed" }, 1004)).toBeUndefined();
+  expect(f.store.events.observe({ waitId: "watch-lead" }, { turnId: "lead-turn-4", status: "failed" }, 1004)).toBeUndefined();
+  expect(() => f.store.events.observe({ waitId: "watch-lead", generation: "other" }, { turnId: "x", status: "failed" }, 1004)).toThrow("generation");
   expect(f.store.events.watching(1004)).toEqual([]);
   const attempt = f.store.events.claim(1, 1004, [])[0]!;
   expect(attempt.waitId).toBe("watch-lead");
   expect(eventReturnCurrent(f.core, eventReturnTarget(attempt), eventEnvelope(attempt))).toBe(true);
-  f.store.events.complete("watch-lead", "g-one", attempt.delivery!.attemptId!, { status: "accepted", reference: "native:watch" }, 1005);
-  let saved = f.port().get(watch);
-  saved = f.port().acknowledge(watch, saved.version, saved.receipt!.id, "handled");
-  expect(saved.state).toBe("handled");
+  expect(eventEnvelope(attempt).event.result).toMatchObject({ title: "Lead one", source: "watch", outcome: "failed", evidenceRefs: ["codex:lead-task:lead-turn-3"] });
+  f.store.events.complete("watch-lead", attempt.generation, attempt.delivery!.attemptId!, { status: "accepted", reference: "native:watch" }, 1005);
+  expect(f.port().get({ waitId: "watch-lead" }).state).toBe("delivered");
+  expect(f.port().acknowledge({ waitId: "watch-lead" }, "handled").state).toBe("handled");
+  // A watch armed for completion reports the completed turn, as a completed outcome.
+  const done = f.port().watch({ waitId: "watch-done", title: "Lead two", expiresAt: 5000, threadId: "lead-two", on: ["completed", "interrupted", "failed"] });
+  expect(done.watch).toEqual({ threadId: "lead-two", on: ["completed", "failed", "interrupted"] });
+  const finished = f.store.events.observe({ waitId: "watch-done" }, { turnId: "two-7", status: "completed" }, 1006)!;
+  expect(finished.receipt!.signal).toMatchObject({ outcome: "completed", eventId: "watch:two-7:completed" });
+  expect(finished.receipt!.signal.summary).toContain("turn two-7 completed");
   // A watch that reaches its expiry without an observation simply expires: no deadline notice, no delivery.
   const quiet = { ...watch, waitId: "watch-quiet" }; f.port().watch(quiet);
   f.setTime(5000);
-  expect(f.store.events.claim(4, 5000, [])).toEqual([]);
+  expect(f.store.events.claim(4, 5000, []).map((wait) => wait.waitId)).toEqual(["watch-done"]);
   expect(f.port().get(quiet)).toMatchObject({ state: "expired", reason: "deadline_passed" });
   expect(f.port().get(quiet).receipt).toBeUndefined();
   expect(f.store.events.observe(quiet, { turnId: "late", status: "failed" }, 5001)).toBeUndefined();
   // A cancelled watch reports nothing either.
   const cancelled = { ...watch, waitId: "watch-cancelled", expiresAt: 9000 }; f.port().watch(cancelled);
-  f.port().cancel(cancelled, 1);
+  f.port().cancel(cancelled);
   expect(f.store.events.observe(cancelled, { turnId: "t", status: "failed" }, 5002)).toBeUndefined();
   expect(f.store.events.watching(5002)).toEqual([]);
 });
 
 test("observed watches neither starve the expiry scan nor skip their retry delay, and every watch is read", () => {
   const f = fixture(); f.setTime(1000);
-  for (let i = 0; i < 40; i++) f.port().watch({ waitId: `watch-${i}`, generation: "g", revision: `lead-${i}`, title: "lead", expiresAt: 2000, threadId: `lead-${i}` });
+  for (let i = 0; i < 40; i++) f.port().watch({ waitId: `watch-${i}`, title: "lead", expiresAt: 2000, threadId: `lead-${i}` });
   expect(f.store.events.watching(1001)).toHaveLength(40);
   // Observed, delivered with a retry, then past expiry: the retry waits its delay and the ordinary deadline still fires.
-  f.store.events.observe({ waitId: "watch-0", generation: "g", revision: "lead-0" }, { turnId: "t", status: "failed" }, 1002);
+  f.store.events.observe({ waitId: "watch-0" }, { turnId: "t", status: "failed" }, 1002);
   const attempt = f.store.events.claim(1, 1002, [])[0]!;
   expect(attempt.waitId).toBe("watch-0");
-  f.store.events.complete("watch-0", "g", attempt.delivery!.attemptId!, { status: "retry", code: "desktop_connector_unavailable", retryAfterMs: 60_000 }, 1003);
-  f.port().arm({ ...arm, waitId: "ordinary-deadline", expiresAt: 2000 });
+  f.store.events.complete("watch-0", attempt.generation, attempt.delivery!.attemptId!, { status: "retry", code: "desktop_connector_unavailable", retryAfterMs: 60_000 }, 1003);
+  f.arm({ ...arm, waitId: "ordinary-deadline", expiresAt: 2000 });
   f.setTime(2001);
   const claims = f.store.events.claim(4, 2001, []);
   expect(claims.map((wait) => wait.waitId)).toEqual(["ordinary-deadline"]);
   expect(claims[0]!.receipt!.source).toBe("deadline");
-  expect(f.port().get({ waitId: "watch-0", generation: "g", revision: "lead-0" })).toMatchObject({ state: "ready", delivery: { state: "retry" } });
+  expect(f.port().get({ waitId: "watch-0" })).toMatchObject({ state: "ready", delivery: { state: "retry" } });
   expect(f.store.events.claim(4, 61_003, []).map((wait) => wait.waitId)).toEqual(["watch-0"]);
   expect(f.store.events.watching(2001)).toEqual([]);
+});
+
+test("the port arms a wait in one call: it prepares the private key file and returns the wait without the key", () => {
+  const f = fixture(); f.setTime(1000);
+  const capabilityFile = join(f.directory, "release.json");
+  expect(() => f.port().arm({ title: "Release", expiresAt: 5000, capabilityFile: "relative.json" })).toThrow("absolute path");
+  expect(() => f.port().arm({ title: "Release", expiresAt: 5000, capabilityFile: join(f.directory, "missing", "key.json") })).toThrow("private directory");
+  expect(() => f.port().arm({ title: "Release", expiresAt: 999, capabilityFile })).toThrow("future");
+  const wait = f.port().arm({ title: "Release", expiresAt: 5000, capabilityFile });
+  expect(wait).toMatchObject({ state: "waiting", title: "Release", revision: "unversioned", capabilityFile });
+  expect(wait.waitId).toMatch(/^wait-/); expect(wait.generation).toMatch(/^[0-9a-f-]{36}$/);
+  const key = JSON.parse(readFileSync(capabilityFile, "utf8"));
+  expect(statSync(capabilityFile).mode & 0o777).toBe(0o600);
+  expect(key).toMatchObject({ waitId: wait.waitId, generation: wait.generation, revision: "unversioned" });
+  expect(JSON.stringify(wait)).not.toContain(key.capability);
+  expect(JSON.stringify(f.port().get({ waitId: wait.waitId }))).not.toContain(key.capability);
+  // The same path arms the same wait again; a different wait under that path is refused.
+  expect(f.port().arm({ title: "Release", expiresAt: 5000, capabilityFile })).toEqual(wait);
+  expect(() => f.port().arm({ title: "Other", expiresAt: 5000, capabilityFile })).toThrow("different content");
+  expect(() => f.port().arm({ title: "Release", expiresAt: 5000, capabilityFile, revision: "v2" })).toThrow("different wait");
+  // A chosen identity and revision are kept, and the key the service wrote signals the wait.
+  const chosen = f.port().arm({ title: "Build", expiresAt: 5000, capabilityFile: join(f.directory, "build.json"), waitId: "build-7", revision: "sha-7" });
+  expect(chosen).toMatchObject({ waitId: "build-7", revision: "sha-7" });
+  const buildKey = JSON.parse(readFileSync(join(f.directory, "build.json"), "utf8")).capability as string;
+  expect(f.store.events.signal(buildKey, { waitId: "build-7", generation: chosen.generation, revision: "sha-7", eventId: "b", outcome: "completed", summary: "Built.", evidenceRefs: [] }, 1001).status).toBe("recorded");
+  expect(f.port().get({ waitId: "build-7" }).state).toBe("ready");
+});
+
+test("a confirmed delivery settles the wait: nothing to acknowledge, not pending, cleared by retention a day later", () => {
+  const f = fixture(true); f.setTime(1000); f.arm(arm);
+  f.store.events.signal(capability, signal, 1000);
+  const attempt = f.store.events.claim(1, 1000, [])[0]!;
+  expect(eventEnvelope(attempt).event.result).toEqual({ title: arm.title, outcome: "released", summary: signal.summary, evidenceRefs: signal.evidenceRefs });
+  f.store.events.complete(address.waitId, address.generation, attempt.delivery!.attemptId!, { status: "accepted", reference: "native:one" }, 1001);
+  let saved = f.port().get({ waitId: address.waitId });
+  expect(saved).toMatchObject({ state: "delivered", receipt: { disposition: "received", evidenceRef: "native:one" }, delivery: { state: "accepted" } });
+  expect(f.port().pending()).toEqual([]);
+  // Its expiry passing changes nothing: the result reached the task.
+  f.setTime(arm.expiresAt + 1); expect(f.store.events.claim(4, arm.expiresAt + 1, [])).toEqual([]);
+  expect(f.port().get({ waitId: address.waitId }).state).toBe("delivered");
+  // Acknowledging is optional and still recorded; cancelling a settled wait changes nothing.
+  expect(f.port().cancel({ waitId: address.waitId }).state).toBe("delivered");
+  saved = f.port().acknowledge({ waitId: address.waitId }, "handled");
+  expect(saved.state).toBe("handled"); expect(saved.receipt!.disposition).toBe("handled");
+  expect(() => f.port().acknowledge({ waitId: address.waitId }, "received", { receiptId: "other" })).toThrow("not its own");
+  // Settled waits leave capacity: a full task can keep arming once its waits settle.
+  for (let i = 0; i < 128; i++) f.arm({ ...arm, waitId: `open-${i}`, expiresAt: arm.expiresAt + 2 * eventLimits.retainedMs });
+  expect(() => f.arm({ ...arm, waitId: "overflow", expiresAt: arm.expiresAt + 2 * eventLimits.retainedMs })).toThrow("capacity");
+  // Retention: a day after settling, the service clears the record on its own; unsettled waits stay.
+  const settledAt = saved.updatedAt;
+  f.store.events.claim(4, settledAt + eventLimits.retainedMs - 1, []);
+  expect(f.port().get({ waitId: address.waitId }).state).toBe("handled");
+  f.store.events.claim(4, settledAt + eventLimits.retainedMs, []);
+  const cleared = f.port().get({ waitId: address.waitId });
+  expect(cleared.state).toBe("cleared"); expect(cleared.receipt).toBeUndefined();
+  expect(f.port().get({ waitId: "open-0" }).state).toBe("waiting");
+  // Cancelling frees capacity at once. Retention survives restart, and an unknown delivery is never cleared until the task reconciles it.
+  expect(f.port().cancel({ waitId: "open-0" }).state).toBe("cancelled");
+  const unknown = { ...arm, waitId: "unknown-send", expiresAt: settledAt + 10 * eventLimits.retainedMs }; f.arm(unknown);
+  f.store.events.signal(capability, { ...signal, waitId: unknown.waitId }, settledAt + eventLimits.retainedMs);
+  const sent = f.store.events.claim(1, settledAt + eventLimits.retainedMs, [])[0]!;
+  f.store.events.complete(unknown.waitId, unknown.generation, sent.delivery!.attemptId!, { status: "unknown", code: "native_timeout" }, settledAt + eventLimits.retainedMs);
+  f.restart();
+  f.store.events.claim(4, settledAt + 3 * eventLimits.retainedMs, []);
+  expect(f.port().get({ waitId: unknown.waitId })).toMatchObject({ state: "ready", delivery: { state: "unknown" } });
+  expect(f.port().pending().map((wait) => wait.waitId)).toContain(unknown.waitId);
+  expect(() => f.port().clear({ waitId: unknown.waitId })).toThrow("Settle");
+  expect(f.port().acknowledge({ waitId: unknown.waitId }, "handled").state).toBe("handled");
+  expect(f.port().clear({ waitId: unknown.waitId }).state).toBe("cleared");
+});
+
+test("a store from the release before retention keeps its settled waits for one retention period after the upgrade", () => {
+  const f = fixture(true); f.setTime(1000); f.arm(arm);
+  f.store.events.signal(capability, signal, 1000);
+  f.port().acknowledge(address, "handled");
+  f.store.close();
+  const db = new Database(join(f.directory, "store.sqlite"));
+  db.run("UPDATE event_waits SET next_at=json_extract(data,'$.expiresAt') WHERE id=?", [address.waitId]);
+  db.run("PRAGMA user_version=7");
+  db.close();
+  const before = Date.now();
+  f.reopen();
+  // Its old next_at (the expiry, long past) would have cleared it at once; the upgrade gave it a full retention period instead.
+  f.store.events.claim(4, before + eventLimits.retainedMs - 1, []);
+  expect(f.port().get(address).state).toBe("handled");
+  f.store.events.claim(4, Date.now() + eventLimits.retainedMs + 1, []);
+  expect(f.port().get(address).state).toBe("cleared");
 });

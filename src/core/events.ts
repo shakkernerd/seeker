@@ -1,8 +1,13 @@
 import { createHash } from "node:crypto";
-import type { EventAddress, EventArm, EventOwner, EventSignal, EventWait, EventWatch, ThreadObservation } from "../events.ts";
+import { isAbsolute } from "node:path";
+import type { EventAddress, EventArmRequest, EventArm, EventOwner, EventRef, EventResult, EventSignal, EventWait, EventWatch, EventWatchRequest, ThreadObservation, TurnEnding } from "../events.ts";
+import { turnEndings } from "../events.ts";
 import { fail, id, integer, object, text } from "./validation.ts";
 
-export const eventLimits = { resultBytes: 16_384, retained: 4096, perTask: 128 } as const;
+/** `retainedMs`: a settled wait (delivered, handled, cancelled or expired) is cleared by the service this long after it settled. */
+export const eventLimits = { resultBytes: 16_384, retained: 4096, perTask: 128, retainedMs: 86_400_000, noticeSummaryChars: 2000, noticeRefChars: 200 } as const;
+/** The endings a watch reports unless the task chose; a completed turn is ordinary and stays quiet by default. */
+export const defaultWatchEndings: readonly TurnEnding[] = ["failed", "interrupted"];
 export const eventRoute = (wait: Pick<EventWait, "owner">): string => JSON.stringify(["event", wait.owner.hostId, wait.owner.taskId]);
 export const eventDigest = (value: string): string => createHash("sha256").update(value).digest("hex");
 export const eventFingerprint = (value: unknown): string => eventDigest(JSON.stringify(value));
@@ -13,6 +18,38 @@ function keys(input: Record<string, unknown>, allowed: string[]): void {
 export function eventAddress(raw: unknown): EventAddress {
   const value = object(raw);
   return { waitId: id(value.waitId, "Wait"), generation: id(value.generation, "Wait generation"), revision: id(value.revision, "Source revision") };
+}
+/** A wait named by its id; generation and revision are checked only when the caller gives them. */
+export function eventRef(raw: unknown): EventRef {
+  const value = object(raw);
+  const ref: EventRef = { waitId: id(value.waitId, "Wait") };
+  if (value.generation !== undefined) ref.generation = id(value.generation, "Wait generation");
+  if (value.revision !== undefined) ref.revision = id(value.revision, "Source revision");
+  return ref;
+}
+function expiry(value: unknown, now: number, allowPast: boolean, what: string): number {
+  const expiresAt = integer(value, "Expiry", 1);
+  if (!allowPast && expiresAt <= now) fail("event_expired", `Choose an explicit future ${what} expiry.`, 409);
+  return expiresAt;
+}
+export function eventArmRequest(raw: unknown, now: number): EventArmRequest {
+  const value = object(raw); keys(value, ["title", "expiresAt", "capabilityFile", "revision", "waitId"]);
+  if (typeof value.capabilityFile !== "string" || !isAbsolute(value.capabilityFile) || value.capabilityFile.includes("\0") || value.capabilityFile.length > 1024) fail("invalid_capability_path", "Give an absolute path for the producer key file inside a private directory.");
+  const request: EventArmRequest = { title: text(value.title, "Wait title", 200), expiresAt: expiry(value.expiresAt, now, false, "wait"), capabilityFile: value.capabilityFile };
+  if (value.revision !== undefined) request.revision = id(value.revision, "Source revision");
+  if (value.waitId !== undefined) request.waitId = id(value.waitId, "Wait");
+  return request;
+}
+export function eventWatchRequest(raw: unknown, now: number): EventWatchRequest {
+  const value = object(raw); keys(value, ["title", "expiresAt", "threadId", "on", "waitId"]);
+  const request: EventWatchRequest = { title: text(value.title, "Watch title", 200), expiresAt: expiry(value.expiresAt, now, false, "watch"), threadId: id(value.threadId, "Watched task") };
+  if (value.on !== undefined) request.on = endings(value.on);
+  if (value.waitId !== undefined) request.waitId = id(value.waitId, "Wait");
+  return request;
+}
+function endings(raw: unknown): TurnEnding[] {
+  if (!Array.isArray(raw) || !raw.length || raw.some((item) => !turnEndings.includes(item as TurnEnding))) fail("invalid_input", "Choose which turn endings to report: completed, failed or interrupted.");
+  return turnEndings.filter((ending) => raw.includes(ending));
 }
 export function eventOwner(raw: EventOwner): EventOwner {
   const value: EventOwner = { hostId: id(raw.hostId, "Host"), taskId: id(raw.taskId, "Task"), turnId: id(raw.turnId, "Turn"), callId: id(raw.callId, "Call") };
@@ -28,15 +65,23 @@ export function eventArm(raw: unknown, now: number, allowPast = false): EventArm
   return { ...eventAddress(value), title: text(value.title, "Wait title", 200), expiresAt, capabilityDigest: value.capabilityDigest };
 }
 export function eventWatch(raw: unknown, now: number, allowPast = false): EventWatch {
-  const value = object(raw); keys(value, ["waitId", "generation", "revision", "title", "expiresAt", "threadId"]);
-  const expiresAt = integer(value.expiresAt, "Expiry", 1);
-  if (!allowPast && expiresAt <= now) fail("event_expired", "Choose an explicit future watch expiry.", 409);
-  return { ...eventAddress(value), title: text(value.title, "Watch title", 200), expiresAt, threadId: id(value.threadId, "Watched task") };
+  const value = object(raw); keys(value, ["waitId", "generation", "revision", "title", "expiresAt", "threadId", "on"]);
+  return { ...eventAddress(value), title: text(value.title, "Watch title", 200), expiresAt: expiry(value.expiresAt, now, allowPast, "watch"), threadId: id(value.threadId, "Watched task"), on: endings(value.on) };
 }
 export function threadObservation(raw: unknown): ThreadObservation {
   const value = object(raw); keys(value, ["turnId", "status"]);
-  if (value.status !== "failed" && value.status !== "interrupted") fail("invalid_input", "Only a failed or interrupted turn is an observation.");
-  return { turnId: id(value.turnId, "Turn"), status: value.status };
+  if (!turnEndings.includes(value.status as TurnEnding)) fail("invalid_input", "Only a completed, failed or interrupted turn is an observation.");
+  return { turnId: id(value.turnId, "Turn"), status: value.status as TurnEnding };
+}
+/** The bounded result a notice carries; the full summary and references stay in the saved receipt. */
+export function eventResult(wait: EventWait): EventResult {
+  if (!wait.receipt) throw new Error("An event result requires a saved receipt.");
+  const { signal } = wait.receipt;
+  const summary = signal.summary.length > eventLimits.noticeSummaryChars ? `${signal.summary.slice(0, eventLimits.noticeSummaryChars)} … (truncated; the full summary is in the saved record)` : signal.summary;
+  const result: EventResult = { outcome: signal.outcome, summary, evidenceRefs: signal.evidenceRefs.map((ref) => ref.length > eventLimits.noticeRefChars ? `${ref.slice(0, eventLimits.noticeRefChars)}…` : ref) };
+  if (wait.title !== undefined) result.title = wait.title;
+  if (wait.receipt.source) result.source = wait.receipt.source;
+  return result;
 }
 export function eventSignal(raw: unknown): EventSignal {
   const value = object(raw); keys(value, ["waitId", "generation", "revision", "eventId", "outcome", "summary", "evidenceRefs"]);

@@ -18,20 +18,23 @@ function fixture() {
   const watcher = new ThreadWatcher(core, [host, blind], 60_000, 500);
   cleanups.push(() => watcher.stop());
   const manager = core.events({ hostId: "codex-desktop", taskId: "manager", turnId: "manager-turn", callId: "manager-call" });
-  const watch = (threadId: string, expiresAt = 60_000) => manager.watch({ waitId: `watch-${threadId}`, generation: "g", revision: threadId, title: `Watch ${threadId}`, expiresAt, threadId });
-  return { core, store, watcher, reads, states, manager, watch, setTime: (value: number) => { now = value; }, address: (threadId: string) => ({ waitId: `watch-${threadId}`, generation: "g", revision: threadId }) };
+  const watch = (threadId: string, on?: ("completed" | "failed" | "interrupted")[]) => manager.watch({ waitId: `watch-${threadId}`, title: `Watch ${threadId}`, expiresAt: 60_000, threadId, ...(on ? { on } : {}) });
+  return { core, store, watcher, reads, states, manager, watch, setTime: (value: number) => { now = value; }, address: (threadId: string) => ({ waitId: `watch-${threadId}` }) };
 }
 
-test("the watcher reads each watched task without a model and records one observation when its turn failed or was interrupted", async () => {
+test("the watcher reads each watched task without a model and records one observation when its turn ended the way the watch reports", async () => {
   const f = fixture();
-  f.watch("lead-a"); f.watch("lead-b"); f.watch("lead-c"); f.watch("lead-gone");
+  f.watch("lead-a"); f.watch("lead-b"); f.watch("lead-c"); f.watch("lead-gone"); f.watch("lead-done", ["completed"]);
   f.states.set("lead-a", { taskId: "lead-a", turnId: "a-1", status: "inProgress" });
   f.states.set("lead-b", { taskId: "lead-b", turnId: "b-1", status: "completed" });
   f.states.set("lead-c", { taskId: "lead-c", turnId: "c-2", status: "failed" });
-  expect(await f.watcher.tick()).toBe(1);
-  expect(f.reads.map((read) => read.threadId).sort()).toEqual(["lead-a", "lead-b", "lead-c", "lead-gone"]);
+  f.states.set("lead-done", { taskId: "lead-done", turnId: "d-3", status: "completed" });
+  expect(await f.watcher.tick()).toBe(2);
+  expect(f.reads.map((read) => read.threadId).sort()).toEqual(["lead-a", "lead-b", "lead-c", "lead-done", "lead-gone"]);
   expect(f.reads[0]!.reader).toEqual({ hostId: "codex-desktop", taskId: "manager", turnId: "manager-turn" });
-  expect(f.manager.get(f.address("lead-c"))).toMatchObject({ state: "ready", receipt: { source: "watch", signal: { evidenceRefs: ["codex:lead-c:c-2"] } } });
+  expect(f.manager.get(f.address("lead-c"))).toMatchObject({ state: "ready", receipt: { source: "watch", signal: { outcome: "failed", evidenceRefs: ["codex:lead-c:c-2"] } } });
+  // A completed turn wakes only the watch that asked for it.
+  expect(f.manager.get(f.address("lead-done"))).toMatchObject({ state: "ready", receipt: { source: "watch", signal: { outcome: "completed", evidenceRefs: ["codex:lead-done:d-3"] } } });
   expect(f.manager.get(f.address("lead-a")).state).toBe("waiting");
   expect(f.manager.get(f.address("lead-b")).state).toBe("waiting");
   expect(f.manager.get(f.address("lead-gone")).state).toBe("waiting");
@@ -42,11 +45,12 @@ test("the watcher reads each watched task without a model and records one observ
   expect(f.reads.filter((read) => read.threadId === "lead-c")).toHaveLength(1);
   expect(f.manager.get(f.address("lead-a")).receipt!.signal.summary).toContain("was interrupted");
   const claimed = f.store.events.claim(4, f.core.clock(), []);
+  // One send per task at a time: the other two observations follow once this one settles.
   expect(claimed.map((wait) => wait.waitId)).toEqual(["watch-lead-a"]);
   // Nothing is ever read for a host that cannot observe tasks, and a cancelled or expired watch is not read.
   const cli = f.core.events({ hostId: "codex-cli", taskId: "cli-manager", turnId: "t", callId: "c" });
-  cli.watch({ waitId: "watch-cli-lead", generation: "g", revision: "r", title: "CLI lead", expiresAt: 60_000, threadId: "cli-lead" });
-  f.manager.cancel(f.address("lead-b"), f.manager.get(f.address("lead-b")).version);
+  cli.watch({ waitId: "watch-cli-lead", title: "CLI lead", expiresAt: 60_000, threadId: "cli-lead" });
+  f.manager.cancel(f.address("lead-b"));
   f.setTime(61_000);
   const before = f.reads.length;
   expect(await f.watcher.tick()).toBe(0);
