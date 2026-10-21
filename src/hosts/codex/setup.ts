@@ -7,8 +7,7 @@ import { binding as validateBinding } from "../../core/validation.ts";
 import { ensureDataDir } from "../../local/config.ts";
 import { privateDirectory, readConnectorConfig, readConnectorCredential, readPrivateFile } from "./config.ts";
 import { CodexHostAdapter } from "./host.ts";
-import { DesktopHelperDelivery } from "./helper-delivery.ts";
-import { NativeDesktopHelper } from "./helper-runtime.ts";
+import { DesktopNativeDelivery } from "./native-delivery.ts";
 import { CodexDesktopLifecycle } from "./desktop.ts";
 import { ConnectorError } from "./protocol.ts";
 import { installSection, nativeLauncher } from "../codex-common/install.ts";
@@ -66,10 +65,7 @@ export async function loadCodexHost(core: SeekerCore, dataDir: string) {
   if (!statIfPresent(path)) return;
   const config = readConnectorConfig(path);
   const lifecycle = new CodexDesktopLifecycle(join(dataDir, "codex-desktop.json"));
-  const runtime = new NativeDesktopHelper(lifecycle, dataDir,
-    (profile, _pipe, _workspace, signal) => host.helperConnection(profile, dataDir, signal),
-    (owner, signal) => host.readEventState(dataDir, { threadId: owner.taskId, turnId: owner.turnId, callId: owner.callId }, signal));
-  const input = new DesktopHelperDelivery(core, runtime);
+  const input = new DesktopNativeDelivery(core, (origin, args, signal, current) => host.nativeSend(dataDir, origin, args, signal, current), (threadId) => host.lastInvocation(threadId));
   const host: CodexHostAdapter = new CodexHostAdapter(config.hostId, readConnectorCredential(config.credentialFile), { binding: (managerId) => core.managerBinding(config.hostId, managerId), manager: (origin) => core.manager(origin), events: (origin) => core.events({ hostId: config.hostId, taskId: origin.threadId, turnId: origin.turnId, callId: origin.callId }) }, lifecycle, input);
   try {
     const listener = await listenPrivate(config.socketPath, async (request) => await host.handle(request) ?? new Response(null, { status: 404 }));

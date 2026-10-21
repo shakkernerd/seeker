@@ -9,7 +9,7 @@ import { installSection } from "../src/hosts/codex/setup.ts";
 const cleanup: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
 
-async function nativeFixture(mode: "compatible" | "drop" | "bad-frame" | "extra-required" | "wrong-input-type" | "events" = "compatible") {
+async function nativeFixture(mode: "compatible" | "drop" | "bad-frame" | "extra-required" | "wrong-input-type" | "send" | "refuse" | "drop-call" | "garbled" | "wrong-id" | "no-result" | "contradictory" = "compatible") {
   const path = join(tmpdir(), `sk-${randomUUID().slice(0, 8)}.sock`);
   const requests: Record<string, any>[] = [], sockets = new Set<Socket>(), calls = new Set(["arm-call"]);
   const server = createServer((socket) => {
@@ -22,14 +22,17 @@ async function nativeFixture(mode: "compatible" | "drop" | "bad-frame" | "extra-
       requests.push(request);
       if (mode === "drop") { socket.destroy(); return; }
       if (mode === "bad-frame") { const header = Buffer.alloc(4); header.writeUInt32LE(0xffffffff); socket.end(header); return; }
-      let result: unknown = { tools: [{ name: mode === "events" ? "read_thread" : "send_message_to_thread", namespace: "codex_app", inputSchema: { type: "object", properties: { threadId: { type: mode === "wrong-input-type" ? "number" : "string" }, prompt: { type: "string" } }, ...(mode === "extra-required" ? { required: ["threadId", "prompt", "newRequiredField"] } : {}) } }] };
+      let result: unknown = { tools: [{ name: "send_message_to_thread", namespace: "codex_app", inputSchema: { type: "object", properties: { threadId: { type: mode === "wrong-input-type" ? "number" : "string" }, prompt: { type: "string" } }, ...(mode === "extra-required" ? { required: ["threadId", "prompt", "newRequiredField"] } : {}) } }] };
       let error: unknown;
-      if (mode === "events" && request.method === "tools/call") {
-        if (calls.has(request.params.callId)) error = { code: -32603, message: "Native call identity was already used." };
-        else {
-          calls.add(request.params.callId);
-          result = { success: true, contentItems: [{ type: "inputText", text: JSON.stringify({ schemaVersion: 1, thread: { id: "owner", kind: "codex" }, page: { order: "newest_first" }, turns: [{ id: "armed-turn", status: calls.size === 2 ? "completed" : "interrupted" }] }) }] };
-        }
+      if (request.method === "tools/call") {
+        if (mode === "drop-call") { socket.destroy(); return; }
+        if (mode === "refuse") error = { code: -32000, message: "Codex app tool request failed" };
+        else if (mode === "wrong-id") { const body = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 7, result: { success: true, contentItems: [] } })); const frame = Buffer.alloc(4 + body.length); frame.writeUInt32LE(body.length); body.copy(frame, 4); socket.end(frame); return; }
+        else if (mode === "contradictory") { const body = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { success: true, contentItems: [] }, error: { code: -32000, message: "also failed" } })); const frame = Buffer.alloc(4 + body.length); frame.writeUInt32LE(body.length); body.copy(frame, 4); socket.end(frame); return; }
+        else if (mode === "no-result") { const body = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1 })); const frame = Buffer.alloc(4 + body.length); frame.writeUInt32LE(body.length); body.copy(frame, 4); socket.end(frame); return; }
+        else if (mode === "garbled") result = { success: true, contentItems: [{ type: "inputText", text: "not json" }] };
+        else if (calls.has(request.params.callId)) error = { code: -32603, message: "Native call identity was already used." };
+        else { calls.add(request.params.callId); result = { success: true, contentItems: [{ type: "inputText", text: JSON.stringify({ threadId: request.params.arguments.threadId }) }] }; }
       }
       const body = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: request.id, ...(error ? { error } : { result }) }));
       const frame = Buffer.alloc(4 + body.length); frame.writeUInt32LE(body.length); body.copy(frame, 4);
@@ -42,14 +45,23 @@ async function nativeFixture(mode: "compatible" | "drop" | "bad-frame" | "extra-
 }
 
 describe("native catalogue qualification", () => {
-  test("successive event reads use distinct native calls while preserving the armed owner", async () => {
-    const fixture = await nativeFixture("events"), client = new CodexNativeClient(fixture.path);
-    const origin = { threadId: "owner", turnId: "armed-turn", callId: "arm-call" };
-    expect(await client.eventState(origin)).toEqual({ taskId: "owner", turnId: "armed-turn", status: "completed" });
-    expect(await client.eventState(origin)).toEqual({ taskId: "owner", turnId: "armed-turn", status: "interrupted" });
-    const reads = fixture.requests.filter((request) => request.method === "tools/call");
-    expect(reads.map((request) => ({ ...request.params, callId: "fresh" }))).toEqual(Array(2).fill({ arguments: { threadId: "owner", turnLimit: 1, includeOutputs: false, maxOutputCharsPerItem: 50 }, callerSource: "codex", namespace: "codex_app", tool: "read_thread", threadId: "owner", turnId: "armed-turn", callId: "fresh" }));
-    expect(origin).toEqual({ threadId: "owner", turnId: "armed-turn", callId: "arm-call" });
+  test("a native send is one stamped tool call confirmed by the host's echoed target, with no model involved", async () => {
+    const fixture = await nativeFixture("send"), client = new CodexNativeClient(fixture.path);
+    const origin = { threadId: "owner", turnId: "armed-turn", callId: "fresh-call" }, args = { threadId: "owner", prompt: "Seeker recorded a machine background event for this task." };
+    expect(await client.send(origin, args)).toEqual({ status: "accepted", threadId: "owner" });
+    expect(fixture.requests.map((request) => request.method)).toEqual(["tools/list", "tools/call"]);
+    expect(fixture.requests[1]!.params).toEqual({ arguments: args, callerSource: "codex", namespace: "codex_app", tool: "send_message_to_thread", threadId: "owner", turnId: "armed-turn", callId: "fresh-call" });
+    // After the request reached the host, nothing but its confirmation of the target is evidence of what it did:
+    // an error answer, a reused call identity, a contradictory, uncorrelated or incomplete answer, or silence.
+    expect(await client.send(origin, args)).toEqual({ status: "uncertain", code: "native_call_failed" });
+    expect(await new CodexNativeClient((await nativeFixture("refuse")).path).send(origin, args)).toEqual({ status: "uncertain", code: "native_call_failed" });
+    expect(await new CodexNativeClient((await nativeFixture("contradictory")).path).send(origin, args)).toEqual({ status: "uncertain", code: "native_invalid_response" });
+    expect(await new CodexNativeClient((await nativeFixture("drop-call")).path).send(origin, args)).toEqual({ status: "uncertain", code: "native_disconnected" });
+    expect(await new CodexNativeClient((await nativeFixture("garbled")).path).send(origin, args)).toEqual({ status: "uncertain", code: "native_target_unconfirmed" });
+    expect(await new CodexNativeClient((await nativeFixture("wrong-id")).path).send(origin, args)).toEqual({ status: "uncertain", code: "native_rpc_uncorrelated" });
+    expect(await new CodexNativeClient((await nativeFixture("no-result")).path).send(origin, args)).toEqual({ status: "uncertain", code: "native_invalid_response" });
+    const missing = await new CodexNativeClient(join(tmpdir(), `missing-${randomUUID()}.sock`)).send(origin, args);
+    expect(missing).toEqual({ status: "refused", code: "native_unavailable" });
   });
 
   test("rejects an incompatible refreshed input capability", async () => {

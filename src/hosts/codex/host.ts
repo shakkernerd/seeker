@@ -3,8 +3,8 @@ import { isEventOperation, invokeEvent } from "./event-tools.ts";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import type { DeliveryResult, HostAdapter, NativeEnvelope, NativeReturnTarget, ManagerBinding, ManagerOrigin, ManagerPort } from "../../contracts.ts";
 import { ConnectorError, codexRoute, connectorProtocol, identifier, maxWireBytes, onlyKeys, parseInvocation, record, type NativeInvocation } from "./protocol.ts";
-import { connectHelperBridge, readEventStateBridge, parseHelperEndpoint, type HelperEndpoint } from "./helper-bridge.ts";
-import type { DesktopOwner, DesktopProfile } from "./desktop-owner.ts";
+import { bridgeProtocol, nativeSendBridge, parseBridgeEndpoint, type BridgeEndpoint } from "./native-bridge.ts";
+import type { NativeSendArguments, NativeSendOutcome } from "./native.ts";
 import { invokeManager } from "./tools.ts";
 
 export interface CodexManagerAccess {
@@ -24,7 +24,8 @@ interface Connection {
   poll?: (response: Response) => void;
   bindings: Map<string, string>;
   desktop?: unknown;
-  helper?: HelperEndpoint;
+  /** The connector's native bridge; the wire key stays `helper` for existing connectors. */
+  helper?: BridgeEndpoint;
 }
 export interface DesktopHostInput {
   deliver(binding: NativeReturnTarget, envelope: NativeEnvelope, signal: AbortSignal): Promise<DeliveryResult>;
@@ -35,6 +36,7 @@ export interface DesktopHostInput {
 /** Authenticated host transport. Only individual invocation metadata grants a ManagerPort. */
 export class CodexHostAdapter implements HostAdapter {
   readonly #connections = new Map<string, Connection>();
+  readonly #invocations = new Map<string, NativeInvocation>();
   readonly #timer: ReturnType<typeof setInterval>;
   #closed = false;
 
@@ -58,8 +60,8 @@ export class CodexHostAdapter implements HostAdapter {
         const body = await bodyObject(request); onlyKeys(body, ["protocol", "instanceId", "desktop", "helper"]);
         if (body.protocol !== connectorProtocol) throw new ConnectorError("protocol_mismatch", "The native connector and service versions differ.", 409);
         const instanceId = identifier(body.instanceId);
-        const helper = body.helper === undefined ? undefined : parseHelperEndpoint(body.helper);
-        if (helper && body.desktop === undefined) throw new ConnectorError("desktop_owner_required", "A helper requires its qualified Desktop owner.", 403);
+        const helper = body.helper === undefined ? undefined : parseBridgeEndpoint(body.helper);
+        if (helper && body.desktop === undefined) throw new ConnectorError("desktop_owner_required", "A native bridge requires its qualified Desktop owner.", 403);
         await this.lifecycle?.connected(body.desktop);
         if (this.#closed || request.signal.aborted) throw new ConnectorError("host_closed", "The native host bridge is stopping.", 503);
         this.#prune();
@@ -86,6 +88,7 @@ export class CodexHostAdapter implements HostAdapter {
       if (path === `${codexRoute}/invoke`) {
         const body = await bodyObject(request); onlyKeys(body, ["origin", "operation", "arguments"]);
         const invocation = parseInvocation(body.origin), operation = identifier(body.operation);
+        this.#remember(invocation);
         if (isEventOperation(operation)) {
           if (!this.access.events) throw new ConnectorError("event_unavailable", "This native host does not admit machine waits.", 403);
           await this.lifecycle?.admitted?.(connection.desktop);
@@ -141,38 +144,29 @@ export class CodexHostAdapter implements HostAdapter {
     }
   }
 
-  async helperConnection(profile: DesktopProfile, dataDir: string, signal: AbortSignal) {
-    this.#prune();
-    const candidates = [...this.#connections.values()].filter((connection) => {
-      if (!connection.helper || !connection.desktop) return false;
-      try {
-        this.lifecycle?.ready?.(connection.desktop);
-        const owner = connection.desktop as DesktopOwner;
-        return JSON.stringify(owner.profile) === JSON.stringify(profile);
-      } catch { return false; }
-    });
-    if (!candidates.length) throw new ConnectorError("desktop_connector_unavailable", "Restore the qualified Desktop MCP connector; saved replies remain pending.", 503);
-    // A profile can have multiple native MCP clients. Each supplies the same
-    // qualified process owner; use one without transferring manager admission.
-    candidates.sort((first, second) => second.lastSeen - first.lastSeen);
-    for (const connection of candidates) {
-      signal.throwIfAborted();
-      try { return await connectHelperBridge(connection.helper!, dataDir, signal); }
-      catch { this.#drop(connection); }
-    }
-    throw new ConnectorError("desktop_connector_unavailable", "Restore the qualified Desktop MCP connector; saved replies remain pending.", 503);
-  }
+  /** The latest admitted invocation of a task: a turn the host knows that task has. */
+  lastInvocation(threadId: string): NativeInvocation | undefined { return this.#invocations.get(threadId); }
 
-  async readEventState(dataDir: string, origin: NativeInvocation, signal: AbortSignal) {
-    if (this.#closed || signal.aborted) throw new ConnectorError("host_closed", "The native event connection ended.", 503);
+  async nativeSend(dataDir: string, origin: NativeInvocation, args: NativeSendArguments, signal: AbortSignal, current: () => boolean = () => true): Promise<NativeSendOutcome> {
+    if (this.#closed || signal.aborted) throw new ConnectorError("host_closed", "The native connection ended.", 503);
     this.#prune();
-    const candidates = [...this.#connections.values()].filter((connection) => {
+    const qualified = [...this.#connections.values()].filter((connection) => {
       if (!connection.helper || !connection.desktop) return false;
       try { this.lifecycle?.ready?.(connection.desktop); return true; } catch { return false; }
     }).sort((first, second) => second.lastSeen - first.lastSeen);
-    const connection = candidates[0];
-    if (!connection) throw new ConnectorError("desktop_connector_unavailable", "Restore the original qualified connector; the event remains retained.", 503);
-    return readEventStateBridge(connection.helper!, dataDir, origin, signal);
+    // A connector from an earlier release answers only its own bridge requests; it is not a sender.
+    const candidates = qualified.filter((connection) => connection.helper!.protocol === bridgeProtocol);
+    // A profile can have multiple native MCP clients; each reaches the same Desktop input tool.
+    for (const connection of candidates) {
+      signal.throwIfAborted();
+      try { return await nativeSendBridge(connection.helper!, dataDir, origin, args, signal, current); }
+      catch (error) {
+        if (!(error instanceof ConnectorError) || error.code !== "desktop_connector_unavailable") throw error;
+        this.#drop(connection);
+      }
+    }
+    if (qualified.length) throw new ConnectorError("desktop_connector_outdated", "Reload the Seeker MCP server in Desktop; the loaded connector predates native sending and saved results and replies remain pending.", 503);
+    throw new ConnectorError("desktop_connector_unavailable", "Restore the qualified Desktop MCP connector; saved results and replies remain pending.", 503);
   }
 
   async deliver(binding: NativeReturnTarget, envelope: NativeEnvelope, signal: AbortSignal): Promise<DeliveryResult> {
@@ -184,6 +178,10 @@ export class CodexHostAdapter implements HostAdapter {
     this.#closed = true; clearInterval(this.#timer);
     for (const connection of this.#connections.values()) this.#drop(connection);
     await this.input?.close();
+  }
+  #remember(invocation: NativeInvocation): void {
+    this.#invocations.delete(invocation.threadId); this.#invocations.set(invocation.threadId, invocation);
+    if (this.#invocations.size > 1024) this.#invocations.delete(this.#invocations.keys().next().value!);
   }
   #drop(connection: Connection): void {
     connection.poll?.(new Response(null, { status: 204 }));

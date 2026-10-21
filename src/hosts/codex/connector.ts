@@ -1,5 +1,5 @@
 import { dirname } from "node:path";
-import { listenHelperBridge, type HelperEndpoint } from "./helper-bridge.ts";
+import { listenNativeBridge, type BridgeEndpoint } from "./native-bridge.ts";
 import { randomUUID } from "node:crypto";
 import { privateSocket, readConnectorConfig, readConnectorCredential, type CodexConnectorConfig } from "./config.ts";
 import { CodexNativeClient } from "./native.ts";
@@ -14,7 +14,7 @@ export class CodexConnector {
   #session?: string;
   #connecting?: Promise<string>;
 
-  constructor(private readonly config: CodexConnectorConfig, private readonly credential: string, private readonly native: CodexNativeClient, private readonly desktop?: DesktopOwner, private readonly helper?: HelperEndpoint) {}
+  constructor(private readonly config: CodexConnectorConfig, private readonly credential: string, private readonly native: CodexNativeClient, private readonly desktop?: DesktopOwner, private readonly helper?: BridgeEndpoint) {}
 
   async invoke(origin: NativeInvocation, operation: string, args: unknown, signal?: AbortSignal): Promise<unknown> {
     const session = await this.#connect();
@@ -86,7 +86,7 @@ export async function runCodexConnector(configPath: string, owner?: DesktopOwner
   const desktop = owner ?? await captureDesktopOwner();
   const native = new CodexNativeClient(pipe, 3_000);
   await native.qualify();
-  const bridge = await listenHelperBridge(dirname(config.socketPath), desktop, pipe);
+  const bridge = await listenNativeBridge(dirname(config.socketPath), native);
   const connector = new CodexConnector(config, readConnectorCredential(config.credentialFile), native, desktop, bridge.endpoint);
   const receiving = connector.receive();
   try { await serveSeekerTools(connector); }

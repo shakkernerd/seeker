@@ -54,7 +54,7 @@ test("service restart can reuse the pinned live owner or start its stopped profi
   expect(f.opened).toEqual([f.profile]);
 });
 
-test("a manually restarted app can qualify the helper only with the same actual native profile", async () => {
+test("a manually restarted app qualifies the native owner only with the same actual native profile", async () => {
   const f = fixture();
   await f.lifecycle.connected(f.owner); await f.lifecycle.admitted(f.owner);
   const replacement: DesktopOwner = { ...f.owner, profile: { ...f.profile, appVersion: "1.1.0", appBuild: "2" }, app: { ...f.owner.app, pid: 201 }, server: { ...f.owner.server, pid: 202, parentPid: 201 } };

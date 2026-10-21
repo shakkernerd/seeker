@@ -59,7 +59,6 @@ export class SeekerCore {
       get: (address) => { current(); return this.store.events.get(origin, address, this.clock()); },
       pending: () => { current(); return this.store.events.pending(origin, this.clock()).map(({ waitId, generation, revision, title, expiresAt, version, state, updatedAt, reason, receipt }) => ({ waitId, generation, revision, title, expiresAt, version, state, updatedAt, ...(reason ? { reason } : {}), ...(receipt ? { receiptId: receipt.id } : {}) })); },
       cancel: (address, version) => mutate(address, version, { type: "cancel" }),
-      resume: (address, version) => mutate(address, version, { type: "resume" }),
       acknowledge: (address, version, receiptId, status) => mutate(address, version, { type: "acknowledge", receiptId, status }),
       clear: (address, version) => mutate(address, version, { type: "clear" }),
     };
