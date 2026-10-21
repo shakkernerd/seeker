@@ -127,9 +127,10 @@ export async function threadStateBridge(endpoint: BridgeEndpoint, dataDir: strin
         const message = record(JSON.parse(buffer.slice(0, end))); onlyKeys(message, ["threadState"]);
         const state = record(message.threadState);
         if (state.unavailable !== undefined) { onlyKeys(state, ["unavailable"]); unreadable = identifier(state.unavailable); return abort(); }
-        onlyKeys(state, ["taskId", "turnId", "status"]);
+        onlyKeys(state, ["taskId", "turnId", "status", "completedAt"]);
         if (state.taskId !== threadId || !["inProgress", "completed", "interrupted", "failed"].includes(String(state.status))) throw unavailable();
-        finish({ taskId: identifier(state.taskId), turnId: identifier(state.turnId), status: state.status as ThreadState["status"] });
+        if (state.completedAt !== undefined && (!Number.isSafeInteger(state.completedAt) || Number(state.completedAt) < 1)) throw unavailable();
+        finish({ taskId: identifier(state.taskId), turnId: identifier(state.turnId), status: state.status as ThreadState["status"], ...(state.completedAt !== undefined ? { completedAt: state.completedAt as number } : {}) });
       } catch { abort(); }
     });
     signal.addEventListener("abort", abort, { once: true });

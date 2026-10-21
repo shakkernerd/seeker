@@ -24,7 +24,7 @@ function fixture() {
 
 test("the watcher reads each watched task without a model and records one observation when its turn ended the way the watch reports", async () => {
   const f = fixture();
-  f.watch("lead-a"); f.watch("lead-b"); f.watch("lead-c"); f.watch("lead-gone"); f.watch("lead-done", ["completed"]);
+  await f.watch("lead-a"); await f.watch("lead-b"); await f.watch("lead-c"); await f.watch("lead-gone"); await f.watch("lead-done", ["completed"]);
   f.states.set("lead-a", { taskId: "lead-a", turnId: "a-1", status: "inProgress" });
   f.states.set("lead-b", { taskId: "lead-b", turnId: "b-1", status: "completed", completedAt: 1_500 });
   f.states.set("lead-c", { taskId: "lead-c", turnId: "c-2", status: "failed", completedAt: 1_500 });
@@ -49,7 +49,7 @@ test("the watcher reads each watched task without a model and records one observ
   expect(claimed.map((wait) => wait.waitId)).toEqual(["watch-lead-a"]);
   // Nothing is ever read for a host that cannot observe tasks, and a cancelled or expired watch is not read.
   const cli = f.core.events({ hostId: "codex-cli", taskId: "cli-manager", turnId: "t", callId: "c" });
-  cli.watch({ waitId: "watch-cli-lead", title: "CLI lead", expiresAt: 60_000, threadId: "cli-lead" });
+  await cli.watch({ waitId: "watch-cli-lead", title: "CLI lead", expiresAt: 60_000, threadId: "cli-lead" });
   f.manager.cancel(f.address("lead-b"));
   f.setTime(61_000);
   const before = f.reads.length;
@@ -61,9 +61,9 @@ test("the watcher reads each watched task without a model and records one observ
 test("a turn that ended before the watch was armed is never reported; one seen running, or begun after the arm, is", async () => {
   const f = fixture();
   // Armed at 1000. A failure recorded at 900 is old news, with or without the host saying when it ended.
-  f.watch("stale-timed"); f.states.set("stale-timed", { taskId: "stale-timed", turnId: "old", status: "failed", completedAt: 900 });
-  f.watch("stale-untimed"); f.states.set("stale-untimed", { taskId: "stale-untimed", turnId: "old", status: "failed" });
-  f.watch("running"); f.states.set("running", { taskId: "running", turnId: "r-1", status: "inProgress" });
+  await f.watch("stale-timed"); f.states.set("stale-timed", { taskId: "stale-timed", turnId: "old", status: "failed", completedAt: 900 });
+  await f.watch("stale-untimed"); f.states.set("stale-untimed", { taskId: "stale-untimed", turnId: "old", status: "failed" });
+  await f.watch("running"); f.states.set("running", { taskId: "running", turnId: "r-1", status: "inProgress" });
   expect(await f.watcher.tick()).toBe(0);
   for (const task of ["stale-timed", "stale-untimed", "running"]) expect(f.manager.get(f.address(task)).state).toBe("waiting");
   expect(f.manager.get(f.address("running")).watch).toMatchObject({ seen: { turnId: "r-1", status: "inProgress" } });
@@ -75,12 +75,12 @@ test("a turn that ended before the watch was armed is never reported; one seen r
   expect(f.manager.get(f.address("stale-untimed"))).toMatchObject({ state: "ready", receipt: { signal: { evidenceRefs: ["codex:stale-untimed:new"] } } });
   expect(f.manager.get(f.address("stale-timed")).state).toBe("waiting");
   // A Codex turn id carries its creation time: one created after the arm is new even on the first read.
-  f.watch("uuid-task"); f.states.set("uuid-task", { taskId: "uuid-task", turnId: "00000000-07d0-7000-8000-000000000000", status: "completed" });
-  f.watch("uuid-old"); f.states.set("uuid-old", { taskId: "uuid-old", turnId: "00000000-0384-7000-8000-000000000000", status: "failed" });
+  await f.watch("uuid-task"); f.states.set("uuid-task", { taskId: "uuid-task", turnId: "00000000-07d0-7000-8000-000000000000", status: "completed" });
+  await f.watch("uuid-old"); f.states.set("uuid-old", { taskId: "uuid-old", turnId: "00000000-0384-7000-8000-000000000000", status: "failed" });
   expect(await f.watcher.tick()).toBe(0);
   expect(f.manager.get(f.address("uuid-old")).state).toBe("waiting");
   f.manager.cancel(f.address("uuid-task"));
-  const done = f.core.events({ hostId: "codex-desktop", taskId: "manager", turnId: "t", callId: "c" }).watch({ waitId: "watch-uuid-done", title: "done", expiresAt: 60_000, threadId: "uuid-task", on: ["completed"] });
+  const done = await f.core.events({ hostId: "codex-desktop", taskId: "manager", turnId: "t", callId: "c" }).watch({ waitId: "watch-uuid-done", title: "done", expiresAt: 60_000, threadId: "uuid-task", on: ["completed"] });
   expect(done.state).toBe("waiting");
   expect(await f.watcher.tick()).toBe(1);
   expect(f.manager.get({ waitId: "watch-uuid-done" })).toMatchObject({ state: "ready", receipt: { signal: { outcome: "completed" } } });
@@ -88,7 +88,7 @@ test("a turn that ended before the watch was armed is never reported; one seen r
 
 test("the watcher stops cleanly and never overlaps its own passes", async () => {
   const f = fixture();
-  f.watch("lead-slow");
+  await f.watch("lead-slow");
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
   f.states.set("lead-slow", { taskId: "lead-slow", turnId: "s-1", status: "failed", completedAt: 1_500 });

@@ -5,7 +5,8 @@ import { turnEndings } from "../events.ts";
 import { fail, id, integer, object, text } from "./validation.ts";
 
 /** `retainedMs`: a settled wait (delivered, handled, cancelled or expired) is cleared by the service this long after it settled. */
-export const eventLimits = { resultBytes: 16_384, retained: 4096, perTask: 128, retainedMs: 86_400_000, noticeSummaryChars: 2000 } as const;
+/** `noticeBytes` bounds the summary and references a notice carries, under the native input limit with room for the rest of the message. */
+export const eventLimits = { resultBytes: 16_384, retained: 4096, perTask: 128, retainedMs: 86_400_000, noticeSummaryChars: 2000, noticeSummaryBytes: 6000, noticeBytes: 12_000 } as const;
 /** The endings a watch reports unless the task chose; a completed turn is ordinary and stays quiet by default. */
 export const defaultWatchEndings: readonly TurnEnding[] = ["failed", "interrupted"];
 export const eventRoute = (wait: Pick<EventWait, "owner">): string => JSON.stringify(["event", wait.owner.hostId, wait.owner.taskId]);
@@ -66,12 +67,14 @@ export function eventArm(raw: unknown, now: number, allowPast = false): EventArm
   if (!allowPast && expiresAt <= now) fail("event_expired", "Choose an explicit future wait expiry.", 409);
   if (typeof value.capabilityDigest !== "string" || !/^[a-f0-9]{64}$/.test(value.capabilityDigest)) fail("invalid_capability", "Use the digest from a private event capability file.");
   const arm: EventArm = { ...eventAddress(value), title: text(value.title, "Wait title", 200), expiresAt, capabilityDigest: value.capabilityDigest };
-  if (value.keyFile !== undefined) { if (typeof value.keyFile !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,200}$/.test(value.keyFile)) fail("invalid_capability", "A Seeker-placed key file is named within the key directory."); arm.keyFile = value.keyFile; }
+  if (value.keyFile !== undefined) { if (typeof value.keyFile !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}\.json$/.test(value.keyFile)) fail("invalid_capability", "A Seeker-placed key file is named after its wait within the key directory."); arm.keyFile = value.keyFile; }
   return arm;
 }
 export function eventWatch(raw: unknown, now: number, allowPast = false): EventWatch {
-  const value = object(raw); keys(value, ["waitId", "generation", "revision", "title", "expiresAt", "threadId", "on"]);
-  return { ...eventAddress(value), title: text(value.title, "Watch title", 200), expiresAt: expiry(value.expiresAt, now, allowPast, "watch"), threadId: id(value.threadId, "Watched task"), on: endings(value.on) };
+  const value = object(raw); keys(value, ["waitId", "generation", "revision", "title", "expiresAt", "threadId", "on", "seen"]);
+  const watch: EventWatch = { ...eventAddress(value), title: text(value.title, "Watch title", 200), expiresAt: expiry(value.expiresAt, now, allowPast, "watch"), threadId: id(value.threadId, "Watched task"), on: endings(value.on) };
+  if (value.seen !== undefined) { const seen = threadObservation(value.seen); watch.seen = { turnId: seen.turnId, status: seen.status }; }
+  return watch;
 }
 export function threadObservation(raw: unknown): ThreadObservation {
   const value = object(raw); keys(value, ["turnId", "status", "completedAt"]);
@@ -85,12 +88,21 @@ export function uuidTime(value: string): number | undefined {
   const match = /^([0-9a-f]{8})-([0-9a-f]{4})-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.exec(value);
   return match ? Number.parseInt(match[1]! + match[2]!, 16) : undefined;
 }
-/** The result a notice carries: the summary bounded, the references complete so each one can be used as given. */
+/**
+ * The result a notice carries, within the native input limit: the summary bounded, then as many
+ * references as fit, each complete so it can be used as given; the rest stay in the saved record.
+ */
 export function eventResult(wait: EventWait): EventResult {
   if (!wait.receipt) throw new Error("An event result requires a saved receipt.");
   const { signal } = wait.receipt;
-  const summary = signal.summary.length > eventLimits.noticeSummaryChars ? `${signal.summary.slice(0, eventLimits.noticeSummaryChars)} … (truncated; the full summary is in the saved record)` : signal.summary;
-  const result: EventResult = { outcome: signal.outcome, summary, evidenceRefs: [...signal.evidenceRefs] };
+  let summary = signal.summary.length > eventLimits.noticeSummaryChars ? signal.summary.slice(0, eventLimits.noticeSummaryChars) : signal.summary;
+  while (Buffer.byteLength(summary) > eventLimits.noticeSummaryBytes) summary = summary.slice(0, -100);
+  if (summary.length < signal.summary.length) summary = `${summary} … (truncated; the full summary is in the saved record)`;
+  const evidenceRefs: string[] = [];
+  let bytes = Buffer.byteLength(summary);
+  for (const ref of signal.evidenceRefs) { const size = Buffer.byteLength(ref) + 2; if (bytes + size > eventLimits.noticeBytes) break; evidenceRefs.push(ref); bytes += size; }
+  const result: EventResult = { outcome: signal.outcome, summary, evidenceRefs };
+  if (evidenceRefs.length < signal.evidenceRefs.length) result.omittedRefs = signal.evidenceRefs.length - evidenceRefs.length;
   if (wait.title !== undefined) result.title = wait.title;
   if (wait.receipt.source) result.source = wait.receipt.source;
   return result;

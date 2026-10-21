@@ -4,12 +4,15 @@ import { join } from "node:path";
 import type { EventOwner, EventPort } from "../events.ts";
 import { prepareEventCapability } from "./event-client.ts";
 import { defaultWatchEndings, eventArmRequest, eventOwner, eventRef, eventWatchRequest } from "./events.ts";
-import type { ChannelIngress, ExchangeStore, ExchangeView, InboundReply, ManagerBinding, ManagerOrigin, ManagerPort, ReadOptions, Recipient } from "../contracts.ts";
+import type { ChannelIngress, ExchangeStore, ExchangeView, InboundReply, ManagerBinding, ManagerOrigin, ManagerPort, ReadOptions, Recipient, ThreadReader, ThreadState } from "../contracts.ts";
 import { fail, id, origin as validateOrigin, sameRecipient } from "./validation.ts";
 
 /** Trusted composition owns this object. Expose only a bound ManagerPort to agent tools. */
 export class SeekerCore {
   /** `keyDirectory`: where Seeker places producer key files for waits armed without a path; without it a task must name the path. */
+  /** Reads a task's latest turn through its host, so a watch knows where the task stood when armed; undefined when the host cannot say now. */
+  threadReader?: (reader: ThreadReader, threadId: string) => Promise<ThreadState | undefined>;
+
   constructor(readonly store: ExchangeStore, readonly clock: () => number = Date.now, private readonly options: { keyDirectory?: string } = {}) {
     if (options.keyDirectory) store.events.keyDirectory = options.keyDirectory;
   }
@@ -90,10 +93,18 @@ export class SeekerCore {
           throw error;
         }
       },
-      watch: (raw) => {
+      watch: async (raw) => {
         current();
         const request = eventWatchRequest(raw, this.clock());
-        return this.store.events.watch(origin, { waitId: request.waitId ?? `watch-${randomUUID()}`, generation: randomUUID(), revision: "watch", title: request.title, expiresAt: request.expiresAt, threadId: request.threadId, on: request.on ?? [...defaultWatchEndings] }, this.clock());
+        if (request.threadId === origin.taskId) fail("invalid_input", "A task cannot watch itself.");
+        // Where the task stands now: a turn already ended is old news, one running is reported when it ends.
+        let seen: { turnId: string; status: ThreadState["status"] } | undefined;
+        if (this.threadReader) {
+          const state = await this.threadReader({ hostId: origin.hostId, taskId: origin.taskId, turnId: origin.turnId }, request.threadId);
+          if (state?.taskId === request.threadId) seen = { turnId: state.turnId, status: state.status };
+        }
+        current();
+        return this.store.events.watch(origin, { waitId: request.waitId ?? `watch-${randomUUID()}`, generation: randomUUID(), revision: "watch", title: request.title, expiresAt: request.expiresAt, threadId: request.threadId, on: request.on ?? [...defaultWatchEndings], ...(seen ? { seen } : {}) }, this.clock());
       },
       get: (ref) => { current(); return this.store.events.get(origin, eventRef(ref), this.clock()); },
       pending: () => { current(); return this.store.events.pending(origin, this.clock()).map(({ waitId, generation, revision, title, expiresAt, version, state, updatedAt, reason, receipt, watch, delivery }) => ({ waitId, generation, revision, title, expiresAt, version, state, updatedAt, ...(reason ? { reason } : {}), ...(receipt ? { receiptId: receipt.id } : {}), ...(watch ? { watch } : {}), ...(delivery ? { delivery: { state: delivery.state, ...(delivery.code ? { code: delivery.code } : {}) } } : {}) })); },

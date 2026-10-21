@@ -9,7 +9,8 @@ import { Database } from "bun:sqlite";
 import { fixtureBinding, fixtureDecision } from "../src/local/fixture.ts";
 import { eventDigest } from "../src/core/events.ts";
 import type { EventArm, EventOwner, EventSignal } from "../src/events.ts";
-import { eventLimits } from "../src/core/events.ts";
+import { eventLimits, eventResult } from "../src/core/events.ts";
+import { nativeWakeup } from "../src/hosts/codex/protocol.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); });
@@ -246,17 +247,17 @@ test("the existing version-six store upgrades atomically without replacing human
   expect(upgraded.events.arm(owner, arm, 1000).state).toBe("waiting");
 });
 
-test("a watch is a wait Seeker itself settles: one observation of an ending it reports, quiet expiry, no producer signal", () => {
+test("a watch is a wait Seeker itself settles: one observation of an ending it reports, quiet expiry, no producer signal", async () => {
   const f = fixture(); f.setTime(1000);
   const watch = { waitId: "watch-lead", title: "Lead one", expiresAt: 5000, threadId: "lead-task" };
-  expect(() => f.port().watch({ ...watch, threadId: owner.taskId })).toThrow("cannot watch itself");
-  expect(() => f.port().watch({ ...watch, on: [] })).toThrow("which turn endings");
-  expect(() => f.port().watch({ ...watch, on: ["aborted" as never] })).toThrow("which turn endings");
-  const armed = f.port().watch(watch);
+  await expect(f.port().watch({ ...watch, threadId: owner.taskId })).rejects.toThrow("cannot watch itself");
+  await expect(f.port().watch({ ...watch, on: [] })).rejects.toThrow("which turn endings");
+  await expect(f.port().watch({ ...watch, on: ["aborted" as never] })).rejects.toThrow("which turn endings");
+  const armed = await f.port().watch(watch);
   expect(armed).toMatchObject({ state: "waiting", watch: { threadId: "lead-task", on: ["failed", "interrupted"] }, title: "Lead one" });
   expect(armed.generation).toMatch(/^[0-9a-f-]{36}$/);
-  expect(f.port().watch(watch).version).toBe(1);
-  expect(() => f.port().watch({ ...watch, title: "renamed" })).toThrow("different content");
+  expect((await f.port().watch(watch)).version).toBe(1);
+  await expect(f.port().watch({ ...watch, title: "renamed" })).rejects.toThrow("different content");
   expect(f.port().pending()[0]).toMatchObject({ waitId: "watch-lead", watch: { threadId: "lead-task" } });
   expect(f.store.events.watching(1001).map((wait) => wait.waitId)).toEqual(["watch-lead"]);
   // A producer cannot signal a watch: it has no capability.
@@ -278,28 +279,28 @@ test("a watch is a wait Seeker itself settles: one observation of an ending it r
   expect(f.port().get({ waitId: "watch-lead" }).state).toBe("delivered");
   expect(f.port().acknowledge({ waitId: "watch-lead" }, "handled").state).toBe("handled");
   // A watch armed for completion reports the completed turn, as a completed outcome.
-  const done = f.port().watch({ waitId: "watch-done", title: "Lead two", expiresAt: 5000, threadId: "lead-two", on: ["completed", "interrupted", "failed"] });
+  const done = await f.port().watch({ waitId: "watch-done", title: "Lead two", expiresAt: 5000, threadId: "lead-two", on: ["completed", "interrupted", "failed"] });
   expect(done.watch).toEqual({ threadId: "lead-two", on: ["completed", "failed", "interrupted"] });
   const finished = f.store.events.observe({ waitId: "watch-done" }, { turnId: "two-7", status: "completed", completedAt: 1006 }, 1006)!;
   expect(finished.receipt!.signal).toMatchObject({ outcome: "completed", eventId: "watch:two-7:completed" });
   expect(finished.receipt!.signal.summary).toContain("turn two-7 completed");
   // A watch that reaches its expiry without an observation simply expires: no deadline notice, no delivery.
-  const quiet = { ...watch, waitId: "watch-quiet" }; f.port().watch(quiet);
+  const quiet = { ...watch, waitId: "watch-quiet" }; await f.port().watch(quiet);
   f.setTime(5000);
   expect(f.store.events.claim(4, 5000, []).map((wait) => wait.waitId)).toEqual(["watch-done"]);
   expect(f.port().get(quiet)).toMatchObject({ state: "expired", reason: "deadline_passed" });
   expect(f.port().get(quiet).receipt).toBeUndefined();
   expect(f.store.events.observe(quiet, { turnId: "late", status: "failed", completedAt: 5001 }, 5001)).toBeUndefined();
   // A cancelled watch reports nothing either.
-  const cancelled = { ...watch, waitId: "watch-cancelled", expiresAt: 9000 }; f.port().watch(cancelled);
+  const cancelled = { ...watch, waitId: "watch-cancelled", expiresAt: 9000 }; await f.port().watch(cancelled);
   f.port().cancel(cancelled);
   expect(f.store.events.observe(cancelled, { turnId: "t", status: "failed", completedAt: 5002 }, 5002)).toBeUndefined();
   expect(f.store.events.watching(5002)).toEqual([]);
 });
 
-test("observed watches neither starve the expiry scan nor skip their retry delay, and every watch is read", () => {
+test("observed watches neither starve the expiry scan nor skip their retry delay, and every watch is read", async () => {
   const f = fixture(); f.setTime(1000);
-  for (let i = 0; i < 40; i++) f.port().watch({ waitId: `watch-${i}`, title: "lead", expiresAt: 2000, threadId: `lead-${i}` });
+  for (let i = 0; i < 40; i++) await f.port().watch({ waitId: `watch-${i}`, title: "lead", expiresAt: 2000, threadId: `lead-${i}` });
   expect(f.store.events.watching(1001)).toHaveLength(40);
   // Observed, delivered with a retry, then past expiry: the retry waits its delay and the ordinary deadline still fires.
   f.store.events.observe({ waitId: "watch-0" }, { turnId: "t", status: "failed", completedAt: 1002 }, 1002);
@@ -405,7 +406,7 @@ test("a confirmed delivery settles the wait: nothing to acknowledge, not pending
   expect(f.port().clear({ waitId: unknown.waitId }).state).toBe("cleared");
 });
 
-test("rows that may not be cleared yet never hold retention back for the rest", () => {
+test("rows that may not be cleared yet never hold retention back for the rest", async () => {
   const f = fixture(); f.setTime(1000);
   // 129 cancelled waits with an unknown send each: older than the one clearable wait, and never clearable until acknowledged.
   for (let i = 0; i < 129; i++) {
@@ -422,7 +423,7 @@ test("rows that may not be cleared yet never hold retention back for the rest", 
   f.store.events.complete(done.waitId, done.generation, sent.delivery!.attemptId!, { status: "accepted", reference: "native:done" }, 2000);
   // Settled without ever having a delivery: cancelled before a result, and a watch that expired quietly.
   f.setTime(2000); f.arm({ ...arm, waitId: "never-signalled", expiresAt: 10 * eventLimits.retainedMs }); f.port().cancel({ waitId: "never-signalled" });
-  f.port().watch({ waitId: "quiet-watch", title: "quiet", expiresAt: 3000, threadId: "someone" });
+  await f.port().watch({ waitId: "quiet-watch", title: "quiet", expiresAt: 3000, threadId: "someone" });
   f.setTime(3000); expect(f.port().get({ waitId: "quiet-watch" }).state).toBe("expired");
   f.store.events.claim(4, 3000 + eventLimits.retainedMs, []);
   for (const waitId of ["done", "never-signalled", "quiet-watch"]) expect(f.port().get({ waitId }).state).toBe("cleared");
@@ -460,4 +461,52 @@ test("a store from the release before retention keeps its settled waits for one 
   expect(f.port().get(address).state).toBe("handled");
   f.store.events.claim(4, Date.now() + eventLimits.retainedMs + 1, []);
   expect(f.port().get(address).state).toBe("cleared");
+});
+
+test("arming a watch reads where the task stands, so an ending from before the watch is old news and a running turn is reported when it ends", async () => {
+  const f = fixture(); f.setTime(1000);
+  const reads: { hostId: string; taskId: string; threadId: string }[] = [];
+  let state: { taskId: string; turnId: string; status: "inProgress" | "completed" | "failed" | "interrupted" } | undefined = { taskId: "lead", turnId: "old", status: "failed" };
+  f.core.threadReader = async (reader, threadId) => { reads.push({ hostId: reader.hostId, taskId: reader.taskId, threadId }); return state; };
+  const armed = await f.port().watch({ waitId: "w-ended", title: "ended", expiresAt: 9000, threadId: "lead" });
+  expect(reads).toEqual([{ hostId: owner.hostId, taskId: owner.taskId, threadId: "lead" }]);
+  expect(armed.watch).toEqual({ threadId: "lead", on: ["failed", "interrupted"], seen: { turnId: "old", status: "failed" } });
+  // The same ended turn, read again later without a completion time, is not an observation; a newer turn is.
+  expect(f.store.events.observe({ waitId: "w-ended" }, { turnId: "old", status: "failed" }, 1500)).toBeUndefined();
+  expect(f.store.events.observe({ waitId: "w-ended" }, { turnId: "next", status: "failed" }, 1600)!.state).toBe("ready");
+  // A turn running when the watch was armed is reported when it ends, even without a completion time.
+  state = { taskId: "lead", turnId: "running", status: "inProgress" };
+  const running = await f.port().watch({ waitId: "w-running", title: "running", expiresAt: 9000, threadId: "lead" });
+  expect(running.watch!.seen).toEqual({ turnId: "running", status: "inProgress" });
+  expect(f.store.events.observe({ waitId: "w-running" }, { turnId: "running", status: "interrupted" }, 1700)!.state).toBe("ready");
+  // When the host cannot say where the task stands, the watch is armed without a baseline and the later rules apply.
+  state = undefined;
+  const blind = await f.port().watch({ waitId: "w-blind", title: "blind", expiresAt: 9000, threadId: "lead" });
+  expect(blind.watch!.seen).toBeUndefined();
+  expect(f.store.events.observe({ waitId: "w-blind" }, { turnId: "whatever", status: "failed", completedAt: 1800 }, 1800)!.state).toBe("ready");
+});
+
+test("a wait id with a colon arms with a key Seeker places, and a notice never outgrows the native input limit", () => {
+  const f = fixture(); f.setTime(1000);
+  const keyed = new SeekerCore(f.store, () => 1000, { keyDirectory: join(f.directory, "keys") }).events(owner);
+  const wait = keyed.arm({ title: "Build", expiresAt: 5000, waitId: "build:release" });
+  expect(wait.capabilityFile).toBe(join(f.directory, "keys", "build:release.json"));
+  // The largest result the store accepts: a long summary of multibyte text and eight 1000-character references.
+  const key = JSON.parse(readFileSync(wait.capabilityFile, "utf8")).capability as string;
+  const refs = Array.from({ length: 8 }, (_, i) => `file:///${String(i)}${"é".repeat(990)}`);
+  const signal = { waitId: "build:release", generation: wait.generation, revision: wait.revision, eventId: "big", outcome: "completed" as const, summary: "x".repeat(200), evidenceRefs: refs };
+  expect(Buffer.byteLength(JSON.stringify(signal))).toBeLessThanOrEqual(eventLimits.resultBytes);
+  f.store.events.signal(key, signal, 1001);
+  const attempt = f.store.events.claim(1, 1001, [])[0]!;
+  const { result } = eventEnvelope(attempt).event;
+  expect(result.summary).toBe(signal.summary);
+  for (const ref of result.evidenceRefs) expect(refs).toContain(ref);
+  // A long multibyte summary is cut by bytes, not only by characters.
+  const bounded = eventResult({ ...attempt, receipt: { ...attempt.receipt!, signal: { ...attempt.receipt!.signal, summary: "é".repeat(2500) } } });
+  expect(bounded.summary.endsWith("(truncated; the full summary is in the saved record)")).toBe(true);
+  expect(Buffer.byteLength(bounded.summary)).toBeLessThanOrEqual(eventLimits.noticeSummaryBytes + 100);
+  expect(result.evidenceRefs.length + (result.omittedRefs ?? 0)).toBe(8); expect(result.omittedRefs).toBeGreaterThan(0);
+  const notice = nativeWakeup({ attemptId: "x", binding: eventReturnTarget(attempt), envelope: eventEnvelope(attempt) });
+  expect(Buffer.byteLength(notice)).toBeLessThanOrEqual(16_384);
+  expect(notice).toContain(`${result.omittedRefs} more in the saved record`);
 });

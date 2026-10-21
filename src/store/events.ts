@@ -15,13 +15,13 @@ const terminal = (wait: EventWait) => ["delivered", "cancelled", "expired", "han
 const settledStates = "('delivered','handled','cancelled','expired')";
 const ended = (status: ThreadObservation["status"]) => status === "completed" ? "completed" : status === "failed" ? "failed" : "was interrupted";
 /**
- * Whether an ended turn ended after the watch was armed. The host's completion time decides when it
- * gives one; otherwise a turn that began after the arm, or one an earlier read saw running, or a turn
- * newer than the one first seen, is a new ending, and a turn already ended at the first read is not.
+ * Whether an ended turn ended after the watch was armed: the host says it completed after the arm,
+ * or the turn began after the arm, or a read (the one made when arming, or a later one) saw it
+ * running or saw an older turn. A turn already ended when first seen, with none of these, is old news.
  */
 function endedAfterArm(wait: StoredEventWait, observation: ThreadObservation): boolean {
   const armedAt = wait.createdAt ?? 0;
-  if (observation.completedAt !== undefined) return observation.completedAt >= armedAt;
+  if (observation.completedAt !== undefined && observation.completedAt >= armedAt) return true;
   const started = uuidTime(observation.turnId);
   if (started !== undefined && started >= armedAt) return true;
   const seen = wait.watch?.seen;
@@ -73,8 +73,8 @@ export class SqliteEventStore implements EventStore {
       }
       if (input.expiresAt <= now) fail("event_expired", "Choose an explicit future watch expiry.", 409);
       this.#admit(owner);
-      const { threadId, on, ...content } = input;
-      const wait: StoredEventWait = { ...content, owner, watch: { threadId, on }, armFingerprint: fingerprint, version: 1, state: "waiting", createdAt: now, updatedAt: now };
+      const { threadId, on, seen, ...content } = input;
+      const wait: StoredEventWait = { ...content, owner, watch: { threadId, on, ...(seen ? { seen } : {}) }, armFingerprint: fingerprint, version: 1, state: "waiting", createdAt: now, updatedAt: now };
       this.db.query("INSERT INTO event_waits(id,host_id,task_id,state,next_at,data) VALUES (?,?,?,?,?,?)").run(wait.waitId, owner.hostId, owner.taskId, wait.state, input.expiresAt, JSON.stringify(wait));
       return eventPublic(wait);
     }).immediate();

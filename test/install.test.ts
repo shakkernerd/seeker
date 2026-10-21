@@ -8,6 +8,7 @@ import { connectEvents } from "../src/install/connector.ts";
 import { removeApplication } from "../src/install/removal.ts";
 import { servicePlist, managedLog } from "../src/install/service.ts";
 import { SqliteExchangeStore } from "../src/store/sqlite.ts";
+import { SeekerCore } from "../src/core/seeker.ts";
 
 const directories: string[] = [];
 afterEach(() => { for (const path of directories.splice(0)) rmSync(path, { recursive: true, force: true }); });
@@ -74,7 +75,17 @@ test("migration rejects an active writer and collisions, then moves same private
   writeFileSync(join(from, "codex-connector.json"), JSON.stringify({ version: 2, hostId: "codex-desktop", socketPath: join(from, "codex.sock"), credentialFile: join(from, "codex.key") }), { mode: 0o600 });
   writeFileSync(join(f.home, "access.key"), "collision", { mode: 0o600 });
   await expect(migrateState(options)).rejects.toThrow("Destination collision"); rmSync(join(f.home, "access.key"));
+  // An open wait whose key Seeker placed would strand its producer: the move waits for it to finish or be cancelled.
+  const keyed = new SqliteExchangeStore(join(from, "exchanges.sqlite"));
+  const held = new SeekerCore(keyed, Date.now, { keyDirectory: join(from, "keys") }).events({ hostId: "codex-desktop", taskId: "task", turnId: "turn", callId: "call" });
+  const open = held.arm({ title: "Held", expiresAt: Date.now() + 60_000 });
+  keyed.close();
+  await expect(migrateState(options)).rejects.toThrow("open wait");
+  const again = new SqliteExchangeStore(join(from, "exchanges.sqlite"));
+  new SeekerCore(again, Date.now, { keyDirectory: join(from, "keys") }).events({ hostId: "codex-desktop", taskId: "task", turnId: "turn", callId: "call" }).cancel({ waitId: open.waitId });
+  again.close();
   await migrateState(options);
+  expect(Bun.file(join(f.home, "keys", `${open.waitId}.json`)).size).toBeGreaterThan(0);
   expect(readFileSync(join(f.home, "access.key"), "utf8")).toBe("same-private-key");
   expect(JSON.parse(readFileSync(join(f.home, "codex-connector.json"), "utf8")).credentialFile).toBe(join(f.home, "codex.key"));
   expect(Bun.file(join(from, "exchanges.sqlite")).size).toBe(0);

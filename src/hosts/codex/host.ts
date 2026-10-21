@@ -97,7 +97,8 @@ export class CodexHostAdapter implements HostAdapter {
           await this.lifecycle?.admitted?.(connection.desktop);
           if (this.#closed || request.signal.aborted || this.#connections.get(connection.token) !== connection) throw new ConnectorError("host_closed", "The native event connection ended.", 503);
           this.lifecycle?.ready?.(connection.desktop);
-          const result = invokeEvent(this.access.events(invocation), operation, body.arguments);
+          const result = await invokeEvent(this.access.events(invocation), operation, body.arguments);
+          if (this.#closed || this.#connections.get(connection.token) !== connection) throw new ConnectorError("host_closed", "The native event connection ended.", 503);
           this.input?.restored?.();
           return privateJson(result);
         }

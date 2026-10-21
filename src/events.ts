@@ -39,12 +39,13 @@ export interface EventWatchRequest {
   on?: TurnEnding[];
   waitId?: string;
 }
-/** A watch on another native task; Seeker itself observes it, no producer signals it. */
+/** A watch on another native task; Seeker itself observes it, no producer signals it. `seen` is the task's latest turn as read when arming. */
 export interface EventWatch extends EventAddress {
   title: string;
   expiresAt: number;
   threadId: string;
   on: TurnEnding[];
+  seen?: { turnId: string; status: TurnEnding | "inProgress" };
 }
 /** What a read of a watched task saw: its latest turn, whether it is running or how it ended, and when it ended if the host says. */
 export interface ThreadObservation { turnId: string; status: TurnEnding | "inProgress"; completedAt?: number }
@@ -104,7 +105,9 @@ export interface EventResult {
   source?: EventReceipt["source"];
   outcome: EventSignal["outcome"];
   summary: string;
+  /** Complete references, as many as the notice can carry in order; `omittedRefs` counts the rest, kept in the saved record. */
   evidenceRefs: string[];
+  omittedRefs?: number;
 }
 /** Machine result identity and its bounded result. */
 export interface EventEnvelope {
@@ -115,7 +118,7 @@ export type EventSummary = Pick<EventWait, "waitId" | "generation" | "revision" 
 export interface EventMutation { expectedVersion?: number }
 export interface EventPort {
   arm(input: EventArmRequest): EventWait & { capabilityFile: string };
-  watch(input: EventWatchRequest): EventWait;
+  watch(input: EventWatchRequest): Promise<EventWait>;
   get(ref: EventRef): EventWait;
   /** This task's open waits and watches: waiting, or with a result not yet delivered. */
   pending(): EventSummary[];

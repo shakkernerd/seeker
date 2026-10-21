@@ -78,6 +78,9 @@ describe("native catalogue qualification", () => {
     await expect(client.threadState(reader, "lead")).rejects.toMatchObject({ code: "native_call_failed" });
     const page = (thread: string, status: string) => ({ success: true, contentItems: [{ type: "inputText", text: JSON.stringify({ schemaVersion: 1, thread: { id: thread, kind: "codex" }, page: { order: "newest_first" }, turns: [{ id: "t", status }] }) }] });
     expect(parseThreadState(page("lead", "interrupted"), "lead")).toEqual({ taskId: "lead", turnId: "t", status: "interrupted" });
+    // The app-server's completion time arrives in seconds and is kept in milliseconds; a record without it gives none.
+    const timed = JSON.parse(JSON.stringify(page("lead", "completed"))); timed.contentItems[0].text = JSON.stringify({ ...JSON.parse(timed.contentItems[0].text), turns: [{ id: "t", status: "completed", completedAt: 1_792_549_446 }] });
+    expect(parseThreadState(timed, "lead")).toEqual({ taskId: "lead", turnId: "t", status: "completed", completedAt: 1_792_549_446_000 });
     expect(() => parseThreadState(page("other", "failed"), "lead")).toThrow();
     expect(() => parseThreadState(page("lead", "unknown-status"), "lead")).toThrow();
   });
