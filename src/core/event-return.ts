@@ -1,6 +1,7 @@
 import type { NativeReturnTarget } from "../contracts.ts";
 import type { EventEnvelope, EventWait } from "../events.ts";
 import type { SeekerCore } from "./seeker.ts";
+import { eventResult } from "./events.ts";
 import { sameOwner } from "./validation.ts";
 
 export function eventReturnTarget(wait: EventWait): NativeReturnTarget {
@@ -13,7 +14,7 @@ export function eventReturnTarget(wait: EventWait): NativeReturnTarget {
 }
 export function eventEnvelope(wait: EventWait): EventEnvelope {
   if (!wait.delivery || !wait.receipt) throw new Error("An event return requires saved receipt and delivery identities.");
-  return { deliveryId: wait.delivery.id, event: { waitId: wait.waitId, generation: wait.generation, revision: wait.revision, version: wait.version, receiptId: wait.receipt.id } };
+  return { deliveryId: wait.delivery.id, event: { waitId: wait.waitId, generation: wait.generation, revision: wait.revision, version: wait.version, receiptId: wait.receipt.id, result: eventResult(wait) } };
 }
 
 /** Durable event authority; the native adapter additionally checks current task activity before grant. */

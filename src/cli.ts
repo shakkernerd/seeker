@@ -90,7 +90,7 @@ async function main(args = process.argv.slice(2)): Promise<void> {
   const accessKey = loadAccessKey(dataDir);
   if (command === "access-key") { console.log(accessKey); return; }
   const store = new SqliteExchangeStore(join(dataDir, "exchanges.sqlite"));
-  const core = new SeekerCore(store);
+  const core = new SeekerCore(store, Date.now, { keyDirectory: join(dataDir, "keys") });
   let runtime: ReturnType<typeof startRuntime> | undefined;
   let telegram: ReturnType<typeof loadTelegram>;
   let native: Awaited<ReturnType<typeof loadCodexHost>>;

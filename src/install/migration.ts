@@ -115,6 +115,10 @@ export async function migrateState(options: { home: string; fromData: string; fr
         db.exec("PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE; COMMIT;");
         const check = db.query<{ quick_check: string }, []>("PRAGMA quick_check").get();
         if (check?.quick_check !== "ok") fail("migration_database", "The source database failed its integrity check.");
+        // A producer holds the key path Seeker returned for an open wait; moving the keys would strand it.
+        const held = db.query<{ count: number }, []>("SELECT count(*) AS count FROM sqlite_master WHERE type='table' AND name='event_waits'").get()!.count
+          ? db.query<{ count: number }, []>("SELECT count(*) AS count FROM event_waits WHERE state IN ('waiting','ready') AND json_extract(data,'$.keyFile') IS NOT NULL").get()!.count : 0;
+        if (held) fail("migration_open_waits", `${held} open wait(s) hold producer keys under this home. Let them finish or cancel them before moving the state.`);
         db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
       } finally { db.close(); }
     }

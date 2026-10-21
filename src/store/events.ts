@@ -1,16 +1,36 @@
 import type { Database } from "bun:sqlite";
 import { randomUUID, timingSafeEqual } from "node:crypto";
+import { unlinkSync } from "node:fs";
+import { join } from "node:path";
 import type { DeliveryResult } from "../contracts.ts";
-import type { EventAddress, EventArm, EventOwner, EventSignal, EventStore, EventWait, EventWatch, StoredEventWait, ThreadObservation } from "../events.ts";
-import { eventAddress, eventArm, eventDigest, eventFingerprint, eventLimits, eventOwner, eventPublic, eventRoute, eventSignal, eventWatch, sameEventOwner, threadObservation } from "../core/events.ts";
+import type { EventAddress, EventArm, EventOwner, EventRef, EventSignal, EventStore, EventWait, EventWatch, StoredEventWait, ThreadObservation } from "../events.ts";
+import { defaultWatchEndings, eventAddress, eventArm, eventDigest, eventFingerprint, eventLimits, eventOwner, eventPublic, eventRef, eventRoute, eventSignal, eventWatch, sameEventOwner, threadObservation, uuidTime } from "../core/events.ts";
 import { fail, id, integer } from "../core/validation.ts";
 
 type Row = { data: string };
 const decode = (row: Row): StoredEventWait => JSON.parse(row.data) as StoredEventWait;
-const terminal = (wait: EventWait) => ["cancelled", "expired", "handled", "cleared"].includes(wait.state);
+/** A wait that will deliver nothing more. `delivered` and `handled` settled with their result; the others without one. */
+const terminal = (wait: EventWait) => ["delivered", "cancelled", "expired", "handled", "cleared"].includes(wait.state);
+/** Settled states the service clears after the retention period; a cleared row is already a tombstone. */
+const settledStates = "('delivered','handled','cancelled','expired')";
+const ended = (status: ThreadObservation["status"]) => status === "completed" ? "completed" : status === "failed" ? "failed" : "was interrupted";
+/**
+ * Whether an ended turn ended after the watch was armed: the host says it completed after the arm,
+ * or the turn began after the arm, or a read (the one made when arming, or a later one) saw it
+ * running or saw an older turn. A turn already ended when first seen, with none of these, is old news.
+ */
+function endedAfterArm(wait: StoredEventWait, observation: ThreadObservation): boolean {
+  const armedAt = wait.createdAt ?? 0;
+  if (observation.completedAt !== undefined && observation.completedAt >= armedAt) return true;
+  const started = uuidTime(observation.turnId);
+  if (started !== undefined && started >= armedAt) return true;
+  const seen = wait.watch?.seen;
+  return seen !== undefined && (seen.turnId !== observation.turnId || seen.status === "inProgress");
+}
 
 /** Shares its owning SqliteExchangeStore connection; never opens a competing writer. */
 export class SqliteEventStore implements EventStore {
+  keyDirectory?: string;
   constructor(private readonly db: Database) {}
 
   arm(rawOwner: EventOwner, raw: EventArm, now: number): EventWait {
@@ -19,19 +39,18 @@ export class SqliteEventStore implements EventStore {
     const input = eventArm(raw, now, true);
     const address = eventAddress(input);
     return this.db.transaction(() => {
+      const { keyFile, ...content } = input;
+      const fingerprint = eventFingerprint({ ...content, owner: { hostId: owner.hostId, taskId: owner.taskId, bindingId: owner.bindingId, ownerGeneration: owner.ownerGeneration } });
       const previous = this.#find(address.waitId);
       if (previous) {
         this.#owned(previous, owner, address);
-        const fingerprint = eventFingerprint({ ...input, owner: { hostId: owner.hostId, taskId: owner.taskId, bindingId: owner.bindingId, ownerGeneration: owner.ownerGeneration } });
         if (previous.armFingerprint !== fingerprint || previous.state === "cleared") fail("event_conflict", "This wait identity already has different content or was cleared. Use a new identity.", 409);
         this.#expire(previous, now); return eventPublic(previous);
       }
       if (input.expiresAt <= now) fail("event_expired", "Choose an explicit future wait expiry.", 409);
-      const total = this.db.query<{ count: number }, []>("SELECT count(*) AS count FROM event_waits INDEXED BY event_wait_retained WHERE state<>'cleared'").get()!.count;
-      const perTask = this.db.query<{ count: number }, [string, string]>("SELECT count(*) AS count FROM event_waits INDEXED BY event_wait_retained WHERE host_id=? AND task_id=? AND state<>'cleared'").get(owner.hostId, owner.taskId)!.count;
-      if (total >= eventLimits.retained || perTask >= eventLimits.perTask) fail("event_capacity", "Retained event capacity reached. Explicitly clear completed evidence before arming more waits.", 503);
-      const { capabilityDigest, ...content } = input;
-      const wait: StoredEventWait = { ...content, owner, capabilityDigest, armFingerprint: eventFingerprint({ ...input, owner: { hostId: owner.hostId, taskId: owner.taskId, bindingId: owner.bindingId, ownerGeneration: owner.ownerGeneration } }), version: 1, state: "waiting", createdAt: now, updatedAt: now };
+      this.#admit(owner);
+      const { capabilityDigest, ...stored } = content;
+      const wait: StoredEventWait = { ...stored, owner, capabilityDigest, ...(keyFile ? { keyFile } : {}), armFingerprint: fingerprint, version: 1, state: "waiting", createdAt: now, updatedAt: now };
       this.db.query("INSERT INTO event_waits(id,host_id,task_id,state,next_at,data) VALUES (?,?,?,?,?,?)").run(wait.waitId, owner.hostId, owner.taskId, wait.state, input.expiresAt, JSON.stringify(wait));
       return eventPublic(wait);
     }).immediate();
@@ -43,19 +62,19 @@ export class SqliteEventStore implements EventStore {
     const address = eventAddress(input);
     if (input.threadId === owner.taskId) fail("invalid_input", "A task cannot watch itself.");
     const snapshot = { hostId: owner.hostId, taskId: owner.taskId, bindingId: owner.bindingId, ownerGeneration: owner.ownerGeneration };
+    // A watch's generation is chosen by the service, so a retry under the same id is judged by its content alone.
+    const fingerprint = eventFingerprint({ waitId: input.waitId, title: input.title, expiresAt: input.expiresAt, threadId: input.threadId, on: input.on, owner: snapshot });
     return this.db.transaction(() => {
       const previous = this.#find(address.waitId);
       if (previous) {
-        this.#owned(previous, owner, address);
-        if (previous.armFingerprint !== eventFingerprint({ ...input, owner: snapshot }) || previous.state === "cleared") fail("event_conflict", "This wait identity already has different content or was cleared. Use a new identity.", 409);
+        this.#owned(previous, owner, { waitId: address.waitId });
+        if (previous.armFingerprint !== fingerprint || previous.state === "cleared") fail("event_conflict", "This wait identity already has different content or was cleared. Use a new identity.", 409);
         this.#expire(previous, now); return eventPublic(previous);
       }
       if (input.expiresAt <= now) fail("event_expired", "Choose an explicit future watch expiry.", 409);
-      const total = this.db.query<{ count: number }, []>("SELECT count(*) AS count FROM event_waits INDEXED BY event_wait_retained WHERE state<>'cleared'").get()!.count;
-      const perTask = this.db.query<{ count: number }, [string, string]>("SELECT count(*) AS count FROM event_waits INDEXED BY event_wait_retained WHERE host_id=? AND task_id=? AND state<>'cleared'").get(owner.hostId, owner.taskId)!.count;
-      if (total >= eventLimits.retained || perTask >= eventLimits.perTask) fail("event_capacity", "Retained event capacity reached. Explicitly clear completed evidence before arming more waits.", 503);
-      const { threadId, ...content } = input;
-      const wait: StoredEventWait = { ...content, owner, watch: { threadId }, armFingerprint: eventFingerprint({ ...input, owner: snapshot }), version: 1, state: "waiting", createdAt: now, updatedAt: now };
+      this.#admit(owner);
+      const { threadId, on, seen, ...content } = input;
+      const wait: StoredEventWait = { ...content, owner, watch: { threadId, on, ...(seen ? { seen } : {}) }, armFingerprint: fingerprint, version: 1, state: "waiting", createdAt: now, updatedAt: now };
       this.db.query("INSERT INTO event_waits(id,host_id,task_id,state,next_at,data) VALUES (?,?,?,?,?,?)").run(wait.waitId, owner.hostId, owner.taskId, wait.state, input.expiresAt, JSON.stringify(wait));
       return eventPublic(wait);
     }).immediate();
@@ -63,16 +82,22 @@ export class SqliteEventStore implements EventStore {
   watching(now: number): EventWait[] {
     return this.db.transaction(() => this.db.query<Row, [number]>("SELECT data FROM event_waits WHERE state='waiting' AND json_extract(data,'$.watch.threadId') IS NOT NULL AND json_extract(data,'$.expiresAt')>? ORDER BY rowid").all(now).map((row) => eventPublic(decode(row)))).immediate();
   }
-  observe(rawAddress: EventAddress, raw: ThreadObservation, now: number): EventWait | undefined {
-    const address = eventAddress(rawAddress), observation = threadObservation(raw);
+  observe(rawRef: EventRef, raw: ThreadObservation, now: number): EventWait | undefined {
+    const ref = eventRef(rawRef), observation = threadObservation(raw);
     return this.db.transaction(() => {
-      const wait = this.#find(address.waitId);
+      const wait = this.#find(ref.waitId);
       if (!wait?.watch) return undefined;
-      this.#address(wait, address); this.#expire(wait, now);
+      this.#address(wait, ref); this.#expire(wait, now);
       // One observation per watch: a settled, cancelled or expired watch reports nothing more.
       if (wait.state !== "waiting" || wait.receipt) return undefined;
-      const signal: EventSignal = { ...address, eventId: `watch:${observation.turnId}:${observation.status}`, outcome: "failed", evidenceRefs: [`codex:${wait.watch.threadId}:${observation.turnId}`],
-        summary: `Watched task ${wait.watch.threadId}: its latest turn ${observation.turnId} ${observation.status === "failed" ? "failed" : "was interrupted"}. Seeker sent it nothing. Decide whether to resume, reassign or leave it; this notice does not restart it.` };
+      const reported = observation.status !== "inProgress" && (wait.watch.on ?? defaultWatchEndings).includes(observation.status) && endedAfterArm(wait, observation);
+      if (!reported) {
+        // Remember what this read saw, so a turn seen running is reported when it ends.
+        if (wait.watch.seen?.turnId !== observation.turnId || wait.watch.seen.status !== observation.status) { wait.watch.seen = { turnId: observation.turnId, status: observation.status }; this.#save(wait); }
+        return undefined;
+      }
+      const signal: EventSignal = { ...eventAddress(wait), eventId: `watch:${observation.turnId}:${observation.status}`, outcome: observation.status === "completed" ? "completed" : "failed", evidenceRefs: [`codex:${wait.watch.threadId}:${observation.turnId}`],
+        summary: `Watched task ${wait.watch.threadId}: its latest turn ${observation.turnId} ${ended(observation.status)}. Seeker sent it nothing. Read that task if you need its report; decide whether to continue, resume or reassign it. This notice does not restart it.` };
       wait.receipt = { id: randomUUID(), source: "watch", signal, recordedAt: now, disposition: "pending" };
       wait.signalFingerprint = eventFingerprint(signal);
       wait.state = "ready"; wait.delivery = { id: randomUUID(), state: "queued", attempts: 0, nextAt: now };
@@ -81,34 +106,30 @@ export class SqliteEventStore implements EventStore {
     }).immediate();
   }
 
-  get(owner: Pick<EventOwner, "hostId" | "taskId">, address: EventAddress, now: number): EventWait {
-    return this.db.transaction(() => { const wait = this.#require(owner, address); this.#expire(wait, now); return eventPublic(wait); }).immediate();
+  get(owner: Pick<EventOwner, "hostId" | "taskId">, ref: EventRef, now: number): EventWait {
+    return this.db.transaction(() => { const wait = this.#require(owner, ref); this.#expire(wait, now); return eventPublic(wait); }).immediate();
   }
   pending(owner: Pick<EventOwner, "hostId" | "taskId">, now: number): EventWait[] {
-    return this.db.transaction(() => this.db.query<Row, [string, string]>("SELECT data FROM event_waits INDEXED BY event_wait_retained WHERE host_id=? AND task_id=? AND state<>'cleared' ORDER BY rowid").all(id(owner.hostId, "Host"), id(owner.taskId, "Task")).map((row) => { const wait = decode(row); this.#expire(wait, now); return eventPublic(wait); })).immediate();
+    return this.db.transaction(() => this.db.query<Row, [string, string]>("SELECT data FROM event_waits INDEXED BY event_wait_owner WHERE host_id=? AND task_id=? AND state IN ('waiting','ready') ORDER BY rowid").all(id(owner.hostId, "Host"), id(owner.taskId, "Task")).map((row) => { const wait = decode(row); this.#expire(wait, now); return eventPublic(wait); }).filter((wait) => wait.state === "waiting" || wait.state === "ready")).immediate();
   }
 
-  mutate(rawOwner: EventOwner, address: EventAddress, expectedVersion: number, command: Parameters<EventStore["mutate"]>[3], now: number): EventWait {
-    const owner = eventOwner(rawOwner); integer(expectedVersion, "Event version", 1);
+  mutate(rawOwner: EventOwner, ref: EventRef, expectedVersion: number | undefined, command: Parameters<EventStore["mutate"]>[3], now: number): EventWait {
+    const owner = eventOwner(rawOwner); if (expectedVersion !== undefined) integer(expectedVersion, "Event version", 1);
     return this.db.transaction(() => {
-      const wait = this.#require(owner, address); this.#expire(wait, now);
-      if (wait.version !== expectedVersion) fail("event_version", "Read the current wait before changing it.", 409);
+      const wait = this.#require(owner, ref); this.#expire(wait, now);
+      if (expectedVersion !== undefined && wait.version !== expectedVersion) fail("event_version", "Read the current wait before changing it.", 409);
       if (command.type === "cancel") {
         if (!terminal(wait)) { wait.state = "cancelled"; wait.reason = "owner_cancelled"; this.#retire(wait); }
       } else if (command.type === "acknowledge") {
-        if (!["received", "handled", "unknown"].includes(command.status) || !wait.receipt || wait.receipt.id !== id(command.receiptId, "Receipt")) fail("event_receipt", "The exact saved event receipt is required.", 409);
+        if (!["received", "handled", "unknown"].includes(command.status) || !wait.receipt || (command.receiptId !== undefined && wait.receipt.id !== id(command.receiptId, "Receipt"))) fail("event_receipt", "This wait has no saved result to acknowledge, or the receipt is not its own.", 409);
         if (wait.state === "cleared") fail("event_closed", "This event evidence was cleared.", 409);
         if (wait.receipt.disposition === "handled" && command.status !== "handled") fail("event_disposition", "A handled event cannot become unhandled.", 409);
         wait.receipt.disposition = command.status; wait.receipt.evidenceRef = `${owner.hostId}:${owner.taskId}:${owner.turnId}:${owner.callId}`;
         if (command.status === "handled" && !["cancelled", "expired"].includes(wait.state)) wait.state = "handled";
         this.#retire(wait);
       } else {
-        if (!terminal(wait) || wait.state === "cleared" || wait.delivery?.state === "sending" || (wait.delivery?.state === "unknown" && wait.receipt?.disposition !== "handled")) fail("event_unsettled", "Settle this wait and explicitly reconcile uncertain delivery before clearing evidence.", 409);
-        // Keep a small revoked identity tombstone so a delayed arm/signal retry cannot recreate a send.
-        wait.state = "cleared";
-        wait.owner = { hostId: wait.owner.hostId, taskId: wait.owner.taskId };
-        delete wait.title; delete wait.expiresAt; delete wait.createdAt;
-        delete wait.receipt; delete wait.delivery; delete wait.capabilityDigest; delete wait.armFingerprint; delete wait.signalFingerprint; delete wait.reason;
+        if (!this.#clearable(wait)) fail("event_unsettled", "Settle this wait and explicitly reconcile uncertain delivery before clearing evidence.", 409);
+        this.#clear(wait);
       }
       wait.version += 1; wait.updatedAt = now; this.#save(wait); return eventPublic(wait);
     }).immediate();
@@ -146,8 +167,12 @@ export class SqliteEventStore implements EventStore {
     return this.db.transaction(() => {
       const claimed: EventWait[] = [], excluded = new Set(excludedRoutes);
       // Expiration and queue selection stay bounded even with thousands of retained results.
-      const expired = this.db.query<Row, [number, number]>("SELECT data FROM event_waits WHERE state IN ('waiting','ready') AND next_at<=? AND json_extract(data,'$.expiresAt')<=? AND json_extract(data,'$.receipt.source') IS NOT 'deadline' AND NOT (json_extract(data,'$.watch.threadId') IS NOT NULL AND json_extract(data,'$.receipt.id') IS NOT NULL) LIMIT 128").all(now, now);
+      const expired = this.db.query<Row, [number, number]>("SELECT data FROM event_waits WHERE state='waiting' AND next_at<=? AND json_extract(data,'$.expiresAt')<=? AND json_extract(data,'$.receipt.id') IS NULL LIMIT 128").all(now, now);
       for (const row of expired) this.#expire(decode(row), now);
+      // Retention: a settled wait is cleared by the service once its day has passed; the task does nothing.
+      // Rows that may not be cleared yet (a send in flight, an unknown send not reconciled) are left out of the scan so they never hold the rest back.
+      const settled = this.db.query<Row, [number]>(`SELECT data FROM event_waits WHERE state IN ${settledStates} AND next_at<=? AND (coalesce(json_extract(data,'$.delivery.state'),'') NOT IN ('sending','unknown') OR (json_extract(data,'$.delivery.state')='unknown' AND json_extract(data,'$.receipt.disposition')='handled')) LIMIT 128`).all(now);
+      for (const row of settled) { const wait = decode(row); if (!this.#clearable(wait)) continue; this.#clear(wait); wait.version += 1; wait.updatedAt = now; this.#save(wait); }
       while (claimed.length < limit) {
         const routes = [...excluded];
         const route = "json_array('event',host_id,task_id)";
@@ -169,6 +194,12 @@ export class SqliteEventStore implements EventStore {
       if (result.status === "accepted") {
         if (typeof result.reference !== "string" || !result.reference || result.reference.length > 500) fail("invalid_adapter_result", "Event delivery reference is invalid.");
         delivery.reference = result.reference; delete delivery.code;
+        // The host confirmed the notice reached the task: the wait is settled, with the result delivered.
+        if (wait.state === "ready" && wait.receipt) {
+          wait.state = "delivered";
+          if (wait.receipt.disposition === "pending") { wait.receipt.disposition = "received"; wait.receipt.evidenceRef = result.reference; }
+          wait.version += 1;
+        }
       } else {
         delivery.code = id(result.code, "Event delivery code");
         if (result.status === "retry") {
@@ -219,17 +250,32 @@ export class SqliteEventStore implements EventStore {
     }).immediate();
   }
   #find(waitId: string): StoredEventWait | undefined { const row = this.db.query<Row, [string]>("SELECT data FROM event_waits WHERE id=?").get(id(waitId, "Wait")); return row ? decode(row) : undefined; }
-  #require(owner: Pick<EventOwner, "hostId" | "taskId">, address: EventAddress): StoredEventWait { const wait = this.#find(address.waitId); if (!wait) fail("event_not_found", "Event wait not found.", 404); this.#owned(wait, owner, address); return wait; }
-  #owned(wait: EventWait, owner: Pick<EventOwner, "hostId" | "taskId">, address: EventAddress): void { if (!sameEventOwner(wait.owner, owner)) fail("origin_denied", "This event wait belongs to another native task.", 403); this.#address(wait, address); }
-  #address(wait: EventWait, raw: EventAddress): void { const address = eventAddress(raw); if (wait.generation !== address.generation || wait.revision !== address.revision) fail("event_generation", "The event generation or source revision changed.", 409); }
+  #require(owner: Pick<EventOwner, "hostId" | "taskId">, ref: EventRef): StoredEventWait { const wait = this.#find(ref.waitId); if (!wait) fail("event_not_found", "Event wait not found.", 404); this.#owned(wait, owner, ref); return wait; }
+  #owned(wait: EventWait, owner: Pick<EventOwner, "hostId" | "taskId">, ref: EventRef): void { if (!sameEventOwner(wait.owner, owner)) fail("origin_denied", "This event wait belongs to another native task.", 403); this.#address(wait, ref); }
+  /** A full address must match the wait; a bare id names it on its own. */
+  #address(wait: EventWait, raw: EventRef): void { const ref = eventRef(raw); if ((ref.generation !== undefined && wait.generation !== ref.generation) || (ref.revision !== undefined && wait.revision !== ref.revision)) fail("event_generation", "The event generation or source revision changed.", 409); }
+  /** Capacity bounds open waits; settled ones leave it and are cleared by retention. */
+  #admit(owner: EventOwner): void {
+    const total = this.db.query<{ count: number }, []>("SELECT count(*) AS count FROM event_waits INDEXED BY event_wait_queue WHERE state IN ('waiting','ready')").get()!.count;
+    const perTask = this.db.query<{ count: number }, [string, string]>("SELECT count(*) AS count FROM event_waits INDEXED BY event_wait_owner WHERE host_id=? AND task_id=? AND state IN ('waiting','ready')").get(owner.hostId, owner.taskId)!.count;
+    if (total >= eventLimits.retained || perTask >= eventLimits.perTask) fail("event_capacity", "Open wait capacity reached. Cancel waits you no longer need before arming more.", 503);
+  }
+  #clearable(wait: StoredEventWait): boolean { return terminal(wait) && wait.state !== "cleared" && wait.delivery?.state !== "sending" && !(wait.delivery?.state === "unknown" && wait.receipt?.disposition !== "handled"); }
+  /** Keep a small revoked identity tombstone so a delayed arm/signal retry cannot recreate a send. */
+  #clear(wait: StoredEventWait): void {
+    wait.state = "cleared";
+    wait.owner = { hostId: wait.owner.hostId, taskId: wait.owner.taskId };
+    delete wait.title; delete wait.expiresAt; delete wait.createdAt; delete wait.watch;
+    delete wait.receipt; delete wait.delivery; delete wait.capabilityDigest; delete wait.armFingerprint; delete wait.signalFingerprint; delete wait.reason;
+    // A key Seeker placed goes with the record; a file the task named is the task's to remove.
+    if (wait.keyFile) { if (this.keyDirectory) { try { unlinkSync(join(this.keyDirectory, wait.keyFile)); } catch { /* already gone */ } } delete wait.keyFile; }
+  }
   #renew(wait: StoredEventWait, now: number): void { wait.delivery = { id: randomUUID(), state: "queued", attempts: 0, nextAt: now }; }
   #retire(wait: StoredEventWait): void { if (wait.delivery && ["queued", "retry", "rejected"].includes(wait.delivery.state)) wait.delivery.state = "retired"; }
   #expire(wait: StoredEventWait, now: number): void {
-    if (terminal(wait) || wait.receipt?.source === "deadline" || (wait.expiresAt !== undefined && wait.expiresAt > now)) return;
-    // A watch's expiry only ends the watching: an observation already recorded is still delivered,
-    // and there is no producer whose silence needs reporting.
-    if (wait.watch && wait.receipt) return;
-    if (!wait.receipt && wait.expiresAt !== undefined && !wait.watch) {
+    // A saved result, whoever recorded it, is delivered whatever the deadline: expiry only ends the waiting.
+    if (terminal(wait) || wait.receipt || (wait.expiresAt !== undefined && wait.expiresAt > now)) return;
+    if (wait.expiresAt !== undefined && !wait.watch) {
       wait.receipt = {
         id: randomUUID(), source: "deadline", recordedAt: now, disposition: "pending",
         signal: { ...eventAddress(wait), eventId: randomUUID(), outcome: "failed", evidenceRefs: [],
@@ -244,8 +290,8 @@ export class SqliteEventStore implements EventStore {
   }
   #save(wait: StoredEventWait): void {
     const queued = wait.state === "ready" && wait.delivery && ["queued", "retry"].includes(wait.delivery.state);
-    // A deadline notice and an observed watch are delivered on their own schedule; their expiry no longer governs them.
-    const next = queued ? wait.receipt?.source === "deadline" || wait.watch ? wait.delivery!.nextAt : Math.min(wait.expiresAt ?? 0, wait.delivery!.nextAt) : wait.expiresAt ?? 0;
+    // A queued result is delivered on its own schedule; a settled wait's next_at is when retention clears it; an open wait's is its expiry.
+    const next = queued ? wait.delivery!.nextAt : terminal(wait) && wait.state !== "cleared" ? wait.updatedAt + eventLimits.retainedMs : wait.expiresAt ?? 0;
     this.db.query("UPDATE event_waits SET state=?,next_at=?,data=? WHERE id=?").run(wait.state, next, JSON.stringify(wait), wait.waitId);
   }
 }

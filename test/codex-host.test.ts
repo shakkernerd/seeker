@@ -28,7 +28,7 @@ function fixture(clock: () => number = Date.now, lifecycle?: CodexHostLifecycle)
   const send = (path: string, body: unknown, token = credential, signal?: AbortSignal) => fetch(`http://127.0.0.1:${server.port}${codexRoute}/${path}`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body), signal });
   const connect = async (desktop?: unknown) => { const response = await send("connect", { protocol: 1, instanceId: randomUUID(), ...(desktop === undefined ? {} : { desktop }) }); expect(response.status).toBe(200); return (await response.json()).session as string; };
   const invoke = (session: string, managerId: string, operation: string, args: unknown) => send("invoke", { origin: { threadId: managerId, turnId: "native-turn", callId: "native-call" }, operation, arguments: args }, session);
-  return { core, store, host, bindings, send, connect, invoke, restorations: () => restorations };
+  return { core, store, host, bindings, send, connect, invoke, directory, restorations: () => restorations };
 }
 function envelope(f: ReturnType<typeof fixture>, index = 0): { binding: ManagerBinding; envelope: ReceiptEnvelope } {
   const binding = f.bindings[index]!;
@@ -61,7 +61,7 @@ describe("thread watches", () => {
   test("a task arms a watch on another task through the shared connection and the host reads it only through a current bridge", async () => {
     const lifecycle: CodexHostLifecycle = { connected: async () => {}, admitted: async () => {}, ready: () => {} };
     const f = fixture(Date.now, lifecycle), session = await f.connect("qualified");
-    const watch = { waitId: "watch-lead", generation: "g", revision: "lead-rev", title: "Lead", expiresAt: Date.now() + 60_000, threadId: "lead-one" };
+    const watch = { waitId: "watch-lead", title: "Lead", expiresAt: Date.now() + 60_000, threadId: "lead-one" };
     const armed = await f.invoke(session, "manager-one", "event_watch", watch);
     expect(armed.status).toBe(200);
     expect(await armed.json()).toMatchObject({ waitId: "watch-lead", state: "waiting", watch: { threadId: "lead-one" } });
@@ -152,8 +152,8 @@ describe("native input ownership", () => {
 
 test("native machine tools admit an individual worker without granting human manager authority", async () => {
   const f = fixture(), session = await f.connect();
-  const address = { waitId: "worker-dependency", generation: "worker-generation", revision: "release-one" };
-  const input = { ...address, title: "Wait for release", expiresAt: Date.now() + 60_000, capabilityDigest: eventDigest("c".repeat(64)) };
+  const address = { waitId: "worker-dependency" };
+  const input = { ...address, title: "Wait for release", expiresAt: Date.now() + 60_000, capabilityFile: join(f.directory, "worker-key.json") };
   const armed = await f.invoke(session, "individual-worker", "event_arm", input);
   expect(armed.status).toBe(200);
   expect((await armed.json()).owner).toMatchObject({ taskId: "individual-worker", turnId: "native-turn", callId: "native-call" });

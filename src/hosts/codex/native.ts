@@ -144,7 +144,18 @@ export function parseThreadState(response: unknown, taskId: string): ThreadState
   if (value.schemaVersion !== 1 || thread.id !== taskId || thread.kind !== "codex" || page.order !== "newest_first" || !Array.isArray(value.turns) || value.turns.length !== 1) throw unqualified();
   const turn = record(value.turns[0]);
   if (!["inProgress", "completed", "interrupted", "failed"].includes(String(turn.status))) throw unqualified();
-  return { taskId: identifier(taskId), turnId: identifier(turn.id), status: turn.status as ThreadState["status"] };
+  const state: ThreadState = { taskId: identifier(taskId), turnId: identifier(turn.id), status: turn.status as ThreadState["status"] };
+  const completedAt = turnCompletedAt(turn);
+  if (completedAt !== undefined) state.completedAt = completedAt;
+  return state;
+}
+
+/** The app-server's turn record gives `completedAt` in Unix seconds; a record without it gives nothing. */
+export function turnCompletedAt(turn: Record<string, unknown>): number | undefined {
+  const value = turn.completedAt;
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return undefined;
+  // Seconds in the protocol; a value already in milliseconds is left as it is.
+  return value < 1e12 ? Math.round(value * 1000) : Math.round(value);
 }
 
 export function nativeEvidence(origin: NativeInvocation): string {

@@ -19,11 +19,15 @@ test("ordinary producer signals a privately armed native wait through the real s
   const path = join(dir, "producer.json"), grant = JSON.parse(await cli(["prepare", "--capability-file", path, "--revision", "release-12"]));
   const raw = JSON.parse(readFileSync(path, "utf8"));
   expect(JSON.stringify(grant).includes(raw.capability)).toBe(false);
-  expect(prepareEventCapability(path, { revision: "release-12" })).toEqual(grant);
+  expect(grant.created).toBe(true);
+  expect(prepareEventCapability(path, { revision: "release-12" })).toEqual({ ...grant, created: false });
   expect(() => prepareEventCapability(path, { revision: "other" })).toThrow();
   const store = new SqliteExchangeStore(":memory:"); cleanups.push(() => store.close());
   const core = new SeekerCore(store), port = core.events({ hostId: "codex-desktop", taskId: "native-owner", turnId: "original-turn", callId: "original-call" });
-  port.arm({ ...grant, title: "Release", expiresAt: Date.now() + 60_000 });
+  // Arming with the path the CLI prepared recovers that key and identity instead of writing a second key.
+  const armed = port.arm({ title: "Release", expiresAt: Date.now() + 60_000, capabilityFile: path, revision: "release-12" });
+  expect(armed).toMatchObject({ waitId: grant.waitId, generation: grant.generation, revision: grant.revision, capabilityFile: path });
+  expect(armed).not.toHaveProperty("capabilityDigest");
   const server = createLocalServer({ core, accessKey: "browser-key", port: 0 }); cleanups.push(() => server.stop(true));
   const endpoint = `http://127.0.0.1:${server.port}`;
   const result = { eventId: "release-12-finished", outcome: "released" as const, summary: "External dependency is available.", evidenceRefs: ["artifact:release-12"] };

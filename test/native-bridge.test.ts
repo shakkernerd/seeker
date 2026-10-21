@@ -88,6 +88,10 @@ test("a thread-state read crosses the bridge with the watcher's stamp and return
   const reader = { threadId: "manager-task", turnId: "manager-turn", callId: "read-call" };
   expect(await threadStateBridge(f.bridge.endpoint, f.dataDir, reader, "lead-task", new AbortController().signal)).toEqual({ taskId: "lead-task", turnId: "lead-turn", status: "interrupted" });
   expect(f.reads).toEqual([{ origin: reader, threadId: "lead-task" }]);
+  // The turn's completion time, when the host gives it, crosses the bridge with the state.
+  f.state({ taskId: "lead-task", turnId: "lead-turn", status: "completed", completedAt: 1_792_549_446_000 });
+  expect(await threadStateBridge(f.bridge.endpoint, f.dataDir, reader, "lead-task", new AbortController().signal)).toEqual({ taskId: "lead-task", turnId: "lead-turn", status: "completed", completedAt: 1_792_549_446_000 });
+  f.state({ taskId: "lead-task", turnId: "lead-turn", status: "interrupted" });
   expect(f.sends).toHaveLength(0);
   // A task the host cannot read is reported as unreadable, which keeps the connector for its sends.
   f.state(Object.assign(new Error("not loaded"), { code: "native_call_failed" }));
@@ -105,5 +109,5 @@ test("a thread-state read crosses the bridge with the watcher's stamp and return
     socket.once("close", () => resolve());
     socket.once("connect", () => socket.write(`${JSON.stringify({ credential: f.bridge.endpoint.credential, threadState: { origin: reader, threadId: "lead-task" }, nativeSend: { origin: reader, arguments: args } })}\n`));
   });
-  expect(f.reads).toHaveLength(3); expect(f.sends).toHaveLength(1);
+  expect(f.reads).toHaveLength(4); expect(f.sends).toHaveLength(1);
 });

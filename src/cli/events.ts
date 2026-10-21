@@ -7,12 +7,13 @@ const help = `Usage:
   seeker event prepare --capability-file <new-private-path> --revision <source-revision> [--wait-id <unique-id>]
   seeker event signal --capability-file <private-path> --endpoint http://127.0.0.1:<port> --result-file <path>
 
-Prepare writes a new private producer key and prints only the wait identity and digest.
-Arm that identity from the original native task with event_arm, title and an explicit expiresAt.
+A native task normally arms a wait with the event_arm tool, which prepares the producer
+key file itself. Prepare is for arming an identity by hand: it writes a new private key
+file and prints only the wait identity and digest for a store-level arm.
 The existing job/dependency owner signals its own result file: eventId, outcome
 (completed, released or failed), summary and evidenceRefs. No job is started by Seeker.
 An uncertain signal response can be retried with the same exact result and identity.
-Never print or pass the capability file contents through model tools, logs or argv.
+Never print or pass the key file contents through model tools, logs or argv.
 `;
 
 export async function runEventCommand(args: string[]): Promise<void> {

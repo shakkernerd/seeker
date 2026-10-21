@@ -7,8 +7,8 @@ import type { EventAddress, EventSignal } from "../events.ts";
 interface CapabilityFile extends EventAddress { version: 1; capability: string }
 export const eventSignalPath = "/api/events/signal";
 
-/** The raw key goes directly to an exclusively created private file, never to the returned value. */
-export function prepareEventCapability(path: string, input: { waitId?: string; revision: string }): EventAddress & { capabilityDigest: string } {
+/** The raw key goes directly to an exclusively created private file, never to the returned value. `created` is false when the file already named this wait. */
+export function prepareEventCapability(path: string, input: { waitId?: string; revision: string }): EventAddress & { capabilityDigest: string; created: boolean } {
   const address = { waitId: input.waitId === undefined ? `wait-${randomUUID()}` : id(input.waitId, "Wait"), generation: randomUUID(), revision: id(input.revision, "Source revision") };
   const capability = randomBytes(32).toString("hex");
   let descriptor: number;
@@ -17,11 +17,11 @@ export function prepareEventCapability(path: string, input: { waitId?: string; r
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     const existing = readCapability(path);
     if (existing.revision !== address.revision || (input.waitId !== undefined && existing.waitId !== address.waitId)) fail("capability_conflict", "This private capability file already belongs to a different wait.", 409);
-    return { waitId: existing.waitId, generation: existing.generation, revision: existing.revision, capabilityDigest: eventDigest(existing.capability) };
+    return { waitId: existing.waitId, generation: existing.generation, revision: existing.revision, capabilityDigest: eventDigest(existing.capability), created: false };
   }
   try { writeFileSync(descriptor, `${JSON.stringify({ version: 1, ...address, capability })}\n`); fsyncSync(descriptor); }
   finally { closeSync(descriptor); }
-  return { ...address, capabilityDigest: eventDigest(capability) };
+  return { ...address, capabilityDigest: eventDigest(capability), created: true };
 }
 
 function readCapability(path: string): CapabilityFile {
