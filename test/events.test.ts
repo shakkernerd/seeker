@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SqliteExchangeStore } from "../src/store/sqlite.ts";
@@ -262,12 +262,12 @@ test("a watch is a wait Seeker itself settles: one observation of an ending it r
   // A producer cannot signal a watch: it has no capability.
   expect(() => f.store.events.signal(capability, { waitId: watch.waitId, generation: armed.generation, revision: armed.revision, eventId: "e", outcome: "completed", summary: "s", evidenceRefs: [] }, 1002)).toThrow("not accepted");
   // A completed turn is not an observation for this watch; the first reported ending settles it.
-  expect(() => f.store.events.observe(watch, { turnId: "t1", status: "aborted" as never }, 1003)).toThrow("completed, failed or interrupted");
-  expect(f.store.events.observe({ waitId: "watch-lead" }, { turnId: "t1", status: "completed" }, 1003)).toBeUndefined();
-  const observed = f.store.events.observe({ waitId: "watch-lead" }, { turnId: "lead-turn-3", status: "interrupted" }, 1003)!;
+  expect(() => f.store.events.observe(watch, { turnId: "t1", status: "aborted" as never }, 1003)).toThrow("in progress, completed, failed or interrupted");
+  expect(f.store.events.observe({ waitId: "watch-lead" }, { turnId: "t1", status: "completed", completedAt: 1003 }, 1003)).toBeUndefined();
+  const observed = f.store.events.observe({ waitId: "watch-lead" }, { turnId: "lead-turn-3", status: "interrupted", completedAt: 1003 }, 1003)!;
   expect(observed.state).toBe("ready"); expect(observed.receipt).toMatchObject({ source: "watch", disposition: "pending", signal: { outcome: "failed", eventId: "watch:lead-turn-3:interrupted", evidenceRefs: ["codex:lead-task:lead-turn-3"] } });
   expect(observed.receipt!.signal.summary).toContain("was interrupted"); expect(observed.receipt!.signal.summary).toContain("sent it nothing");
-  expect(f.store.events.observe({ waitId: "watch-lead" }, { turnId: "lead-turn-4", status: "failed" }, 1004)).toBeUndefined();
+  expect(f.store.events.observe({ waitId: "watch-lead" }, { turnId: "lead-turn-4", status: "failed", completedAt: 1004 }, 1004)).toBeUndefined();
   expect(() => f.store.events.observe({ waitId: "watch-lead", generation: "other" }, { turnId: "x", status: "failed" }, 1004)).toThrow("generation");
   expect(f.store.events.watching(1004)).toEqual([]);
   const attempt = f.store.events.claim(1, 1004, [])[0]!;
@@ -280,7 +280,7 @@ test("a watch is a wait Seeker itself settles: one observation of an ending it r
   // A watch armed for completion reports the completed turn, as a completed outcome.
   const done = f.port().watch({ waitId: "watch-done", title: "Lead two", expiresAt: 5000, threadId: "lead-two", on: ["completed", "interrupted", "failed"] });
   expect(done.watch).toEqual({ threadId: "lead-two", on: ["completed", "failed", "interrupted"] });
-  const finished = f.store.events.observe({ waitId: "watch-done" }, { turnId: "two-7", status: "completed" }, 1006)!;
+  const finished = f.store.events.observe({ waitId: "watch-done" }, { turnId: "two-7", status: "completed", completedAt: 1006 }, 1006)!;
   expect(finished.receipt!.signal).toMatchObject({ outcome: "completed", eventId: "watch:two-7:completed" });
   expect(finished.receipt!.signal.summary).toContain("turn two-7 completed");
   // A watch that reaches its expiry without an observation simply expires: no deadline notice, no delivery.
@@ -289,11 +289,11 @@ test("a watch is a wait Seeker itself settles: one observation of an ending it r
   expect(f.store.events.claim(4, 5000, []).map((wait) => wait.waitId)).toEqual(["watch-done"]);
   expect(f.port().get(quiet)).toMatchObject({ state: "expired", reason: "deadline_passed" });
   expect(f.port().get(quiet).receipt).toBeUndefined();
-  expect(f.store.events.observe(quiet, { turnId: "late", status: "failed" }, 5001)).toBeUndefined();
+  expect(f.store.events.observe(quiet, { turnId: "late", status: "failed", completedAt: 5001 }, 5001)).toBeUndefined();
   // A cancelled watch reports nothing either.
   const cancelled = { ...watch, waitId: "watch-cancelled", expiresAt: 9000 }; f.port().watch(cancelled);
   f.port().cancel(cancelled);
-  expect(f.store.events.observe(cancelled, { turnId: "t", status: "failed" }, 5002)).toBeUndefined();
+  expect(f.store.events.observe(cancelled, { turnId: "t", status: "failed", completedAt: 5002 }, 5002)).toBeUndefined();
   expect(f.store.events.watching(5002)).toEqual([]);
 });
 
@@ -302,7 +302,7 @@ test("observed watches neither starve the expiry scan nor skip their retry delay
   for (let i = 0; i < 40; i++) f.port().watch({ waitId: `watch-${i}`, title: "lead", expiresAt: 2000, threadId: `lead-${i}` });
   expect(f.store.events.watching(1001)).toHaveLength(40);
   // Observed, delivered with a retry, then past expiry: the retry waits its delay and the ordinary deadline still fires.
-  f.store.events.observe({ waitId: "watch-0" }, { turnId: "t", status: "failed" }, 1002);
+  f.store.events.observe({ waitId: "watch-0" }, { turnId: "t", status: "failed", completedAt: 1002 }, 1002);
   const attempt = f.store.events.claim(1, 1002, [])[0]!;
   expect(attempt.waitId).toBe("watch-0");
   f.store.events.complete("watch-0", attempt.generation, attempt.delivery!.attemptId!, { status: "retry", code: "desktop_connector_unavailable", retryAfterMs: 60_000 }, 1003);
@@ -326,6 +326,11 @@ test("the port arms a wait in one call: it prepares the private key file and ret
   expect(statSync(join(f.directory, "keys")).mode & 0o777).toBe(0o700); expect(statSync(placed.capabilityFile).mode & 0o777).toBe(0o600);
   expect(placed).not.toHaveProperty("keyFile"); expect(JSON.stringify(keyed.get({ waitId: placed.waitId }))).not.toContain("keyFile");
   expect(keyed.arm({ title: "Release", expiresAt: 5000, waitId: placed.waitId })).toEqual(placed);
+  // A refused arm leaves no key behind; the key of an existing wait is untouched by a retry the store refuses.
+  for (let i = 0; i < 127; i++) f.arm({ ...arm, waitId: `open-${i}`, expiresAt: 5000 });
+  expect(() => keyed.arm({ title: "Overflow", expiresAt: 5000 })).toThrow("capacity");
+  expect(() => keyed.arm({ title: "Renamed", expiresAt: 5000, waitId: placed.waitId })).toThrow("different content");
+  expect(readdirSync(join(f.directory, "keys"))).toEqual([`${placed.waitId}.json`]);
   keyed.cancel({ waitId: placed.waitId }); keyed.clear({ waitId: placed.waitId });
   expect(() => statSync(placed.capabilityFile)).toThrow();
   // A task-chosen path is prepared at that path and stays the task's file.
@@ -415,9 +420,28 @@ test("rows that may not be cleared yet never hold retention back for the rest", 
   f.store.events.signal(capability, { ...signal, waitId: done.waitId }, 2000);
   const sent = f.store.events.claim(1, 2000, [])[0]!;
   f.store.events.complete(done.waitId, done.generation, sent.delivery!.attemptId!, { status: "accepted", reference: "native:done" }, 2000);
-  f.store.events.claim(4, 2000 + eventLimits.retainedMs, []);
-  expect(f.port().get({ waitId: "done" }).state).toBe("cleared");
+  // Settled without ever having a delivery: cancelled before a result, and a watch that expired quietly.
+  f.setTime(2000); f.arm({ ...arm, waitId: "never-signalled", expiresAt: 10 * eventLimits.retainedMs }); f.port().cancel({ waitId: "never-signalled" });
+  f.port().watch({ waitId: "quiet-watch", title: "quiet", expiresAt: 3000, threadId: "someone" });
+  f.setTime(3000); expect(f.port().get({ waitId: "quiet-watch" }).state).toBe("expired");
+  f.store.events.claim(4, 3000 + eventLimits.retainedMs, []);
+  for (const waitId of ["done", "never-signalled", "quiet-watch"]) expect(f.port().get({ waitId }).state).toBe("cleared");
   expect(f.port().get({ waitId: "stuck-0" })).toMatchObject({ state: "cancelled", delivery: { state: "unknown" } });
+  // Once acknowledged, a stuck row clears at the next pass.
+  f.port().acknowledge({ waitId: "stuck-0" }, "handled");
+  f.store.events.claim(4, 3000 + eventLimits.retainedMs, []);
+  expect(f.port().get({ waitId: "stuck-0" }).state).toBe("cleared");
+});
+
+test("keys Seeker placed follow the key directory when the state moves", () => {
+  const f = fixture(true); f.setTime(1000);
+  const before = join(f.directory, "keys-before"), after = join(f.directory, "keys-after");
+  const wait = new SeekerCore(f.store, () => 1000, { keyDirectory: before }).events(owner).arm({ title: "Moved", expiresAt: 5000 });
+  expect(wait.capabilityFile).toBe(join(before, `${wait.waitId}.json`));
+  f.store.close(); renameSync(before, after); f.reopen();
+  const moved = new SeekerCore(f.store, () => 1000, { keyDirectory: after }).events(owner);
+  moved.cancel({ waitId: wait.waitId }); moved.clear({ waitId: wait.waitId });
+  expect(readdirSync(after)).toEqual([]);
 });
 
 test("a store from the release before retention keeps its settled waits for one retention period after the upgrade", () => {

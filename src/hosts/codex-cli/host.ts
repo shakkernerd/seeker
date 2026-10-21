@@ -5,6 +5,7 @@ import type { DeliveryResult, HostAdapter, NativeEnvelope, NativeReturnTarget, M
 import { SeekerCore } from "../../core/seeker.ts";
 import { SeekerError } from "../../core/validation.ts";
 import { ConnectorError, envelopeIdentity, envelopeReference, identifier, nativeWakeup, onlyKeys, parseInvocation, record, type NativeInvocation } from "../codex/protocol.ts";
+import { turnCompletedAt } from "../codex/native.ts";
 import { invokeManager } from "../codex/tools.ts";
 import { parseCliOwner, sameCliProcess, sameCliProfile, type CliOwner, type RegisteredCliOwner } from "./owner.ts";
 import { NativeRpcError } from "./rpc.ts";
@@ -99,7 +100,10 @@ export class CodexCliHost implements HostAdapter {
     if (!Array.isArray(turns.data) || turns.data.length !== 1) throw new ConnectorError("cli_thread_state_unavailable", "The task's latest turn could not be read.", 503);
     const turn = record(turns.data[0]), status = String(turn.status);
     if (!["inProgress", "completed", "interrupted", "failed"].includes(status)) throw new ConnectorError("cli_thread_state_unavailable", "The task's latest turn could not be qualified.", 503);
-    return { taskId: identifier(threadId), turnId: identifier(turn.id), status: status as ThreadState["status"] };
+    const state: ThreadState = { taskId: identifier(threadId), turnId: identifier(turn.id), status: status as ThreadState["status"] };
+    const completedAt = turnCompletedAt(turn);
+    if (completedAt !== undefined) state.completedAt = completedAt;
+    return state;
   }
 
   async deliver(binding: NativeReturnTarget, envelope: NativeEnvelope, signal: AbortSignal): Promise<DeliveryResult> {

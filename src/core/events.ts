@@ -66,7 +66,7 @@ export function eventArm(raw: unknown, now: number, allowPast = false): EventArm
   if (!allowPast && expiresAt <= now) fail("event_expired", "Choose an explicit future wait expiry.", 409);
   if (typeof value.capabilityDigest !== "string" || !/^[a-f0-9]{64}$/.test(value.capabilityDigest)) fail("invalid_capability", "Use the digest from a private event capability file.");
   const arm: EventArm = { ...eventAddress(value), title: text(value.title, "Wait title", 200), expiresAt, capabilityDigest: value.capabilityDigest };
-  if (value.keyFile !== undefined) { if (typeof value.keyFile !== "string" || !isAbsolute(value.keyFile)) fail("invalid_capability", "A Seeker-placed key file is an absolute path."); arm.keyFile = value.keyFile; }
+  if (value.keyFile !== undefined) { if (typeof value.keyFile !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,200}$/.test(value.keyFile)) fail("invalid_capability", "A Seeker-placed key file is named within the key directory."); arm.keyFile = value.keyFile; }
   return arm;
 }
 export function eventWatch(raw: unknown, now: number, allowPast = false): EventWatch {
@@ -74,9 +74,16 @@ export function eventWatch(raw: unknown, now: number, allowPast = false): EventW
   return { ...eventAddress(value), title: text(value.title, "Watch title", 200), expiresAt: expiry(value.expiresAt, now, allowPast, "watch"), threadId: id(value.threadId, "Watched task"), on: endings(value.on) };
 }
 export function threadObservation(raw: unknown): ThreadObservation {
-  const value = object(raw); keys(value, ["turnId", "status"]);
-  if (!turnEndings.includes(value.status as TurnEnding)) fail("invalid_input", "Only a completed, failed or interrupted turn is an observation.");
-  return { turnId: id(value.turnId, "Turn"), status: value.status as TurnEnding };
+  const value = object(raw); keys(value, ["turnId", "status", "completedAt"]);
+  if (value.status !== "inProgress" && !turnEndings.includes(value.status as TurnEnding)) fail("invalid_input", "A turn is in progress, completed, failed or interrupted.");
+  const observation: ThreadObservation = { turnId: id(value.turnId, "Turn"), status: value.status as ThreadObservation["status"] };
+  if (value.completedAt !== undefined) observation.completedAt = integer(value.completedAt, "Turn completion time", 1);
+  return observation;
+}
+/** The creation time a UUIDv7 carries, as Codex turn ids do; undefined for any other id. */
+export function uuidTime(value: string): number | undefined {
+  const match = /^([0-9a-f]{8})-([0-9a-f]{4})-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.exec(value);
+  return match ? Number.parseInt(match[1]! + match[2]!, 16) : undefined;
 }
 /** The result a notice carries: the summary bounded, the references complete so each one can be used as given. */
 export function eventResult(wait: EventWait): EventResult {

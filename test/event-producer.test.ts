@@ -19,7 +19,8 @@ test("ordinary producer signals a privately armed native wait through the real s
   const path = join(dir, "producer.json"), grant = JSON.parse(await cli(["prepare", "--capability-file", path, "--revision", "release-12"]));
   const raw = JSON.parse(readFileSync(path, "utf8"));
   expect(JSON.stringify(grant).includes(raw.capability)).toBe(false);
-  expect(prepareEventCapability(path, { revision: "release-12" })).toEqual(grant);
+  expect(grant.created).toBe(true);
+  expect(prepareEventCapability(path, { revision: "release-12" })).toEqual({ ...grant, created: false });
   expect(() => prepareEventCapability(path, { revision: "other" })).toThrow();
   const store = new SqliteExchangeStore(":memory:"); cleanups.push(() => store.close());
   const core = new SeekerCore(store), port = core.events({ hostId: "codex-desktop", taskId: "native-owner", turnId: "original-turn", callId: "original-call" });

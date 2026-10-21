@@ -1,9 +1,10 @@
 import type { Database } from "bun:sqlite";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { unlinkSync } from "node:fs";
+import { join } from "node:path";
 import type { DeliveryResult } from "../contracts.ts";
 import type { EventAddress, EventArm, EventOwner, EventRef, EventSignal, EventStore, EventWait, EventWatch, StoredEventWait, ThreadObservation } from "../events.ts";
-import { defaultWatchEndings, eventAddress, eventArm, eventDigest, eventFingerprint, eventLimits, eventOwner, eventPublic, eventRef, eventRoute, eventSignal, eventWatch, sameEventOwner, threadObservation } from "../core/events.ts";
+import { defaultWatchEndings, eventAddress, eventArm, eventDigest, eventFingerprint, eventLimits, eventOwner, eventPublic, eventRef, eventRoute, eventSignal, eventWatch, sameEventOwner, threadObservation, uuidTime } from "../core/events.ts";
 import { fail, id, integer } from "../core/validation.ts";
 
 type Row = { data: string };
@@ -13,9 +14,23 @@ const terminal = (wait: EventWait) => ["delivered", "cancelled", "expired", "han
 /** Settled states the service clears after the retention period; a cleared row is already a tombstone. */
 const settledStates = "('delivered','handled','cancelled','expired')";
 const ended = (status: ThreadObservation["status"]) => status === "completed" ? "completed" : status === "failed" ? "failed" : "was interrupted";
+/**
+ * Whether an ended turn ended after the watch was armed. The host's completion time decides when it
+ * gives one; otherwise a turn that began after the arm, or one an earlier read saw running, or a turn
+ * newer than the one first seen, is a new ending, and a turn already ended at the first read is not.
+ */
+function endedAfterArm(wait: StoredEventWait, observation: ThreadObservation): boolean {
+  const armedAt = wait.createdAt ?? 0;
+  if (observation.completedAt !== undefined) return observation.completedAt >= armedAt;
+  const started = uuidTime(observation.turnId);
+  if (started !== undefined && started >= armedAt) return true;
+  const seen = wait.watch?.seen;
+  return seen !== undefined && (seen.turnId !== observation.turnId || seen.status === "inProgress");
+}
 
 /** Shares its owning SqliteExchangeStore connection; never opens a competing writer. */
 export class SqliteEventStore implements EventStore {
+  keyDirectory?: string;
   constructor(private readonly db: Database) {}
 
   arm(rawOwner: EventOwner, raw: EventArm, now: number): EventWait {
@@ -73,9 +88,14 @@ export class SqliteEventStore implements EventStore {
       const wait = this.#find(ref.waitId);
       if (!wait?.watch) return undefined;
       this.#address(wait, ref); this.#expire(wait, now);
-      // One observation per watch: a settled, cancelled or expired watch reports nothing more,
-      // and an ending the watch was not armed for is not an observation.
-      if (wait.state !== "waiting" || wait.receipt || !(wait.watch.on ?? defaultWatchEndings).includes(observation.status)) return undefined;
+      // One observation per watch: a settled, cancelled or expired watch reports nothing more.
+      if (wait.state !== "waiting" || wait.receipt) return undefined;
+      const reported = observation.status !== "inProgress" && (wait.watch.on ?? defaultWatchEndings).includes(observation.status) && endedAfterArm(wait, observation);
+      if (!reported) {
+        // Remember what this read saw, so a turn seen running is reported when it ends.
+        if (wait.watch.seen?.turnId !== observation.turnId || wait.watch.seen.status !== observation.status) { wait.watch.seen = { turnId: observation.turnId, status: observation.status }; this.#save(wait); }
+        return undefined;
+      }
       const signal: EventSignal = { ...eventAddress(wait), eventId: `watch:${observation.turnId}:${observation.status}`, outcome: observation.status === "completed" ? "completed" : "failed", evidenceRefs: [`codex:${wait.watch.threadId}:${observation.turnId}`],
         summary: `Watched task ${wait.watch.threadId}: its latest turn ${observation.turnId} ${ended(observation.status)}. Seeker sent it nothing. Read that task if you need its report; decide whether to continue, resume or reassign it. This notice does not restart it.` };
       wait.receipt = { id: randomUUID(), source: "watch", signal, recordedAt: now, disposition: "pending" };
@@ -151,7 +171,7 @@ export class SqliteEventStore implements EventStore {
       for (const row of expired) this.#expire(decode(row), now);
       // Retention: a settled wait is cleared by the service once its day has passed; the task does nothing.
       // Rows that may not be cleared yet (a send in flight, an unknown send not reconciled) are left out of the scan so they never hold the rest back.
-      const settled = this.db.query<Row, [number]>(`SELECT data FROM event_waits WHERE state IN ${settledStates} AND next_at<=? AND json_extract(data,'$.delivery.state') IS NOT 'sending' AND NOT (json_extract(data,'$.delivery.state')='unknown' AND json_extract(data,'$.receipt.disposition') IS NOT 'handled') LIMIT 128`).all(now);
+      const settled = this.db.query<Row, [number]>(`SELECT data FROM event_waits WHERE state IN ${settledStates} AND next_at<=? AND (coalesce(json_extract(data,'$.delivery.state'),'') NOT IN ('sending','unknown') OR (json_extract(data,'$.delivery.state')='unknown' AND json_extract(data,'$.receipt.disposition')='handled')) LIMIT 128`).all(now);
       for (const row of settled) { const wait = decode(row); if (!this.#clearable(wait)) continue; this.#clear(wait); wait.version += 1; wait.updatedAt = now; this.#save(wait); }
       while (claimed.length < limit) {
         const routes = [...excluded];
@@ -248,7 +268,7 @@ export class SqliteEventStore implements EventStore {
     delete wait.title; delete wait.expiresAt; delete wait.createdAt; delete wait.watch;
     delete wait.receipt; delete wait.delivery; delete wait.capabilityDigest; delete wait.armFingerprint; delete wait.signalFingerprint; delete wait.reason;
     // A key Seeker placed goes with the record; a file the task named is the task's to remove.
-    if (wait.keyFile) { try { unlinkSync(wait.keyFile); } catch { /* already gone, or not ours to remove */ } delete wait.keyFile; }
+    if (wait.keyFile) { if (this.keyDirectory) { try { unlinkSync(join(this.keyDirectory, wait.keyFile)); } catch { /* already gone */ } } delete wait.keyFile; }
   }
   #renew(wait: StoredEventWait, now: number): void { wait.delivery = { id: randomUUID(), state: "queued", attempts: 0, nextAt: now }; }
   #retire(wait: StoredEventWait): void { if (wait.delivery && ["queued", "retry", "rejected"].includes(wait.delivery.state)) wait.delivery.state = "retired"; }

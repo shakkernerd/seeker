@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import type { EventOwner, EventPort } from "../events.ts";
 import { prepareEventCapability } from "./event-client.ts";
@@ -10,7 +10,9 @@ import { fail, id, origin as validateOrigin, sameRecipient } from "./validation.
 /** Trusted composition owns this object. Expose only a bound ManagerPort to agent tools. */
 export class SeekerCore {
   /** `keyDirectory`: where Seeker places producer key files for waits armed without a path; without it a task must name the path. */
-  constructor(readonly store: ExchangeStore, readonly clock: () => number = Date.now, private readonly options: { keyDirectory?: string } = {}) {}
+  constructor(readonly store: ExchangeStore, readonly clock: () => number = Date.now, private readonly options: { keyDirectory?: string } = {}) {
+    if (options.keyDirectory) store.events.keyDirectory = options.keyDirectory;
+  }
 
   bind(binding: ManagerBinding): void { this.store.bind(binding); }
   setRecipient(bindingId: string, expectedGeneration: number, recipient: Recipient): void {
@@ -79,9 +81,14 @@ export class SeekerCore {
           if (code === "EACCES" || code === "EPERM" || code === "EROFS") fail("capability_unwritable", "The producer key file path is not writable by the service.", 409);
           throw error;
         }
-        const { capabilityDigest, ...address } = grant;
-        const arm = { ...address, title: request.title, expiresAt: request.expiresAt, capabilityDigest, ...(request.capabilityFile === undefined ? { keyFile: capabilityFile } : {}) };
-        return { ...this.store.events.arm(origin, arm, this.clock()), capabilityFile };
+        const { capabilityDigest, created, ...address } = grant;
+        const arm = { ...address, title: request.title, expiresAt: request.expiresAt, capabilityDigest, ...(request.capabilityFile === undefined ? { keyFile: `${waitId}.json` } : {}) };
+        try { return { ...this.store.events.arm(origin, arm, this.clock()), capabilityFile }; }
+        catch (error) {
+          // A key written for a wait the store refused is removed; a key that already belonged to a wait stays.
+          if (created && request.capabilityFile === undefined) { try { unlinkSync(capabilityFile); } catch { /* already gone */ } }
+          throw error;
+        }
       },
       watch: (raw) => {
         current();

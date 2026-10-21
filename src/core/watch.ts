@@ -53,8 +53,8 @@ export class ThreadWatcher {
           let state;
           try { state = await host.threadState({ hostId, taskId: wait.owner.taskId, turnId: wait.owner.turnId }, wait.watch!.threadId, signal); }
           catch { continue; }
-          if (state.taskId !== wait.watch!.threadId || state.status === "inProgress") continue;
-          try { if (this.core.store.events.observe(wait, { turnId: state.turnId, status: state.status }, this.core.clock())) observed += 1; }
+          if (state.taskId !== wait.watch!.threadId) continue;
+          try { if (this.core.store.events.observe(wait, { turnId: state.turnId, status: state.status, ...(state.completedAt !== undefined ? { completedAt: state.completedAt } : {}) }, this.core.clock())) observed += 1; }
           catch { this.lastError = "store_write_failed"; return; }
         }
       }));

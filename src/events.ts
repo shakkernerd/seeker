@@ -25,7 +25,7 @@ export interface EventArm extends EventAddress {
   title: string;
   expiresAt: number;
   capabilityDigest: string;
-  /** A key file Seeker placed under its own home; removed when the wait is cleared. A task-chosen file is the task's. */
+  /** The name of a key file Seeker placed in its key directory; removed when the wait is cleared. A task-chosen file is the task's. */
   keyFile?: string;
 }
 /** The ways a task's turn can end; a watch reports the ones it was armed for. */
@@ -46,7 +46,8 @@ export interface EventWatch extends EventAddress {
   threadId: string;
   on: TurnEnding[];
 }
-export interface ThreadObservation { turnId: string; status: TurnEnding }
+/** What a read of a watched task saw: its latest turn, whether it is running or how it ended, and when it ended if the host says. */
+export interface ThreadObservation { turnId: string; status: TurnEnding | "inProgress"; completedAt?: number }
 export interface EventSignal extends EventAddress {
   eventId: string;
   outcome: "completed" | "released" | "failed";
@@ -77,8 +78,8 @@ export interface EventWait extends EventAddress {
   owner: Pick<EventOwner, "hostId" | "taskId"> & Partial<Omit<EventOwner, "hostId" | "taskId">>;
   title?: string;
   expiresAt?: number;
-  /** Present on a watch: the task whose latest turn Seeker observes for this wait, and the endings it reports. */
-  watch?: { threadId: string; on?: TurnEnding[] };
+  /** Present on a watch: the task whose latest turn Seeker observes for this wait, the endings it reports, and the latest turn a read saw. */
+  watch?: { threadId: string; on?: TurnEnding[]; seen?: { turnId: string; status: TurnEnding | "inProgress" } };
   version: number;
   /**
    * `delivered`: the result reached the task. `handled`: the task said so itself. `paused` is a legacy
@@ -123,11 +124,13 @@ export interface EventPort {
   clear(ref: EventRef, options?: EventMutation): EventWait;
 }
 export interface EventStore {
+  /** The directory holding the key files Seeker placed; a cleared wait's `keyFile` is removed from it. */
+  keyDirectory?: string;
   arm(owner: EventOwner, input: EventArm, now: number): EventWait;
   watch(owner: EventOwner, input: EventWatch, now: number): EventWait;
   /** Every unexpired watch still waiting for an observation. */
   watching(now: number): EventWait[];
-  /** Records one observed turn ending as the watch's result and queues its delivery, when the watch reports that ending. */
+  /** Takes one read of the watched task; records the first ending that happened after the watch was armed, of a kind it reports, as its result and queues delivery. */
   observe(address: EventRef, observation: ThreadObservation, now: number): EventWait | undefined;
   get(owner: Pick<EventOwner, "hostId" | "taskId">, ref: EventRef, now: number): EventWait;
   /** The owner's open waits: waiting, or ready with a result not yet delivered. */
