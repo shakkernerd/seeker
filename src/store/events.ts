@@ -283,6 +283,16 @@ export class SqliteEventStore implements EventStore {
       };
       wait.state = "ready"; wait.reason = "deadline_passed";
       wait.delivery = { id: randomUUID(), state: "queued", attempts: 0, nextAt: now };
+    } else if (wait.watch && wait.watch.on?.includes("expired")) {
+      // A watch asked to report its own expiry: the task has not ended a reported turn within the time given.
+      const seen = wait.watch.seen;
+      wait.receipt = {
+        id: randomUUID(), source: "watch", recordedAt: now, disposition: "pending",
+        signal: { ...eventAddress(wait), eventId: `watch:expired:${seen?.turnId ?? "none"}`, outcome: "failed", evidenceRefs: seen ? [`codex:${wait.watch.threadId}:${seen.turnId}`] : [],
+          summary: `Watched task ${wait.watch.threadId}: the watch expired${seen ? ` while its latest turn ${seen.turnId} was ${seen.status === "inProgress" ? "still running" : seen.status}` : ""}. Seeker sent it nothing. Read that task; decide whether to watch it again, resume or reassign it. This notice does not restart it.` },
+      };
+      wait.state = "ready"; wait.reason = "deadline_passed";
+      wait.delivery = { id: randomUUID(), state: "queued", attempts: 0, nextAt: now };
     } else {
       wait.state = "expired"; wait.reason = "deadline_passed"; this.#retire(wait);
     }

@@ -31,12 +31,15 @@ export interface EventArm extends EventAddress {
 /** The ways a task's turn can end; a watch reports the ones it was armed for. */
 export type TurnEnding = "completed" | "failed" | "interrupted";
 export const turnEndings: readonly TurnEnding[] = ["completed", "failed", "interrupted"];
+/** What a watch can report: a turn ending, or its own expiry while the task had not ended a turn. */
+export type WatchEnding = TurnEnding | "expired";
+export const watchEndings: readonly WatchEnding[] = [...turnEndings, "expired"];
 /** What a task supplies to watch another task; the identity is chosen by Seeker unless given. */
 export interface EventWatchRequest {
   title: string;
   expiresAt: number;
   threadId: string;
-  on?: TurnEnding[];
+  on?: WatchEnding[];
   waitId?: string;
 }
 /** A watch on another native task; Seeker itself observes it, no producer signals it. `seen` is the task's latest turn as read when arming. */
@@ -44,7 +47,7 @@ export interface EventWatch extends EventAddress {
   title: string;
   expiresAt: number;
   threadId: string;
-  on: TurnEnding[];
+  on: WatchEnding[];
   seen?: { turnId: string; status: TurnEnding | "inProgress" };
 }
 /** What a read of a watched task saw: its latest turn, whether it is running or how it ended, and when it ended if the host says. */
@@ -80,7 +83,7 @@ export interface EventWait extends EventAddress {
   title?: string;
   expiresAt?: number;
   /** Present on a watch: the task whose latest turn Seeker observes for this wait, the endings it reports, and the latest turn a read saw. */
-  watch?: { threadId: string; on?: TurnEnding[]; seen?: { turnId: string; status: TurnEnding | "inProgress" } };
+  watch?: { threadId: string; on?: WatchEnding[]; seen?: { turnId: string; status: TurnEnding | "inProgress" } };
   version: number;
   /**
    * `delivered`: the result reached the task. `handled`: the task said so itself. `paused` is a legacy
