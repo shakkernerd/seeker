@@ -418,3 +418,24 @@ test("CLI worker event admission delivers a saved result whatever turn the task 
   f.store.events.complete(address.waitId, address.generation, claimed.delivery!.attemptId!, result, Date.now());
   expect(f.store.events.claim(1, Date.now(), [])).toEqual([]);
 });
+
+test("the CLI host reads a watched task's latest turn through its app-server, reconnecting to the running one after a restart but never starting one", async () => {
+  const f = fixture();
+  f.behavior.request = async (call) => call.method === "thread/turns/list" ? { data: [{ id: "lead-turn", status: "interrupted", items: [{ text: "Untrusted" }] }] } : f.defaultResponse(call);
+  // Freshly constructed from its saved registration, with no connection yet: the read connects to the existing app-server.
+  expect(f.connections).toHaveLength(0);
+  expect(await f.host.threadState({ hostId: cliHostId, taskId: managerId }, "lead-task", new AbortController().signal)).toEqual({ taskId: "lead-task", turnId: "lead-turn", status: "interrupted" });
+  expect(f.connections).toHaveLength(1);
+  expect(f.calls.some((call) => call.method === "thread/resume" || call.method === "turn/start")).toBe(false);
+  // A gone app-server is not restarted for a read.
+  const gone = fixture(); gone.runtime.gone = async () => true;
+  await expect(gone.host.threadState({ hostId: cliHostId, taskId: managerId }, "lead-task", new AbortController().signal)).rejects.toMatchObject({ code: "cli_unavailable" });
+  expect(gone.connections).toHaveLength(0);
+  const state = await f.host.threadState({ hostId: cliHostId, taskId: managerId }, "lead-task", new AbortController().signal);
+  expect(state).toEqual({ taskId: "lead-task", turnId: "lead-turn", status: "interrupted" });
+  const call = f.calls.filter((item) => item.method === "thread/turns/list").at(-1)!;
+  expect(call.params).toEqual({ threadId: "lead-task", limit: 1, sortDirection: "desc", itemsView: "notLoaded" });
+  f.behavior.request = async (call) => call.method === "thread/turns/list" ? { data: [] } : f.defaultResponse(call);
+  await expect(f.host.threadState({ hostId: cliHostId, taskId: managerId }, "lead-task", new AbortController().signal)).rejects.toMatchObject({ code: "cli_thread_state_unavailable" });
+  await expect(f.host.threadState({ hostId: "codex-desktop", taskId: managerId }, "lead-task", new AbortController().signal)).rejects.toMatchObject({ code: "origin_denied" });
+});

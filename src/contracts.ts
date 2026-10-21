@@ -237,9 +237,14 @@ export type HostEnvelope = ReceiptEnvelope | DeferredEnvelope | DeliveryNoticeEn
 
 export interface NativeReturnTarget { id: string; origin: ManagerOrigin }
 export type NativeEnvelope = HostEnvelope | EventEnvelope;
+export interface ThreadState { taskId: string; turnId: string; status: "inProgress" | "completed" | "interrupted" | "failed" }
+/** The task on whose behalf a host reads another task; the host stamps the read with it. */
+export interface ThreadReader { hostId: string; taskId: string; turnId?: string }
 export interface HostAdapter {
   id: string;
   deliver(binding: NativeReturnTarget, envelope: NativeEnvelope, signal: AbortSignal): Promise<DeliveryResult>;
+  /** The latest turn of a task this host serves, read without a model; absent when the host cannot observe tasks. */
+  threadState?(reader: ThreadReader, threadId: string, signal: AbortSignal): Promise<ThreadState>;
 }
 
 export type ManagerCommand =

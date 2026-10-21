@@ -45,6 +45,14 @@ A saved result is delivered to the task whatever turn the task is on by then: an
 
 `event_cancel` revokes future admission/return and retains existing evidence. Cancellation after a native grant cannot prove that input did not escape. `event_get` and `event_pending` allow the original owner to reconcile that uncertainty after reconnect or restart.
 
+## Watching another task
+
+A task that starts other tasks, a manager with its leads, can ask Seeker to watch one of them. `event_watch` takes a fresh wait identity, a title, an explicit expiry and the watched task's exact thread id; it needs no producer capability because Seeker is the observer. The watch is an ordinary retained wait: it appears in `event_pending`, is read with `event_get`, and is cancelled, acknowledged and cleared with the usual tools.
+
+While a watch is waiting and unexpired, the service reads the watched task's latest turn through its host at a fixed interval of thirty seconds, with no model involved: the Desktop connector reads it over the native tools pipe, the CLI host over its registered app-server. Only the turn's identity and status are read; its messages and outputs are discarded at the reader. When that turn has failed or been interrupted, the service saves one result for the watch (`receipt.source: "watch"`, `signal.outcome: "failed"`, the turn in `evidenceRefs`) and delivers it to the watching task like any machine event. A completed turn is not reported; a task that finished its turn normally reports through its own means. One observation settles the watch: resume or reassign the watched task as you see fit, then arm a new watch if you want to keep watching it.
+
+Seeker never sends anything to the watched task. A task cannot watch itself. A watch that reaches its expiry simply expires, with no deadline notice. A task that cannot be read, because it is not loaded on that host or the host is unavailable, is read again at the next interval. Watches count against the same retained-wait limits as other waits.
+
 ## Lifetime and limits
 
 Every wait has a caller-explicit expiry. If an uncancelled wait reaches that deadline without a producer result, the service atomically saves one failure receipt (`source: "deadline"`, `signal.outcome: "failed"`) and its native return intent. This means the wait failed to obtain a result; **job completion remains unknown**. The notice does not restart the job or establish success. A late producer signal is rejected and cannot replace the deadline receipt.

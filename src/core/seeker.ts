@@ -56,8 +56,9 @@ export class SeekerCore {
       (address, expectedVersion, command) => { current(); return this.store.events.mutate(origin, address, expectedVersion, command, this.clock()); };
     return {
       arm: (value) => { current(); return this.store.events.arm(origin, value, this.clock()); },
+      watch: (value) => { current(); return this.store.events.watch(origin, value, this.clock()); },
       get: (address) => { current(); return this.store.events.get(origin, address, this.clock()); },
-      pending: () => { current(); return this.store.events.pending(origin, this.clock()).map(({ waitId, generation, revision, title, expiresAt, version, state, updatedAt, reason, receipt }) => ({ waitId, generation, revision, title, expiresAt, version, state, updatedAt, ...(reason ? { reason } : {}), ...(receipt ? { receiptId: receipt.id } : {}) })); },
+      pending: () => { current(); return this.store.events.pending(origin, this.clock()).map(({ waitId, generation, revision, title, expiresAt, version, state, updatedAt, reason, receipt, watch }) => ({ waitId, generation, revision, title, expiresAt, version, state, updatedAt, ...(reason ? { reason } : {}), ...(receipt ? { receiptId: receipt.id } : {}), ...(watch ? { watch } : {}) })); },
       cancel: (address, version) => mutate(address, version, { type: "cancel" }),
       acknowledge: (address, version, receiptId, status) => mutate(address, version, { type: "acknowledge", receiptId, status }),
       clear: (address, version) => mutate(address, version, { type: "clear" }),

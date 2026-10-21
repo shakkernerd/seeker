@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { EventAddress, EventArm, EventOwner, EventSignal, EventWait } from "../events.ts";
+import type { EventAddress, EventArm, EventOwner, EventSignal, EventWait, EventWatch, ThreadObservation } from "../events.ts";
 import { fail, id, integer, object, text } from "./validation.ts";
 
 export const eventLimits = { resultBytes: 16_384, retained: 4096, perTask: 128 } as const;
@@ -26,6 +26,17 @@ export function eventArm(raw: unknown, now: number, allowPast = false): EventArm
   if (!allowPast && expiresAt <= now) fail("event_expired", "Choose an explicit future wait expiry.", 409);
   if (typeof value.capabilityDigest !== "string" || !/^[a-f0-9]{64}$/.test(value.capabilityDigest)) fail("invalid_capability", "Use the digest from a private event capability file.");
   return { ...eventAddress(value), title: text(value.title, "Wait title", 200), expiresAt, capabilityDigest: value.capabilityDigest };
+}
+export function eventWatch(raw: unknown, now: number, allowPast = false): EventWatch {
+  const value = object(raw); keys(value, ["waitId", "generation", "revision", "title", "expiresAt", "threadId"]);
+  const expiresAt = integer(value.expiresAt, "Expiry", 1);
+  if (!allowPast && expiresAt <= now) fail("event_expired", "Choose an explicit future watch expiry.", 409);
+  return { ...eventAddress(value), title: text(value.title, "Watch title", 200), expiresAt, threadId: id(value.threadId, "Watched task") };
+}
+export function threadObservation(raw: unknown): ThreadObservation {
+  const value = object(raw); keys(value, ["turnId", "status"]);
+  if (value.status !== "failed" && value.status !== "interrupted") fail("invalid_input", "Only a failed or interrupted turn is an observation.");
+  return { turnId: id(value.turnId, "Turn"), status: value.status };
 }
 export function eventSignal(raw: unknown): EventSignal {
   const value = object(raw); keys(value, ["waitId", "generation", "revision", "eventId", "outcome", "summary", "evidenceRefs"]);

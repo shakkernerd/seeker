@@ -99,3 +99,30 @@ test("explicit removal deletes only verified application paths and matching MCP 
   expect(Bun.TOML.parse(readFileSync(config, "utf8"))).toEqual({ model: "same", mcp_servers: { unrelated: { command: "/keep" } } });
   expect(Bun.file(join(f.home, "app/installation.json")).size).toBe(0);
 });
+
+test("event connector setup upgrades a tool list it generated earlier and preserves a custom one", async () => {
+  const f = fixture(); await installApplication(f.options);
+  const config = join(f.root, "config.toml");
+  expect((connectEvents(f.home, config) as { changed: boolean }).changed).toBe(true);
+  const written = readFileSync(config, "utf8");
+  expect(written).toContain('"event_watch"');
+  const older = written.replace(/enabled_tools = \[[^\n]*\]/, 'enabled_tools = ["event_arm", "event_get", "event_pending", "event_cancel", "event_resume", "event_acknowledge", "event_clear"]');
+  writeFileSync(config, older);
+  expect((connectEvents(f.home, config, true) as { changed: boolean }).changed).toBe(true);
+  expect(readFileSync(config, "utf8")).toBe(older);
+  connectEvents(f.home, config);
+  expect(readFileSync(config, "utf8")).toBe(written);
+  const custom = written.replace(/enabled_tools = \[[^\n]*\]/, 'enabled_tools = ["event_get", "event_pending"]');
+  writeFileSync(config, custom);
+  expect(connectEvents(f.home, config, true)).toMatchObject({ changed: false, enabledTools: expect.stringContaining("preserved") });
+  connectEvents(f.home, config);
+  expect(readFileSync(config, "utf8")).toBe(custom);
+  // A mention of the event table inside another table's comment never redirects the rewrite to that table.
+  const decoy = '[mcp_servers.seeker]\ncommand = "/human"\n# Configure [mcp_servers.seeker_events] separately\nenabled_tools = ["submit", "get", "pending", "update"]\n\n' + older;
+  writeFileSync(config, decoy);
+  connectEvents(f.home, config);
+  const result = readFileSync(config, "utf8");
+  expect(result).toContain('enabled_tools = ["submit", "get", "pending", "update"]');
+  expect(result).toContain('"event_watch"');
+  expect(result).not.toContain('"event_resume"');
+});

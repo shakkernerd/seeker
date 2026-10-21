@@ -1,5 +1,6 @@
 import type { HostAdapter, MessagingChannel } from "../contracts.ts";
 import { DeliveryPump } from "../core/delivery.ts";
+import { ThreadWatcher } from "../core/watch.ts";
 import { LocalChannel } from "./channel.ts";
 import { createLocalServer, type LocalServerOptions } from "./server.ts";
 
@@ -17,10 +18,11 @@ export function startRuntime(options: RuntimeOptions) {
   }
   const server = createLocalServer(options);
   const pump = new DeliveryPump(options.core, channels, hosts);
-  try { pump.start(); }
-  catch (error) { void server.stop(true); throw error; }
+  const watcher = new ThreadWatcher(options.core, hosts);
+  try { pump.start(); watcher.start(); }
+  catch (error) { watcher.stop(); void server.stop(true); throw error; }
   return {
-    server, pump,
-    async stop() { pump.stop(); await server.stop(true); },
+    server, pump, watcher,
+    async stop() { watcher.stop(); pump.stop(); await server.stop(true); },
   };
 }

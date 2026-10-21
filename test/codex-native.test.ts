@@ -3,13 +3,13 @@ import { randomUUID } from "node:crypto";
 import { createServer, type Socket } from "node:net";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { CodexNativeClient } from "../src/hosts/codex/native.ts";
+import { CodexNativeClient, parseThreadState } from "../src/hosts/codex/native.ts";
 import { installSection } from "../src/hosts/codex/setup.ts";
 
 const cleanup: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
 
-async function nativeFixture(mode: "compatible" | "drop" | "bad-frame" | "extra-required" | "wrong-input-type" | "send" | "refuse" | "drop-call" | "garbled" | "wrong-id" | "no-result" | "contradictory" = "compatible") {
+async function nativeFixture(mode: "compatible" | "drop" | "bad-frame" | "extra-required" | "wrong-input-type" | "send" | "refuse" | "drop-call" | "garbled" | "wrong-id" | "no-result" | "contradictory" | "read" = "compatible") {
   const path = join(tmpdir(), `sk-${randomUUID().slice(0, 8)}.sock`);
   const requests: Record<string, any>[] = [], sockets = new Set<Socket>(), calls = new Set(["arm-call"]);
   const server = createServer((socket) => {
@@ -22,9 +22,12 @@ async function nativeFixture(mode: "compatible" | "drop" | "bad-frame" | "extra-
       requests.push(request);
       if (mode === "drop") { socket.destroy(); return; }
       if (mode === "bad-frame") { const header = Buffer.alloc(4); header.writeUInt32LE(0xffffffff); socket.end(header); return; }
-      let result: unknown = { tools: [{ name: "send_message_to_thread", namespace: "codex_app", inputSchema: { type: "object", properties: { threadId: { type: mode === "wrong-input-type" ? "number" : "string" }, prompt: { type: "string" } }, ...(mode === "extra-required" ? { required: ["threadId", "prompt", "newRequiredField"] } : {}) } }] };
+      let result: unknown = { tools: [{ name: "send_message_to_thread", namespace: "codex_app", inputSchema: { type: "object", properties: { threadId: { type: mode === "wrong-input-type" ? "number" : "string" }, prompt: { type: "string" } }, ...(mode === "extra-required" ? { required: ["threadId", "prompt", "newRequiredField"] } : {}) } }, { name: "read_thread", namespace: "codex_app", inputSchema: { type: "object" } }] };
       let error: unknown;
-      if (request.method === "tools/call") {
+      if (mode === "read" && request.method === "tools/call") {
+        if (calls.has(request.params.callId)) error = { code: -32603, message: "Native call identity was already used." };
+        else { calls.add(request.params.callId); result = { success: true, contentItems: [{ type: "inputText", text: JSON.stringify({ schemaVersion: 1, thread: { id: request.params.arguments.threadId, kind: "codex", preview: "Untrusted preview" }, page: { order: "newest_first" }, turns: [{ id: "lead-turn", status: calls.size === 2 ? "inProgress" : "failed", items: [{ text: "Untrusted output" }] }] }) }] }; }
+      } else if (request.method === "tools/call") {
         if (mode === "drop-call") { socket.destroy(); return; }
         if (mode === "refuse") error = { code: -32000, message: "Codex app tool request failed" };
         else if (mode === "wrong-id") { const body = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 7, result: { success: true, contentItems: [] } })); const frame = Buffer.alloc(4 + body.length); frame.writeUInt32LE(body.length); body.copy(frame, 4); socket.end(frame); return; }
@@ -62,6 +65,21 @@ describe("native catalogue qualification", () => {
     expect(await new CodexNativeClient((await nativeFixture("no-result")).path).send(origin, args)).toEqual({ status: "uncertain", code: "native_invalid_response" });
     const missing = await new CodexNativeClient(join(tmpdir(), `missing-${randomUUID()}.sock`)).send(origin, args);
     expect(missing).toEqual({ status: "refused", code: "native_unavailable" });
+  });
+
+  test("a thread-state read is one stamped read_thread call that keeps only the latest turn's identity and status", async () => {
+    const fixture = await nativeFixture("read"), client = new CodexNativeClient(fixture.path);
+    const reader = { threadId: "manager", turnId: "manager-turn", callId: "read-one" };
+    expect(await client.threadState(reader, "lead")).toEqual({ taskId: "lead", turnId: "lead-turn", status: "inProgress" });
+    expect(await client.threadState({ ...reader, callId: "read-two" }, "lead")).toEqual({ taskId: "lead", turnId: "lead-turn", status: "failed" });
+    const reads = fixture.requests.filter((request) => request.method === "tools/call");
+    expect(reads.map((request) => ({ ...request.params, callId: "fresh" }))).toEqual(Array(2).fill({ arguments: { threadId: "lead", turnLimit: 1, includeOutputs: false, maxOutputCharsPerItem: 50 }, callerSource: "codex", namespace: "codex_app", tool: "read_thread", threadId: "manager", turnId: "manager-turn", callId: "fresh" }));
+    expect(JSON.stringify(await client.threadState({ ...reader, callId: "read-three" }, "lead").catch((error) => error.code))).not.toContain("Untrusted");
+    await expect(client.threadState(reader, "lead")).rejects.toMatchObject({ code: "native_call_failed" });
+    const page = (thread: string, status: string) => ({ success: true, contentItems: [{ type: "inputText", text: JSON.stringify({ schemaVersion: 1, thread: { id: thread, kind: "codex" }, page: { order: "newest_first" }, turns: [{ id: "t", status }] }) }] });
+    expect(parseThreadState(page("lead", "interrupted"), "lead")).toEqual({ taskId: "lead", turnId: "t", status: "interrupted" });
+    expect(() => parseThreadState(page("other", "failed"), "lead")).toThrow();
+    expect(() => parseThreadState(page("lead", "unknown-status"), "lead")).toThrow();
   });
 
   test("rejects an incompatible refreshed input capability", async () => {

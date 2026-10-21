@@ -1,4 +1,5 @@
 import { createConnection } from "node:net";
+import type { ThreadState } from "../../contracts.ts";
 import { identifier, maxWireBytes, record, type NativeInvocation } from "./protocol.ts";
 
 export class NativeFailure extends Error {
@@ -14,6 +15,7 @@ export type NativeSendOutcome =
 /** Qualifies a native connector through the registered app's read-only tool catalogue. */
 export class CodexNativeClient {
   #namespace?: string;
+  #readNamespace?: string;
   constructor(private readonly pipePath: string, private readonly timeoutMs = 4_000) {}
 
   async qualify(signal?: AbortSignal): Promise<void> {
@@ -60,6 +62,23 @@ export class CodexNativeClient {
       // The host answered after taking the input; an unparseable answer is not evidence that nothing was sent.
       return { status: "uncertain", code: "native_target_unconfirmed" };
     }
+  }
+
+  /** The latest turn of a loaded task; messages, previews and outputs are discarded at this reader. */
+  async threadState(origin: NativeInvocation, threadId: string, signal?: AbortSignal): Promise<ThreadState> {
+    if (!this.#readNamespace) {
+      const list = record(await this.#request(signal));
+      if (!Array.isArray(list.tools)) throw new NativeFailure("native_read_unavailable");
+      const tool = list.tools.map(record).find((item) => item.name === "read_thread");
+      if (!tool) throw new NativeFailure("native_read_unavailable");
+      this.#readNamespace = identifier(tool.namespace);
+    }
+    const result = await this.#request(signal, "tools/call", {
+      arguments: { threadId: identifier(threadId), turnLimit: 1, includeOutputs: false, maxOutputCharsPerItem: 50 },
+      callerSource: "codex", namespace: this.#readNamespace, tool: "read_thread",
+      threadId: origin.threadId, turnId: origin.turnId, callId: origin.callId,
+    });
+    return parseThreadState(result, threadId);
   }
 
   #request(signal?: AbortSignal, method = "tools/list", params: unknown = { threadStartKind: "all" }): Promise<unknown> {
@@ -111,6 +130,21 @@ export class CodexNativeClient {
       socket.once("close", () => finish(new NativeFailure("native_disconnected")));
     });
   }
+}
+
+export function parseThreadState(response: unknown, taskId: string): ThreadState {
+  const unqualified = () => new NativeFailure("native_read_unqualified");
+  const result = record(response);
+  if (result.success !== true || !Array.isArray(result.contentItems) || result.contentItems.length !== 1) throw unqualified();
+  const item = record(result.contentItems[0]);
+  if (item.type !== "inputText" || typeof item.text !== "string") throw unqualified();
+  let value: Record<string, unknown>;
+  try { value = record(JSON.parse(item.text)); } catch { throw unqualified(); }
+  const thread = record(value.thread), page = record(value.page);
+  if (value.schemaVersion !== 1 || thread.id !== taskId || thread.kind !== "codex" || page.order !== "newest_first" || !Array.isArray(value.turns) || value.turns.length !== 1) throw unqualified();
+  const turn = record(value.turns[0]);
+  if (!["inProgress", "completed", "interrupted", "failed"].includes(String(turn.status))) throw unqualified();
+  return { taskId: identifier(taskId), turnId: identifier(turn.id), status: turn.status as ThreadState["status"] };
 }
 
 export function nativeEvidence(origin: NativeInvocation): string {

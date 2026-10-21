@@ -238,3 +238,62 @@ test("the existing version-six store upgrades atomically without replacing human
   expect(upgraded.get("retained-human-request")?.exchange.revisions[0]?.decision).toEqual(fixtureDecision);
   expect(new SeekerCore(upgraded, () => 1000).events(owner).arm(arm).state).toBe("waiting");
 });
+
+test("a watch is a wait Seeker itself settles: one observation of a failed or interrupted turn, quiet expiry, no producer signal", () => {
+  const f = fixture(); f.setTime(1000);
+  const watch = { waitId: "watch-lead", generation: "g-one", revision: "lead-one", title: "Lead one", expiresAt: 5000, threadId: "lead-task" };
+  expect(() => f.port().watch({ ...watch, threadId: owner.taskId })).toThrow("cannot watch itself");
+  const armed = f.port().watch(watch);
+  expect(armed).toMatchObject({ state: "waiting", watch: { threadId: "lead-task" }, title: "Lead one" });
+  expect(f.port().watch(watch).version).toBe(1);
+  expect(() => f.port().watch({ ...watch, title: "renamed" })).toThrow("different content");
+  expect(f.port().pending()[0]).toMatchObject({ waitId: "watch-lead", watch: { threadId: "lead-task" } });
+  expect(f.store.events.watching(1001).map((wait) => wait.waitId)).toEqual(["watch-lead"]);
+  // A producer cannot signal a watch: it has no capability.
+  expect(() => f.store.events.signal(capability, { waitId: watch.waitId, generation: watch.generation, revision: watch.revision, eventId: "e", outcome: "completed", summary: "s", evidenceRefs: [] }, 1002)).toThrow("not accepted");
+  // Only failed or interrupted turns are observations, and an observation settles the watch.
+  expect(() => f.store.events.observe(watch, { turnId: "t1", status: "completed" as never }, 1003)).toThrow("failed or interrupted");
+  const observed = f.store.events.observe(watch, { turnId: "lead-turn-3", status: "interrupted" }, 1003)!;
+  expect(observed.state).toBe("ready"); expect(observed.receipt).toMatchObject({ source: "watch", disposition: "pending", signal: { outcome: "failed", eventId: "watch:lead-turn-3:interrupted", evidenceRefs: ["codex:lead-task:lead-turn-3"] } });
+  expect(observed.receipt!.signal.summary).toContain("was interrupted"); expect(observed.receipt!.signal.summary).toContain("sent it nothing");
+  expect(f.store.events.observe(watch, { turnId: "lead-turn-4", status: "failed" }, 1004)).toBeUndefined();
+  expect(f.store.events.watching(1004)).toEqual([]);
+  const attempt = f.store.events.claim(1, 1004, [])[0]!;
+  expect(attempt.waitId).toBe("watch-lead");
+  expect(eventReturnCurrent(f.core, eventReturnTarget(attempt), eventEnvelope(attempt))).toBe(true);
+  f.store.events.complete("watch-lead", "g-one", attempt.delivery!.attemptId!, { status: "accepted", reference: "native:watch" }, 1005);
+  let saved = f.port().get(watch);
+  saved = f.port().acknowledge(watch, saved.version, saved.receipt!.id, "handled");
+  expect(saved.state).toBe("handled");
+  // A watch that reaches its expiry without an observation simply expires: no deadline notice, no delivery.
+  const quiet = { ...watch, waitId: "watch-quiet" }; f.port().watch(quiet);
+  f.setTime(5000);
+  expect(f.store.events.claim(4, 5000, [])).toEqual([]);
+  expect(f.port().get(quiet)).toMatchObject({ state: "expired", reason: "deadline_passed" });
+  expect(f.port().get(quiet).receipt).toBeUndefined();
+  expect(f.store.events.observe(quiet, { turnId: "late", status: "failed" }, 5001)).toBeUndefined();
+  // A cancelled watch reports nothing either.
+  const cancelled = { ...watch, waitId: "watch-cancelled", expiresAt: 9000 }; f.port().watch(cancelled);
+  f.port().cancel(cancelled, 1);
+  expect(f.store.events.observe(cancelled, { turnId: "t", status: "failed" }, 5002)).toBeUndefined();
+  expect(f.store.events.watching(5002)).toEqual([]);
+});
+
+test("observed watches neither starve the expiry scan nor skip their retry delay, and every watch is read", () => {
+  const f = fixture(); f.setTime(1000);
+  for (let i = 0; i < 40; i++) f.port().watch({ waitId: `watch-${i}`, generation: "g", revision: `lead-${i}`, title: "lead", expiresAt: 2000, threadId: `lead-${i}` });
+  expect(f.store.events.watching(1001)).toHaveLength(40);
+  // Observed, delivered with a retry, then past expiry: the retry waits its delay and the ordinary deadline still fires.
+  f.store.events.observe({ waitId: "watch-0", generation: "g", revision: "lead-0" }, { turnId: "t", status: "failed" }, 1002);
+  const attempt = f.store.events.claim(1, 1002, [])[0]!;
+  expect(attempt.waitId).toBe("watch-0");
+  f.store.events.complete("watch-0", "g", attempt.delivery!.attemptId!, { status: "retry", code: "desktop_connector_unavailable", retryAfterMs: 60_000 }, 1003);
+  f.port().arm({ ...arm, waitId: "ordinary-deadline", expiresAt: 2000 });
+  f.setTime(2001);
+  const claims = f.store.events.claim(4, 2001, []);
+  expect(claims.map((wait) => wait.waitId)).toEqual(["ordinary-deadline"]);
+  expect(claims[0]!.receipt!.source).toBe("deadline");
+  expect(f.port().get({ waitId: "watch-0", generation: "g", revision: "lead-0" })).toMatchObject({ state: "ready", delivery: { state: "retry" } });
+  expect(f.store.events.claim(4, 61_003, []).map((wait) => wait.waitId)).toEqual(["watch-0"]);
+  expect(f.store.events.watching(2001)).toEqual([]);
+});
