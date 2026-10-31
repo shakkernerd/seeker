@@ -64,6 +64,8 @@ export class SeekerCore {
     };
     const mutate = (ref: unknown, expectedVersion: number | undefined, command: Parameters<ExchangeStore["events"]["mutate"]>[3]) => { current(); return this.store.events.mutate(origin, eventRef(ref), expectedVersion, command, this.clock()); };
     return {
+      openChannel: (input) => { current(); return this.store.events.openChannel(origin, input, this.clock()); },
+      sendChannel: (input) => { current(); return this.store.events.sendChannel(origin, input, this.clock()); },
       arm: (raw) => {
         current();
         const request = eventArmRequest(raw, this.clock());
@@ -109,7 +111,7 @@ export class SeekerCore {
         return this.store.events.watch(origin, { waitId: request.waitId ?? `watch-${randomUUID()}`, generation: randomUUID(), revision: "watch", title: request.title, expiresAt: request.expiresAt, threadId: request.threadId, on: request.on ?? [...defaultWatchEndings], ...(seen ? { seen } : {}) }, this.clock());
       },
       get: (ref) => { current(); return this.store.events.get(origin, eventRef(ref), this.clock()); },
-      pending: () => { current(); return this.store.events.pending(origin, this.clock()).map(({ waitId, generation, revision, title, expiresAt, version, state, updatedAt, reason, receipt, watch, delivery }) => ({ waitId, generation, revision, title, expiresAt, version, state, updatedAt, ...(reason ? { reason } : {}), ...(receipt ? { receiptId: receipt.id } : {}), ...(watch ? { watch } : {}), ...(delivery ? { delivery: { state: delivery.state, ...(delivery.code ? { code: delivery.code } : {}) } } : {}) })); },
+      pending: () => { current(); return this.store.events.pending(origin, this.clock()).map(({ waitId, generation, revision, title, expiresAt, version, state, updatedAt, reason, receipt, watch, channel, owner, delivery }) => ({ waitId, generation, revision, title, expiresAt, version, state, updatedAt, ...(reason ? { reason } : {}), ...(receipt ? { receiptId: receipt.id } : {}), ...(watch ? { watch } : {}), ...(channel ? { channel, channelDirection: owner.taskId === origin.taskId ? "receive" as const : "send" as const, owner: { hostId: owner.hostId, taskId: owner.taskId } } : {}), ...(delivery ? { delivery: { state: delivery.state, ...(delivery.code ? { code: delivery.code } : {}) } } : {}) })); },
       cancel: (ref, options) => mutate(ref, options?.expectedVersion, { type: "cancel" }),
       acknowledge: (ref, status, options) => mutate(ref, options?.expectedVersion, { type: "acknowledge", status, ...(options?.receiptId !== undefined ? { receiptId: options.receiptId } : {}) }),
       clear: (ref, options) => mutate(ref, options?.expectedVersion, { type: "clear" }),

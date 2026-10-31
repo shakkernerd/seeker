@@ -42,6 +42,33 @@ export interface EventWatchRequest {
   on?: WatchEnding[];
   waitId?: string;
 }
+/** A receiver's explicit, expiring grant to one same-host peer. */
+export interface TaskChannelRequest {
+  title: string;
+  peerTaskId: string;
+  expiresAt: number;
+  waitId?: string;
+}
+export interface TaskChannelSend {
+  waitId: string;
+  messageId: string;
+  text: string;
+  evidenceRefs?: string[];
+}
+export interface TaskChannel {
+  peerTaskId: string;
+  /** Optional native assignment snapshot of the named sender. */
+  peerBindingId?: string;
+  peerOwnerGeneration?: number;
+}
+export interface TaskMessage {
+  channelId: string;
+  channelGeneration: string;
+  sender: EventOwner;
+  /** Set only by channel_open when the peer explicitly grants the reverse direction. */
+  readyChannelId?: string;
+}
+export type TaskChannelOpened = EventWait & { outgoing?: { waitId: string; expiresAt: number; receiverTaskId: string } };
 /** A watch on another native task; Seeker itself observes it, no producer signals it. `seen` is the task's latest turn as read when arming. */
 export interface EventWatch extends EventAddress {
   title: string;
@@ -58,11 +85,13 @@ export interface EventSignal extends EventAddress {
   summary: string;
   evidenceRefs: string[];
 }
+/** Only native channel intake creates a peer message; the producer signal API stays one-shot. */
+export type TaskMessageSignal = Omit<EventSignal, "outcome"> & { outcome: "message" };
 export interface EventReceipt {
   id: string;
-  /** Set only by the service: a deadline passed without a producer result, or a watched task was observed. */
-  source?: "deadline" | "watch";
-  signal: EventSignal;
+  /** Set only by the service: a deadline, watch observation, or authenticated peer message. */
+  source?: "deadline" | "watch" | "channel";
+  signal: EventSignal | TaskMessageSignal;
   recordedAt: number;
   disposition: "pending" | "received" | "handled" | "unknown";
   evidenceRef?: string;
@@ -84,6 +113,8 @@ export interface EventWait extends EventAddress {
   expiresAt?: number;
   /** Present on a watch: the task whose latest turn Seeker observes for this wait, the endings it reports, and the latest turn a read saw. */
   watch?: { threadId: string; on?: WatchEnding[]; seen?: { turnId: string; status: TurnEnding | "inProgress" } };
+  channel?: TaskChannel;
+  message?: TaskMessage;
   version: number;
   /**
    * `delivered`: the result reached the task. `handled`: the task said so itself. `paused` is a legacy
@@ -106,19 +137,24 @@ export interface StoredEventWait extends EventWait {
 export interface EventResult {
   title?: string;
   source?: EventReceipt["source"];
-  outcome: EventSignal["outcome"];
+  outcome: EventReceipt["signal"]["outcome"];
   summary: string;
   /** Every reference, complete, so each can be used as given. */
   evidenceRefs: string[];
+  /** Service-authenticated provenance, separate from untrusted message text. */
+  peer?: { hostId: string; taskId: string; channelId: string };
+  readyChannelId?: string;
 }
 /** Machine result identity and its bounded result. */
 export interface EventEnvelope {
   deliveryId: string;
   event: EventAddress & { version: number; receiptId: string; result: EventResult };
 }
-export type EventSummary = Pick<EventWait, "waitId" | "generation" | "revision" | "title" | "expiresAt" | "version" | "state" | "updatedAt" | "reason" | "watch"> & { receiptId?: string; delivery?: Pick<EventDelivery, "state" | "code"> };
+export type EventSummary = Pick<EventWait, "waitId" | "generation" | "revision" | "title" | "expiresAt" | "version" | "state" | "updatedAt" | "reason" | "watch" | "channel"> & { channelDirection?: "receive" | "send"; owner?: Pick<EventOwner, "hostId" | "taskId">; receiptId?: string; delivery?: Pick<EventDelivery, "state" | "code"> };
 export interface EventMutation { expectedVersion?: number }
 export interface EventPort {
+  openChannel(input: TaskChannelRequest): TaskChannelOpened;
+  sendChannel(input: TaskChannelSend): { status: "recorded" | "duplicate"; waitId: string; receiptId: string };
   arm(input: EventArmRequest): EventWait & { capabilityFile: string };
   /** `signal` is the calling request's; a watch is not armed once it has ended. */
   watch(input: EventWatchRequest, signal?: AbortSignal): Promise<EventWait>;
@@ -130,6 +166,8 @@ export interface EventPort {
   clear(ref: EventRef, options?: EventMutation): EventWait;
 }
 export interface EventStore {
+  openChannel(owner: EventOwner, input: TaskChannelRequest, now: number): TaskChannelOpened;
+  sendChannel(owner: EventOwner, input: TaskChannelSend, now: number): { status: "recorded" | "duplicate"; waitId: string; receiptId: string };
   /** The directory holding the key files Seeker placed; a cleared wait's `keyFile` is removed from it. */
   keyDirectory?: string;
   arm(owner: EventOwner, input: EventArm, now: number): EventWait;
