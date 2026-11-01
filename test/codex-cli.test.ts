@@ -84,7 +84,7 @@ function fixture(registered = true) {
     method: "POST", headers: { authorization: `Bearer ${credential}` }, body: JSON.stringify({ owner, origin, operation, arguments: args }),
   }));
   return { host, core, store, bindings, owner, registration, statePath, runtime, rpc, calls, connections, behavior, defaultResponse, restorations, invoke,
-    advance: () => { now += 10_000; }, nextId: () => `cli-request-${++sequence}` };
+    advance: (milliseconds = 10_000) => { now += milliseconds; }, nextId: () => `cli-request-${++sequence}` };
 }
 type Fixture = ReturnType<typeof fixture>;
 const invocation = (threadId = managerId): NativeInvocation => invocationFromMetadata({
@@ -461,6 +461,33 @@ test("an explicitly urgent peer direction steers the exact active CLI turn and c
   const duplicate = await f.invoke(message.peer, "channel_send", message.input);
   expect(await duplicate.json()).toMatchObject({ ...message.receipt, status: "duplicate" });
   expect(f.calls.filter((call) => call.method === "turn/steer")).toHaveLength(1);
+});
+
+test("an urgent CLI direction shares receiver preparation with an older routine retry", async () => {
+  const f = fixture(), receiver = invocation("queued-receiver"), peer = invocation();
+  f.behavior.request = async (call) => {
+    if (call.method === "thread/turns/list") return { data: [{ id: "active-turn", status: "inProgress" }] };
+    if (call.method === "turn/steer") return { turnId: "active-turn" };
+    return f.defaultResponse(call);
+  };
+  const grant = { waitId: "queued-directions", title: "Directions", peerTaskId: peer.threadId, expiresAt: f.core.clock() + 60_000 };
+  expect((await f.invoke(receiver, "channel_open", grant)).status).toBe(200);
+  expect((await f.invoke(peer, "channel_send", { waitId: grant.waitId, messageId: "routine", text: "Routine progress" })).status).toBe(200);
+  async function step() {
+    const wait = f.store.events.claim(1, f.core.clock(), [])[0];
+    if (!wait) return;
+    const result = await f.host.deliver(eventReturnTarget(wait), eventEnvelope(wait), new AbortController().signal);
+    f.store.events.complete(wait.waitId, wait.generation, wait.delivery!.attemptId!, result, f.core.clock());
+    await readinessTurn();
+  }
+  await step(); f.advance(1000); await step();
+  f.advance(500);
+  expect((await f.invoke(peer, "channel_send", { waitId: grant.waitId, messageId: "urgent", text: "Stop and report command settlement", urgent: true })).status).toBe(200);
+  await step();
+  for (let elapsed = 500; elapsed <= 9500; elapsed += 500) { f.advance(500); await step(); }
+  expect(f.calls.filter((call) => call.method === "turn/steer")).toHaveLength(1);
+  expect(f.calls.filter((call) => call.method === "thread/resume")).toHaveLength(1);
+  expect(f.calls.some((call) => call.method === "turn/start")).toBe(false);
 });
 
 test("Stop text without explicit urgency stays queued during an active CLI turn", async () => {

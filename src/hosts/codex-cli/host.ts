@@ -26,7 +26,7 @@ function mode(value: unknown): RegisteredCliOwner["remoteControl"] {
 export class CodexCliHost implements HostAdapter {
   readonly id = cliHostId;
   readonly #lifetime = new AbortController();
-  readonly #ready = new Map<string, string>();
+  readonly #ready = new Map<string, number>();
   readonly #preparing = new Map<string, Promise<void>>();
   readonly #attempts = new Map<string, { identity: string; result: Promise<DeliveryResult> }>();
   readonly #finished = new Map<string, { identity: string; result: DeliveryResult }>();
@@ -114,8 +114,7 @@ export class CodexCliHost implements HostAdapter {
     if (prior) return prior.identity === identity ? prior.result : { status: "rejected", code: "delivery_identity_changed" };
     const attempt = this.#attempts.get(envelope.deliveryId);
     if (attempt) return attempt.identity === identity ? attempt.result : { status: "rejected", code: "delivery_identity_changed" };
-    const key = `${epoch(binding)}:${this.#ownerRevision}`;
-    if (!this.#rpc?.connected || this.#ready.get(binding.origin.managerId) !== key) {
+    if (!this.#rpc?.connected || this.#ready.get(binding.origin.managerId) !== this.#ownerRevision) {
       this.#prepare(binding, envelope);
       return retry(this.#registration ? "cli_preparing" : "cli_not_admitted");
     }
@@ -247,7 +246,9 @@ export class CodexCliHost implements HostAdapter {
       if (record(result.thread).id !== threadId) throw new ConnectorError("cli_wrong_thread", "CLI resumed a different task.", 503);
       signal.throwIfAborted();
       if (!this.#current(binding, envelope) || revision !== this.#ownerRevision || rpc !== this.#rpc) return;
-      this.#ready.set(threadId, `${epoch(binding)}:${revision}`);
+      // Native readiness belongs to the loaded task, not any one message. Every
+      // delivery still checks its own current assignment and receipt before writing.
+      this.#ready.set(threadId, revision);
       // Let the core commit the known-unaccepted attempt before reopening any
       // exhausted retries. Background preparation never sends a notification.
       if (this.#ready.size > 512) this.#ready.delete(this.#ready.keys().next().value!);
