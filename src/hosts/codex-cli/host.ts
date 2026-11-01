@@ -26,7 +26,7 @@ function mode(value: unknown): RegisteredCliOwner["remoteControl"] {
 export class CodexCliHost implements HostAdapter {
   readonly id = cliHostId;
   readonly #lifetime = new AbortController();
-  readonly #ready = new Map<string, string>();
+  readonly #ready = new Map<string, number>();
   readonly #preparing = new Map<string, Promise<void>>();
   readonly #attempts = new Map<string, { identity: string; result: Promise<DeliveryResult> }>();
   readonly #finished = new Map<string, { identity: string; result: DeliveryResult }>();
@@ -114,8 +114,7 @@ export class CodexCliHost implements HostAdapter {
     if (prior) return prior.identity === identity ? prior.result : { status: "rejected", code: "delivery_identity_changed" };
     const attempt = this.#attempts.get(envelope.deliveryId);
     if (attempt) return attempt.identity === identity ? attempt.result : { status: "rejected", code: "delivery_identity_changed" };
-    const key = `${epoch(binding)}:${this.#ownerRevision}`;
-    if (!this.#rpc?.connected || this.#ready.get(binding.origin.managerId) !== key) {
+    if (!this.#rpc?.connected || this.#ready.get(binding.origin.managerId) !== this.#ownerRevision) {
       this.#prepare(binding, envelope);
       return retry(this.#registration ? "cli_preparing" : "cli_not_admitted");
     }
@@ -247,7 +246,9 @@ export class CodexCliHost implements HostAdapter {
       if (record(result.thread).id !== threadId) throw new ConnectorError("cli_wrong_thread", "CLI resumed a different task.", 503);
       signal.throwIfAborted();
       if (!this.#current(binding, envelope) || revision !== this.#ownerRevision || rpc !== this.#rpc) return;
-      this.#ready.set(threadId, `${epoch(binding)}:${revision}`);
+      // Native readiness belongs to the loaded task, not any one message. Every
+      // delivery still checks its own current assignment and receipt before writing.
+      this.#ready.set(threadId, revision);
       // Let the core commit the known-unaccepted attempt before reopening any
       // exhausted retries. Background preparation never sends a notification.
       if (this.#ready.size > 512) this.#ready.delete(this.#ready.keys().next().value!);
@@ -260,6 +261,7 @@ export class CodexCliHost implements HostAdapter {
     const rpc = this.#rpc!, registration = this.#registration!, revision = this.#ownerRevision;
     const deadline = AbortSignal.any([signal, this.#lifetime.signal, AbortSignal.timeout(4_000)]);
     let requested = false;
+    let steeringTurnId: string | undefined;
     try {
       if (await this.runtime.gone(registration.owner, deadline)) { rpc.close(); this.#ready.clear(); return retry("cli_offline"); }
       if (deadline.aborted || revision !== this.#ownerRevision || rpc !== this.#rpc || !this.#current(binding, envelope)) return retry("cli_delivery_cancelled");
@@ -268,19 +270,31 @@ export class CodexCliHost implements HostAdapter {
         if (!wait?.owner.turnId) return { status: "rejected", code: "event_owner_changed" };
         const turns = record(await rpc.request("thread/turns/list", { threadId: binding.origin.managerId, limit: 1, sortDirection: "desc", itemsView: "notLoaded" }, deadline, 1500));
         if (!Array.isArray(turns.data) || turns.data.length !== 1) return retry("event_native_state_unavailable");
-        // A turn still in progress keeps the result queued; a newer, interrupted or failed
-        // turn does not hold it: the task reads the notice under its current instructions.
-        if (record(turns.data[0]).status === "inProgress") return retry("event_owner_active");
+        const turn = record(turns.data[0]);
+        if (!["inProgress", "completed", "interrupted", "failed"].includes(String(turn.status))) return retry("event_native_state_unavailable");
+        // Routine results wait. Explicit urgent peer directions reach the observed active
+        // turn through native steering; neither acceptance nor delivery proves execution stopped.
+        if (turn.status === "inProgress") {
+          if (!wait.message?.urgent) return retry("event_owner_active");
+          steeringTurnId = identifier(turn.id);
+        }
         if (deadline.aborted || revision !== this.#ownerRevision || rpc !== this.#rpc || !this.#current(binding, envelope)) return retry("cli_delivery_cancelled");
       }
       requested = true;
-      const result = record(await rpc.request("turn/start", { threadId: binding.origin.managerId, input: [{ type: "text", text: nativeWakeup({ attemptId: randomUUID(), binding, envelope }) }] }, deadline, 2_500));
-      const turnId = identifier(record(result.turn).id);
+      const input = [{ type: "text", text: nativeWakeup({ attemptId: randomUUID(), binding, envelope }) }];
+      const result = record(await rpc.request(steeringTurnId ? "turn/steer" : "turn/start", {
+        threadId: binding.origin.managerId, input, ...(steeringTurnId ? { expectedTurnId: steeringTurnId } : {}),
+      }, deadline, 2_500));
+      const turnId = steeringTurnId ? identifier(result.turnId) : identifier(record(result.turn).id);
+      if (steeringTurnId && turnId !== steeringTurnId) return { status: "unknown", code: "cli_steer_target_unconfirmed" };
       return { status: "accepted", reference: `cli:${binding.origin.managerId}:${turnId}` };
     } catch (error) {
       if (error instanceof NativeRpcError) {
         if (!requested) return retry("event_native_state_unavailable");
         if (!error.written) return retry(error.code);
+        // These native errors explicitly reject the input before submission. Read again on
+        // the next attempt; never fall through to starting a turn after a steering race.
+        if (steeringTurnId && error.nativeCode === -32600 && (/^no active turn to steer$/.test(error.nativeMessage ?? "") || /^expected active turn id /.test(error.nativeMessage ?? "") || /^cannot steer a (review|compact) turn$/.test(error.nativeMessage ?? ""))) return retry("event_owner_active");
         if (error.nativeCode === -32600 && /^thread not found:/i.test(error.nativeMessage ?? "")) { this.#ready.delete(binding.origin.managerId); return retry("cli_task_unloaded"); }
         return { status: "unknown", code: "cli_input_uncertain" };
       }

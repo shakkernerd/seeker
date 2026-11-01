@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
-import type { EventAddress, EventArmRequest, EventArm, EventOwner, EventRef, EventResult, EventSignal, EventWait, EventWatch, EventWatchRequest, ThreadObservation, TurnEnding, WatchEnding } from "../events.ts";
+import type { EventAddress, EventArmRequest, EventArm, EventOwner, EventRef, EventResult, EventSignal, EventWait, EventWatch, EventWatchRequest, TaskChannelRequest, TaskChannelSend, ThreadObservation, TurnEnding, WatchEnding } from "../events.ts";
 import { turnEndings, watchEndings } from "../events.ts";
 import { fail, id, integer, object, text } from "./validation.ts";
 
@@ -50,6 +50,19 @@ export function eventWatchRequest(raw: unknown, now: number): EventWatchRequest 
   if (value.on !== undefined) request.on = endings(value.on);
   if (value.waitId !== undefined) request.waitId = id(value.waitId, "Wait");
   return request;
+}
+export function taskChannelRequest(raw: unknown): TaskChannelRequest {
+  const value = object(raw); keys(value, ["title", "peerTaskId", "expiresAt", "waitId"]);
+  return { title: text(value.title, "Channel title", 200), peerTaskId: id(value.peerTaskId, "Peer task"), expiresAt: integer(value.expiresAt, "Expiry", 1), ...(value.waitId !== undefined ? { waitId: id(value.waitId, "Channel") } : {}) };
+}
+export function taskChannelSend(raw: unknown): TaskChannelSend & { evidenceRefs: string[] } {
+  const value = object(raw); keys(value, ["waitId", "messageId", "text", "evidenceRefs", "urgent"]);
+  const refs = value.evidenceRefs ?? [];
+  if (!Array.isArray(refs) || refs.length > 8) fail("invalid_input", "Provide up to eight evidence references.");
+  if (value.urgent !== undefined && typeof value.urgent !== "boolean") fail("invalid_input", "Urgent must be a boolean.");
+  const result = { waitId: id(value.waitId, "Channel"), messageId: id(value.messageId, "Message"), text: text(value.text, "Peer message", 8192), evidenceRefs: refs.map((ref) => text(ref, "Evidence reference", 1000)), ...(value.urgent === true ? { urgent: true } : {}) };
+  if (Buffer.byteLength(JSON.stringify(result)) > eventLimits.resultBytes) fail("too_large", "The saved peer message exceeds its byte limit.", 413);
+  return result;
 }
 function endings(raw: unknown): WatchEnding[] {
   if (!Array.isArray(raw) || !raw.length || raw.some((item) => !watchEndings.includes(item as WatchEnding))) fail("invalid_input", "Choose what the watch reports: completed, failed, interrupted, or expired.");
@@ -101,6 +114,9 @@ export function eventResult(wait: EventWait): EventResult {
   const result: EventResult = { outcome: signal.outcome, summary, evidenceRefs: [...signal.evidenceRefs] };
   if (wait.title !== undefined) result.title = wait.title;
   if (wait.receipt.source) result.source = wait.receipt.source;
+  if (wait.message) result.peer = { hostId: wait.message.sender.hostId, taskId: wait.message.sender.taskId, channelId: wait.message.channelId };
+  if (wait.message?.readyChannelId) result.readyChannelId = wait.message.readyChannelId;
+  if (wait.message?.urgent) result.urgent = true;
   return result;
 }
 export function eventSignal(raw: unknown): EventSignal {

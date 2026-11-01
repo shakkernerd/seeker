@@ -6,9 +6,10 @@ import { prepareNativeRegistration } from "../hosts/codex/setup.ts";
 import { atomicWrite, layout, present, regular } from "./layout.ts";
 import { verifyInstallation } from "./application.ts";
 
-const eventTools = ["event_arm", "event_watch", "event_get", "event_pending", "event_cancel", "event_acknowledge", "event_clear"];
+const eventTools = ["event_arm", "event_watch", "event_get", "event_pending", "event_cancel", "event_acknowledge", "event_clear", "channel_open", "channel_send"];
 /** Tool lists this installer wrote in earlier releases; only these are rewritten on upgrade, a custom filter is preserved. */
 const generatedToolLists = [
+  ["event_arm", "event_watch", "event_get", "event_pending", "event_cancel", "event_acknowledge", "event_clear"],
   ["event_arm", "event_get", "event_pending", "event_cancel", "event_resume", "event_acknowledge", "event_clear"],
   ["event_arm", "event_get", "event_pending", "event_cancel", "event_acknowledge", "event_clear"],
 ];
@@ -43,7 +44,7 @@ export function connectEvents(home: string, configPath: string, dryRun = false) 
   const result = existing ? upgradeToolList(current, existing) : `${current}${current.endsWith("\n") || !current ? "" : "\n"}\n# Seeker native background events\n[mcp_servers.seeker_events]\ncommand = ${JSON.stringify(join(p.bin, "seeker-codex"))}\nargs = ${JSON.stringify(["--config", privateConfig, "--runtime", p.runtime])}\nenv_vars = ["CODEX_APP_TOOLS_PIPE_PATH", "CODEX_MCP_NODE_PATH", "CODEX_HOME", "CODEX_ELECTRON_USER_DATA_PATH", "CODEX_SQLITE_HOME"]\nenabled = true\nrequired = false\nstartup_timeout_sec = 10\ntool_timeout_sec = 15\nenabled_tools = ${JSON.stringify(eventTools)}\n`;
   Bun.TOML.parse(result);
   const toolsPreserved = Boolean(existing && result === current && Array.isArray(existing.enabled_tools) && JSON.stringify(existing.enabled_tools) !== JSON.stringify(eventTools));
-  const plan = { config: path, connector: privateConfig, changed: result !== current, ...(toolsPreserved ? { enabledTools: "custom list preserved; add event_watch yourself to use watches" } : {}), managerRegistration: "unchanged", reload: "Reload this MCP server through the original host; then invoke event_pending in a native task." };
+  const plan = { config: path, connector: privateConfig, changed: result !== current, ...(toolsPreserved ? { enabledTools: "custom list preserved; enable channel_open/channel_send for task channels or event_watch for task watches" } : {}), managerRegistration: "unchanged", reload: "Reload this MCP server through the original host; then invoke event_pending in a native task." };
   if (dryRun) return plan;
   if (present(join(p.home, ".installation-lock"))) fail("install_busy", "Finish installation or migration before connector setup.");
   prepareNativeRegistration(home);

@@ -2,10 +2,10 @@ import type { Database } from "bun:sqlite";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { unlinkSync } from "node:fs";
 import { join } from "node:path";
-import type { DeliveryResult } from "../contracts.ts";
-import type { EventAddress, EventArm, EventOwner, EventRef, EventSignal, EventStore, EventWait, EventWatch, StoredEventWait, ThreadObservation } from "../events.ts";
-import { defaultWatchEndings, eventAddress, eventArm, eventDigest, eventFingerprint, eventLimits, eventOwner, eventPublic, eventRef, eventRoute, eventSignal, eventWatch, sameEventOwner, threadObservation, uuidTime } from "../core/events.ts";
-import { fail, id, integer } from "../core/validation.ts";
+import type { DeliveryResult, ManagerBinding } from "../contracts.ts";
+import type { EventAddress, EventArm, EventOwner, EventRef, EventSignal, EventStore, EventWait, EventWatch, StoredEventWait, TaskChannelRequest, TaskChannelSend, TaskMessageSignal, ThreadObservation } from "../events.ts";
+import { defaultWatchEndings, eventAddress, eventArm, eventDigest, eventFingerprint, eventLimits, eventOwner, eventPublic, eventRef, eventRoute, eventSignal, eventWatch, sameEventOwner, taskChannelRequest, taskChannelSend, threadObservation, uuidTime } from "../core/events.ts";
+import { fail, id, integer, SeekerError } from "../core/validation.ts";
 
 type Row = { data: string };
 const decode = (row: Row): StoredEventWait => JSON.parse(row.data) as StoredEventWait;
@@ -31,7 +31,60 @@ function endedAfterArm(wait: StoredEventWait, observation: ThreadObservation): b
 /** Shares its owning SqliteExchangeStore connection; never opens a competing writer. */
 export class SqliteEventStore implements EventStore {
   keyDirectory?: string;
-  constructor(private readonly db: Database) {}
+  constructor(private readonly db: Database, private readonly findBinding: (hostId: string, taskId: string) => ManagerBinding | undefined) {}
+
+  openChannel(rawOwner: EventOwner, raw: TaskChannelRequest, now: number): ReturnType<EventStore["openChannel"]> {
+    const owner = eventOwner(rawOwner), input = taskChannelRequest(raw);
+    if (input.peerTaskId === owner.taskId) fail("invalid_input", "A task cannot grant itself a channel.");
+    return this.db.transaction(() => {
+      const waitId = input.waitId ?? `channel-${randomUUID()}`;
+      const fingerprint = eventFingerprint({ title: input.title, peerTaskId: input.peerTaskId, expiresAt: input.expiresAt });
+      const previous = this.#find(waitId);
+      if (previous) {
+        this.#owned(previous, owner, { waitId });
+        if (!previous.channel || previous.armFingerprint !== fingerprint || previous.state === "cleared") fail("event_conflict", "This channel identity already has different content or was cleared. Use a new identity.", 409);
+        this.#expire(previous, now);
+        return this.#opened(previous, now);
+      }
+      const active = this.#activeChannel(owner.hostId, owner.taskId, input.peerTaskId, now);
+      if (active) {
+        if (active.armFingerprint !== fingerprint || (input.waitId !== undefined && input.waitId !== active.waitId)) fail("channel_conflict", "This receiver already has an active grant for this peer. Reuse its exact request, or cancel it before opening a different grant.", 409);
+        return this.#opened(active, now);
+      }
+      if (input.expiresAt <= now) fail("event_expired", "Choose an explicit future channel expiry.", 409);
+      const peer = this.findBinding(owner.hostId, input.peerTaskId);
+      this.#admit(owner);
+      const wait: StoredEventWait = { waitId, generation: randomUUID(), revision: "task-channel", title: input.title, expiresAt: input.expiresAt, owner,
+        channel: { peerTaskId: input.peerTaskId, ...(peer ? { peerBindingId: peer.id, peerOwnerGeneration: peer.origin.generation } : {}) },
+        armFingerprint: fingerprint, version: 1, state: "waiting", createdAt: now, updatedAt: now };
+      this.#insert(wait, input.expiresAt);
+      const outgoing = this.#outgoing(wait, now);
+      if (outgoing) this.#queueMessage(outgoing, owner, { waitId: outgoing.waitId, messageId: `ready-${eventFingerprint([wait.waitId, wait.generation])}`, text: "The peer explicitly opened the reverse channel.", evidenceRefs: [] }, now, wait.waitId);
+      return this.#opened(wait, now, outgoing);
+    }).immediate();
+  }
+
+  sendChannel(rawOwner: EventOwner, raw: TaskChannelSend, now: number): ReturnType<EventStore["sendChannel"]> {
+    const sender = eventOwner(rawOwner), input = taskChannelSend(raw);
+    const result = this.db.transaction(() => {
+      const channel = this.#find(input.waitId);
+      if (!channel?.channel || channel.owner.hostId !== sender.hostId || channel.channel.peerTaskId !== sender.taskId) fail("channel_denied", "No channel grant names this native sender. The receiver must explicitly open one first.", 403);
+      // Sender retries in a later native turn still name the same immutable message.
+      const waitId = this.#messageId(channel, input.messageId);
+      const fingerprint = eventFingerprint(input);
+      const previous = this.#find(waitId);
+      if (previous) {
+        if (previous.state === "cleared") fail("event_closed", "This message was cleared; its identity cannot be reused.", 409);
+        if (previous.signalFingerprint !== fingerprint) fail("event_conflict", "This message identity already has different content.", 409);
+        return { status: "duplicate" as const, waitId, receiptId: previous.receipt!.id };
+      }
+      this.#expire(channel, now);
+      if (channel.state !== "waiting") return undefined;
+      return this.#queueMessage(channel, sender, input, now);
+    }).immediate();
+    if (!result) fail("channel_closed", "This channel expired, was revoked, or a native assignment changed. No new message was saved.", 409);
+    return result;
+  }
 
   arm(rawOwner: EventOwner, raw: EventArm, now: number): EventWait {
     const owner = eventOwner(rawOwner);
@@ -107,10 +160,24 @@ export class SqliteEventStore implements EventStore {
   }
 
   get(owner: Pick<EventOwner, "hostId" | "taskId">, ref: EventRef, now: number): EventWait {
-    return this.db.transaction(() => { const wait = this.#require(owner, ref); this.#expire(wait, now); return eventPublic(wait); }).immediate();
+    return this.db.transaction(() => {
+      const wait = this.#find(ref.waitId);
+      if (!wait) fail("event_not_found", "Event wait not found.", 404);
+      if (wait.owner.hostId !== owner.hostId || (wait.channel?.peerTaskId !== owner.taskId && wait.message?.sender.taskId !== owner.taskId)) this.#owned(wait, owner, ref);
+      else this.#address(wait, ref);
+      this.#expire(wait, now); return eventPublic(wait);
+    }).immediate();
   }
   pending(owner: Pick<EventOwner, "hostId" | "taskId">, now: number): EventWait[] {
-    return this.db.transaction(() => this.db.query<Row, [string, string]>("SELECT data FROM event_waits INDEXED BY event_wait_owner WHERE host_id=? AND task_id=? AND state IN ('waiting','ready') ORDER BY rowid").all(id(owner.hostId, "Host"), id(owner.taskId, "Task")).map((row) => { const wait = decode(row); this.#expire(wait, now); return eventPublic(wait); }).filter((wait) => wait.state === "waiting" || wait.state === "ready")).immediate();
+    return this.db.transaction(() => {
+      const hostId = id(owner.hostId, "Host"), taskId = id(owner.taskId, "Task");
+      const owned = this.db.query<Row, [string, string]>("SELECT data FROM event_waits INDEXED BY event_wait_owner WHERE host_id=? AND task_id=? AND state IN ('waiting','ready') ORDER BY rowid").all(hostId, taskId)
+        .map((row) => { const wait = decode(row); this.#expire(wait, now); return wait; }).filter((wait) => wait.state === "waiting" || wait.state === "ready");
+      // Discover only reciprocal links the caller explicitly opened. One reverse grant per
+      // owned channel keeps this listing bounded by twice the existing per-task capacity.
+      const grants = owned.flatMap((wait) => { const outgoing = wait.channel ? this.#outgoing(wait, now) : undefined; return outgoing ? [outgoing] : []; });
+      return [...owned, ...grants].map(eventPublic);
+    }).immediate();
   }
 
   mutate(rawOwner: EventOwner, ref: EventRef, expectedVersion: number | undefined, command: Parameters<EventStore["mutate"]>[3], now: number): EventWait {
@@ -119,7 +186,8 @@ export class SqliteEventStore implements EventStore {
       const wait = this.#require(owner, ref); this.#expire(wait, now);
       if (expectedVersion !== undefined && wait.version !== expectedVersion) fail("event_version", "Read the current wait before changing it.", 409);
       if (command.type === "cancel") {
-        if (!terminal(wait)) { wait.state = "cancelled"; wait.reason = "owner_cancelled"; this.#retire(wait); }
+        if (!terminal(wait) || (wait.channel && wait.state === "expired")) { wait.state = "cancelled"; wait.reason = "owner_cancelled"; this.#retire(wait); }
+        if (wait.channel) this.#revokeMessages(wait, now);
       } else if (command.type === "acknowledge") {
         if (!["received", "handled", "unknown"].includes(command.status) || !wait.receipt || (command.receiptId !== undefined && wait.receipt.id !== id(command.receiptId, "Receipt"))) fail("event_receipt", "This wait has no saved result to acknowledge, or the receipt is not its own.", 409);
         if (wait.state === "cleared") fail("event_closed", "This event evidence was cleared.", 409);
@@ -171,12 +239,14 @@ export class SqliteEventStore implements EventStore {
       for (const row of expired) this.#expire(decode(row), now);
       // Retention: a settled wait is cleared by the service once its day has passed; the task does nothing.
       // Rows that may not be cleared yet (a send in flight, an unknown send not reconciled) are left out of the scan so they never hold the rest back.
-      const settled = this.db.query<Row, [number]>(`SELECT data FROM event_waits WHERE state IN ${settledStates} AND next_at<=? AND (coalesce(json_extract(data,'$.delivery.state'),'') NOT IN ('sending','unknown') OR (json_extract(data,'$.delivery.state')='unknown' AND json_extract(data,'$.receipt.disposition')='handled')) LIMIT 128`).all(now);
+      const settled = this.db.query<Row, [number]>(`SELECT data FROM event_waits AS parent WHERE state IN ${settledStates} AND next_at<=? AND (coalesce(json_extract(data,'$.delivery.state'),'') NOT IN ('sending','unknown') OR (json_extract(data,'$.delivery.state')='unknown' AND json_extract(data,'$.receipt.disposition')='handled')) AND (json_extract(data,'$.channel') IS NULL OR NOT EXISTS (SELECT 1 FROM event_waits AS child WHERE (json_extract(child.data,'$.message.channelId')=parent.id OR json_extract(child.data,'$.message.readyChannelId')=parent.id) AND child.state<>'cleared')) LIMIT 128`).all(now);
       for (const row of settled) { const wait = decode(row); if (!this.#clearable(wait)) continue; this.#clear(wait); wait.version += 1; wait.updatedAt = now; this.#save(wait); }
       while (claimed.length < limit) {
         const routes = [...excluded];
         const route = "json_array('event',host_id,task_id)";
-        const row = this.db.query<Row, (string | number)[]>(`SELECT data FROM event_waits WHERE state='ready' AND next_at<=? AND json_extract(data,'$.delivery.state') IN ('queued','retry') ${routes.length ? `AND (${route}) NOT IN (${routes.map(() => "?").join(",")})` : ""} ORDER BY next_at,rowid LIMIT 1`).get(now, ...routes);
+        // Urgent peer directions precede routine results on the existing queue. The route
+        // exclusion still protects a send in flight, including unsettled timed-out I/O.
+        const row = this.db.query<Row, (string | number)[]>(`SELECT data FROM event_waits WHERE state='ready' AND next_at<=? AND json_extract(data,'$.delivery.state') IN ('queued','retry') ${routes.length ? `AND (${route}) NOT IN (${routes.map(() => "?").join(",")})` : ""} ORDER BY coalesce(json_extract(data,'$.message.urgent'),0) DESC,next_at,rowid LIMIT 1`).get(now, ...routes);
         if (!row) break;
         const wait = decode(row); this.#expire(wait, now);
         if (wait.state !== "ready" || !wait.delivery) continue;
@@ -260,12 +330,14 @@ export class SqliteEventStore implements EventStore {
     const perTask = this.db.query<{ count: number }, [string, string]>("SELECT count(*) AS count FROM event_waits INDEXED BY event_wait_owner WHERE host_id=? AND task_id=? AND state IN ('waiting','ready')").get(owner.hostId, owner.taskId)!.count;
     if (total >= eventLimits.retained || perTask >= eventLimits.perTask) fail("event_capacity", "Open wait capacity reached. Cancel waits you no longer need before arming more.", 503);
   }
-  #clearable(wait: StoredEventWait): boolean { return terminal(wait) && wait.state !== "cleared" && wait.delivery?.state !== "sending" && !(wait.delivery?.state === "unknown" && wait.receipt?.disposition !== "handled"); }
+  #clearable(wait: StoredEventWait): boolean {
+    return terminal(wait) && wait.state !== "cleared" && wait.delivery?.state !== "sending" && !(wait.delivery?.state === "unknown" && wait.receipt?.disposition !== "handled") && (!wait.channel || !this.db.query<{ id: string }, [string, string]>("SELECT id FROM event_waits WHERE (json_extract(data,'$.message.channelId')=? OR json_extract(data,'$.message.readyChannelId')=?) AND state<>'cleared' LIMIT 1").get(wait.waitId, wait.waitId));
+  }
   /** Keep a small revoked identity tombstone so a delayed arm/signal retry cannot recreate a send. */
   #clear(wait: StoredEventWait): void {
     wait.state = "cleared";
     wait.owner = { hostId: wait.owner.hostId, taskId: wait.owner.taskId };
-    delete wait.title; delete wait.expiresAt; delete wait.createdAt; delete wait.watch;
+    delete wait.title; delete wait.expiresAt; delete wait.createdAt; delete wait.watch; delete wait.channel; delete wait.message;
     delete wait.receipt; delete wait.delivery; delete wait.capabilityDigest; delete wait.armFingerprint; delete wait.signalFingerprint; delete wait.reason;
     // A key Seeker placed goes with the record; a file the task named is the task's to remove.
     if (wait.keyFile) { if (this.keyDirectory) { try { unlinkSync(join(this.keyDirectory, wait.keyFile)); } catch { /* already gone */ } } delete wait.keyFile; }
@@ -273,6 +345,29 @@ export class SqliteEventStore implements EventStore {
   #renew(wait: StoredEventWait, now: number): void { wait.delivery = { id: randomUUID(), state: "queued", attempts: 0, nextAt: now }; }
   #retire(wait: StoredEventWait): void { if (wait.delivery && ["queued", "retry", "rejected"].includes(wait.delivery.state)) wait.delivery.state = "retired"; }
   #expire(wait: StoredEventWait, now: number): void {
+    if (wait.message && !terminal(wait)) {
+      const channel = this.#find(wait.message.channelId);
+      if (channel?.channel) this.#expire(channel, now);
+      const reverse = wait.message.readyChannelId ? this.#find(wait.message.readyChannelId) : undefined;
+      if (reverse?.channel) this.#expire(reverse, now);
+      // Expiry closes admission, not a committed result. Revocation and assignment changes fence delivery.
+      if (!channel?.channel || channel.generation !== wait.message.channelGeneration || !["waiting", "expired"].includes(channel.state) || (wait.message.readyChannelId && (!reverse?.channel || !["waiting", "expired"].includes(reverse.state)))) {
+        wait.state = "cancelled"; wait.reason = "channel_revoked"; this.#retire(wait);
+        wait.version += 1; wait.updatedAt = now; this.#save(wait);
+      }
+      return;
+    }
+    if (wait.channel) {
+      if (wait.state === "cleared" || wait.state === "cancelled") return;
+      if (!this.#channelCurrent(wait)) {
+        wait.state = "cancelled"; wait.reason = "channel_owner_changed";
+        wait.version += 1; wait.updatedAt = now; this.#save(wait); this.#revokeMessages(wait, now);
+      } else if (wait.state === "waiting" && wait.expiresAt! <= now) {
+        wait.state = "expired"; wait.reason = "deadline_passed";
+        wait.version += 1; wait.updatedAt = now; this.#save(wait);
+      }
+      return;
+    }
     // A saved result, whoever recorded it, is delivered whatever the deadline: expiry only ends the waiting.
     if (terminal(wait) || wait.receipt || (wait.expiresAt !== undefined && wait.expiresAt > now)) return;
     if (wait.expiresAt !== undefined && !wait.watch) {
@@ -303,5 +398,57 @@ export class SqliteEventStore implements EventStore {
     // A queued result is delivered on its own schedule; a settled wait's next_at is when retention clears it; an open wait's is its expiry.
     const next = queued ? wait.delivery!.nextAt : terminal(wait) && wait.state !== "cleared" ? wait.updatedAt + eventLimits.retainedMs : wait.expiresAt ?? 0;
     this.db.query("UPDATE event_waits SET state=?,next_at=?,data=? WHERE id=?").run(wait.state, next, JSON.stringify(wait), wait.waitId);
+  }
+
+  #insert(wait: StoredEventWait, next: number): void {
+    this.db.query("INSERT INTO event_waits(id,host_id,task_id,state,next_at,data) VALUES (?,?,?,?,?,?)").run(wait.waitId, wait.owner.hostId, wait.owner.taskId, wait.state, next, JSON.stringify(wait));
+  }
+  #messageId(channel: StoredEventWait, messageId: string, readyChannelId?: string): string {
+    return `message-${eventFingerprint([channel.waitId, channel.generation, readyChannelId === undefined ? "peer" : "ready", messageId])}`;
+  }
+  #queueMessage(channel: StoredEventWait, sender: EventOwner, input: ReturnType<typeof taskChannelSend>, now: number, readyChannelId?: string): ReturnType<EventStore["sendChannel"]> {
+    const owner = channel.owner as EventOwner;
+    this.#admit(owner);
+    const address: EventAddress = { waitId: this.#messageId(channel, input.messageId, readyChannelId), generation: randomUUID(), revision: "task-message" };
+    const signal: TaskMessageSignal = { ...address, eventId: input.messageId, outcome: "message", summary: input.text, evidenceRefs: input.evidenceRefs };
+    if (Buffer.byteLength(JSON.stringify(signal)) > eventLimits.resultBytes) fail("too_large", "The saved peer message exceeds its byte limit.", 413);
+    const wait: StoredEventWait = { ...address, title: channel.title, expiresAt: channel.expiresAt, owner,
+      message: { channelId: channel.waitId, channelGeneration: channel.generation, sender, ...(input.urgent ? { urgent: true as const } : {}), ...(readyChannelId !== undefined ? { readyChannelId } : {}) }, version: 1, state: "ready", createdAt: now, updatedAt: now,
+      signalFingerprint: eventFingerprint(input), receipt: { id: randomUUID(), source: "channel", signal, recordedAt: now, disposition: "pending" }, delivery: { id: randomUUID(), state: "queued", attempts: 0, nextAt: now } };
+    this.#insert(wait, now);
+    return { status: "recorded", waitId: wait.waitId, receiptId: wait.receipt!.id };
+  }
+  #outgoing(channel: StoredEventWait, now: number): StoredEventWait | undefined {
+    if (channel.state !== "waiting") return;
+    return this.#activeChannel(channel.owner.hostId, channel.channel!.peerTaskId, channel.owner.taskId, now);
+  }
+  #activeChannel(hostId: string, receiverTaskId: string, peerTaskId: string, now: number): StoredEventWait | undefined {
+    const row = this.db.query<Row, [string, string, string]>("SELECT data FROM event_waits WHERE host_id=? AND task_id=? AND state='waiting' AND json_extract(data,'$.channel.peerTaskId')=?").get(hostId, receiverTaskId, peerTaskId);
+    if (!row) return;
+    const channel = decode(row); this.#expire(channel, now);
+    return channel.state === "waiting" ? channel : undefined;
+  }
+  #opened(channel: StoredEventWait, now: number, outgoing = this.#outgoing(channel, now)): ReturnType<EventStore["openChannel"]> {
+    return { ...eventPublic(channel), ...(outgoing ? { outgoing: { waitId: outgoing.waitId, expiresAt: outgoing.expiresAt!, receiverTaskId: outgoing.owner.taskId } } : {}) };
+  }
+  #channelCurrent(wait: StoredEventWait): boolean {
+    try {
+      const receiver = this.findBinding(wait.owner.hostId, wait.owner.taskId);
+      const peer = this.findBinding(wait.owner.hostId, wait.channel!.peerTaskId);
+      return receiver?.id === wait.owner.bindingId && receiver?.origin.generation === wait.owner.ownerGeneration && peer?.id === wait.channel!.peerBindingId && peer?.origin.generation === wait.channel!.peerOwnerGeneration;
+    } catch (error) {
+      // Unknown ownership revokes this grant; it must not stop other recipients' queue work.
+      if (error instanceof SeekerError && error.code === "binding_ambiguous") return false;
+      throw error;
+    }
+  }
+  #revokeMessages(channel: StoredEventWait, now: number): void {
+    const rows = this.db.query<Row, [string, string]>("SELECT data FROM event_waits WHERE (json_extract(data,'$.message.channelId')=? OR json_extract(data,'$.message.readyChannelId')=?) AND state IN ('waiting','ready')").all(channel.waitId, channel.waitId);
+    for (const row of rows) {
+      const wait = decode(row);
+      wait.state = "cancelled"; wait.reason = "channel_revoked"; this.#retire(wait);
+      // Sending/unknown attempts keep their uncertain status; completion may still record acceptance.
+      wait.version += 1; wait.updatedAt = now; this.#save(wait);
+    }
   }
 }

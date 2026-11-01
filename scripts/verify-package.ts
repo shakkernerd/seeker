@@ -205,7 +205,8 @@ if (seeker.version !== ${JSON.stringify(manifest.version)} || seeker.runtimeVers
   const eventConfig = join(directory, "events.toml");
   await run("Installed event-only setup", [stable, "install", "connect", "--config", eventConfig, "--home", home], directory);
   const events = Bun.TOML.parse(readFileSync(eventConfig, "utf8")) as { mcp_servers: { seeker_events: { command: string; enabled_tools: string[] } } };
-  check(events.mcp_servers.seeker_events.command === join(realpathSync(home), "bin/seeker-codex") && events.mcp_servers.seeker_events.enabled_tools.every(tool => tool.startsWith("event_")) && existsSync(join(home, "cli/codex-connector.json")) && !existsSync(join(home, "exchanges.sqlite")), "Event-only installation changed manager admission or used an unstable path.");
+  const machineTools = ["event_arm", "event_watch", "event_get", "event_pending", "event_cancel", "event_acknowledge", "event_clear", "channel_open", "channel_send"];
+  check(events.mcp_servers.seeker_events.command === join(realpathSync(home), "bin/seeker-codex") && JSON.stringify([...events.mcp_servers.seeker_events.enabled_tools].sort()) === JSON.stringify(machineTools.sort()) && existsSync(join(home, "cli/codex-connector.json")) && !existsSync(join(home, "exchanges.sqlite")), "Machine-tool installation changed manager admission, omitted a tool or used an unstable path.");
 
   phase = "checking installed native setup";
   const nativeProject = join(directory, "native-project"), nativeData = join(directory, "native-data");

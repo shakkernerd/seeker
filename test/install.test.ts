@@ -116,11 +116,17 @@ test("event connector setup upgrades a tool list it generated earlier and preser
   const config = join(f.root, "config.toml");
   expect((connectEvents(f.home, config) as { changed: boolean }).changed).toBe(true);
   const written = readFileSync(config, "utf8");
+  expect(written).toContain('"channel_open"');
+  expect(written).toContain('"channel_send"');
   expect(written).toContain('"event_watch"');
   const older = written.replace(/enabled_tools = \[[^\n]*\]/, 'enabled_tools = ["event_arm", "event_get", "event_pending", "event_cancel", "event_resume", "event_acknowledge", "event_clear"]');
   writeFileSync(config, older);
   expect((connectEvents(f.home, config, true) as { changed: boolean }).changed).toBe(true);
   expect(readFileSync(config, "utf8")).toBe(older);
+  connectEvents(f.home, config);
+  expect(readFileSync(config, "utf8")).toBe(written);
+  const previous = written.replace(/enabled_tools = \[[^\n]*\]/, 'enabled_tools = ["event_arm", "event_watch", "event_get", "event_pending", "event_cancel", "event_acknowledge", "event_clear"]');
+  writeFileSync(config, previous);
   connectEvents(f.home, config);
   expect(readFileSync(config, "utf8")).toBe(written);
   const custom = written.replace(/enabled_tools = \[[^\n]*\]/, 'enabled_tools = ["event_get", "event_pending"]');

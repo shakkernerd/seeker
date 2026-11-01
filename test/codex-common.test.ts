@@ -208,16 +208,21 @@ test("shared stdio preserves schemas, trusted invocation identity, cancellation 
   const module = new URL("../src/hosts/codex-common/mcp.ts", import.meta.url).href;
   const child = Bun.spawn([process.execPath, "--no-install", "--eval", `
     import { serveSeekerTools } from ${JSON.stringify(module)};
+    import { invokeEvent, isEventOperation } from ${JSON.stringify(new URL("../src/hosts/codex/event-tools.ts", import.meta.url).href)};
+    import { SeekerCore } from ${JSON.stringify(new URL("../src/core/seeker.ts", import.meta.url).href)};
+    import { SqliteExchangeStore } from ${JSON.stringify(new URL("../src/store/sqlite.ts", import.meta.url).href)};
+    const store = new SqliteExchangeStore(":memory:"), core = new SeekerCore(store);
     let closed = false;
     await serveSeekerTools({
       async invoke(origin, operation, args, signal) {
+        if (isEventOperation(operation)) return invokeEvent(core.events({ hostId: "mcp-fixture", taskId: origin.threadId, turnId: origin.turnId, callId: origin.callId }), operation, args, signal);
         if (operation === "pending") await new Promise(resolve => {
           signal.addEventListener("abort", resolve, { once: true });
           if (signal.aborted) resolve();
         });
         return { origin, operation, args, cancelled: signal.aborted };
       },
-      close() { closed = true; }
+      close() { closed = true; store.close(); }
     });
     console.log(JSON.stringify({ fixtureClosed: closed }));
   `], { stdin: "pipe", stdout: "pipe", stderr: "pipe", timeout: 8_000, killSignal: "SIGKILL", maxBuffer: 2 * maxWireBytes });
@@ -254,6 +259,25 @@ test("shared stdio preserves schemas, trusted invocation identity, cancellation 
     send({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "pending", arguments: {}, _meta: metadata } });
     send({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 5 } });
     expect(JSON.parse((await until((item) => item.id === 5)).result.content[0].text).cancelled).toBe(true);
+    const peerMetadata = { threadId: "fixture-lead", callId: "lead-call", "x-codex-turn-metadata": { thread_id: "fixture-lead", turn_id: "lead-turn" } };
+    const grant = { waitId: "mcp-channel", peerTaskId: "fixture-lead", title: "MCP peer reports", expiresAt: Date.now() + 60_000 };
+    send({ jsonrpc: "2.0", id: "channel-open", method: "tools/call", params: { name: "channel_open", arguments: grant, _meta: metadata } });
+    expect(JSON.parse((await until((item) => item.id === "channel-open")).result.content[0].text)).toMatchObject({ owner: { taskId: "fixture-manager" }, channel: { peerTaskId: "fixture-lead" } });
+    send({ jsonrpc: "2.0", id: "channel-reverse", method: "tools/call", params: { name: "channel_open", arguments: { waitId: "mcp-reverse", peerTaskId: "fixture-manager", title: "MCP instructions", expiresAt: grant.expiresAt }, _meta: peerMetadata } });
+    expect(JSON.parse((await until((item) => item.id === "channel-reverse")).result.content[0].text)).toMatchObject({ outgoing: { waitId: grant.waitId } });
+    send({ jsonrpc: "2.0", id: "channel-discover", method: "tools/call", params: { name: "event_pending", arguments: {}, _meta: peerMetadata } });
+    expect(JSON.parse((await until((item) => item.id === "channel-discover")).result.content[0].text)).toEqual([
+      expect.objectContaining({ waitId: "mcp-reverse", channelDirection: "receive" }),
+      expect.objectContaining({ waitId: grant.waitId, channelDirection: "send" }),
+    ]);
+    const report = { waitId: grant.waitId, messageId: "mcp-report", text: "Ready for review." };
+    send({ jsonrpc: "2.0", id: "channel-send", method: "tools/call", params: { name: "channel_send", arguments: report, _meta: peerMetadata } });
+    const saved = JSON.parse((await until((item) => item.id === "channel-send")).result.content[0].text);
+    expect(saved.status).toBe("recorded");
+    send({ jsonrpc: "2.0", id: "channel-read", method: "tools/call", params: { name: "event_get", arguments: { waitId: saved.waitId }, _meta: metadata } });
+    expect(JSON.parse((await until((item) => item.id === "channel-read")).result.content[0].text)).toMatchObject({ message: { sender: { taskId: "fixture-lead", turnId: "lead-turn", callId: "lead-call" } }, receipt: { source: "channel", signal: { summary: report.text } } });
+    send({ jsonrpc: "2.0", id: "channel-forgery", method: "tools/call", params: { name: "channel_send", arguments: { ...report, sender: "fixture-manager" }, _meta: peerMetadata } });
+    expect(JSON.parse((await until((item) => item.id === "channel-forgery")).result.content[0].text).error).toBe("unexpected_argument");
     for (let index = 0; index < 16; index++) send({ jsonrpc: "2.0", id: `held-${index}`, method: "tools/call", params: { name: "pending", arguments: {}, _meta: metadata } });
     send({ jsonrpc: "2.0", id: "overflow", method: "ping" });
     expect((await until((item) => item.id === "overflow")).error.code).toBe(-32600);

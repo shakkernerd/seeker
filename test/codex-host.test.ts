@@ -164,3 +164,37 @@ test("native machine tools admit an individual worker without granting human man
   expect((await f.invoke(session, "other-worker", "event_get", address)).status).toBe(403);
   expect((await f.invoke(session, "individual-worker", "event_get", address)).status).toBe(200);
 });
+
+test("native channel dispatch admits explicit task peers, authenticates the sender, and rejects spoofed authority", async () => {
+  const f = fixture(), session = await f.connect();
+  const grant = { waitId: "peer-channel", title: "Unit reports", peerTaskId: "native-lead", expiresAt: Date.now() + 60_000 };
+  // Neither endpoint needs a human-conversation manager binding.
+  const opened = await f.invoke(session, "native-manager", "channel_open", grant);
+  expect(opened.status).toBe(200);
+  expect(await opened.json()).toMatchObject({ owner: { hostId: "codex-test", taskId: "native-manager" }, channel: { peerTaskId: "native-lead" } });
+  const reverse = await f.invoke(session, "native-lead", "channel_open", { waitId: "peer-reverse", title: "Unit instructions", peerTaskId: "native-manager", expiresAt: grant.expiresAt });
+  expect(await reverse.json()).toMatchObject({ outgoing: { waitId: grant.waitId } });
+  const pending = await f.invoke(session, "native-lead", "event_pending", {});
+  expect(await pending.json()).toEqual([
+    expect.objectContaining({ waitId: "peer-reverse", channelDirection: "receive" }),
+    expect.objectContaining({ waitId: grant.waitId, channelDirection: "send", owner: { hostId: "codex-test", taskId: "native-manager" } }),
+  ]);
+  const input = { waitId: grant.waitId, messageId: "stop-direction", text: "Stop and report command settlement.", urgent: true };
+  for (const extra of [{ taskId: "native-manager" }, { sender: "native-manager" }, { source: "human" }, { readyChannelId: "fake-grant" }, { hostId: "another-host" }, { urgent: "true" }]) {
+    expect((await f.invoke(session, "native-lead", "channel_send", { ...input, ...extra })).status).toBe(400);
+  }
+  expect((await f.invoke(session, "unlinked-task", "channel_send", input)).status).toBe(403);
+  expect((await f.invoke(session, "native-lead", "channel_open", { ...grant, receiverTaskId: "native-manager" })).status).toBe(400);
+  const sent = await f.invoke(session, "native-lead", "channel_send", input);
+  expect(sent.status).toBe(200);
+  const receipt = await sent.json();
+  const saved = await f.invoke(session, "native-manager", "event_get", { waitId: receipt.waitId });
+  expect(await saved.json()).toMatchObject({ message: { urgent: true, sender: { hostId: "codex-test", taskId: "native-lead", turnId: "native-turn", callId: "native-call" } }, receipt: { source: "channel", signal: { outcome: "message" } } });
+  expect((await f.invoke(session, "native-lead", "event_cancel", { waitId: grant.waitId })).status).toBe(403);
+  expect((await f.invoke(session, "unlinked-task", "event_get", { waitId: receipt.waitId })).status).toBe(403);
+  for (const task of ["native-manager", "native-lead"]) {
+    expect((await f.invoke(session, task, "submit", { requestId: "human-authority", decision })).status).toBe(403);
+    expect((await f.invoke(session, task, "pending", {})).status).toBe(403);
+  }
+  expect(f.store.get("human-authority")).toBeUndefined();
+});

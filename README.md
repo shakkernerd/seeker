@@ -36,6 +36,10 @@ The local channel is available immediately. [Codex Desktop setup](docs/codex.md)
 
 [Background event return](docs/events.md) lets an existing native task arm a durable wait in one call, end its turn, and be woken with the job's result, or watch another task and be woken when that task's turn ends. The existing owner signals through a private per-wait key that Seeker prepares; Seeker retains the result and delivery evidence without executing the job, and clears settled waits itself. Machine events are separate from human decisions and do not grant conversation-manager access.
 
+## Task reports
+
+[Task channels](docs/events.md#task-channels) carry repeated manager/lead reports through the same durable event queue. Each receiver grants one named native peer until an explicit deadline. Reciprocal grants establish the return path without model polling; messages deduplicate, and explicit revocation or cleanup closes the grant. Native caller identity supplies provenance. Machine reports never become human approvals.
+
 ## Use and extend
 
 [Local setup and recovery](docs/local.md) covers authentication, data, startup, and operating limits. [Architecture](docs/architecture.md) explains the component boundaries. [Adapter contracts](docs/adapters.md) describes authenticated origin, reply correlation, and receipts. [Development and packaging](docs/development.md) covers verification and the installable tarball.
