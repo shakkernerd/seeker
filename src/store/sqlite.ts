@@ -41,7 +41,7 @@ export class SqliteExchangeStore implements ExchangeStore {
       this.#db.run("PRAGMA fullfsync = ON");
       this.#db.run("PRAGMA foreign_keys = ON");
       const version = this.#db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version;
-      if (version < 0 || version > 9) fail("store_version", "This store needs a compatible Seeker version; it was not changed.");
+      if (version < 0 || version > 10) fail("store_version", "This store needs a compatible Seeker version; it was not changed.");
       this.#db.transaction(() => {
         this.#db.run(`
           CREATE TABLE IF NOT EXISTS bindings (id TEXT PRIMARY KEY, data TEXT NOT NULL);
@@ -109,8 +109,8 @@ export class SqliteExchangeStore implements ExchangeStore {
         CREATE INDEX IF NOT EXISTS event_channel_ready ON event_waits(json_extract(data,'$.message.readyChannelId'),state) WHERE json_extract(data,'$.message.readyChannelId') IS NOT NULL;`);
         // Waits that settled before retention existed keep their record for one retention period from this upgrade.
         if (version > 0 && version < 8) this.#db.run("UPDATE event_waits SET next_at=? WHERE state IN ('handled','cancelled','expired')", [Date.now() + eventLimits.retainedMs]);
-        // Earlier binaries cannot interpret reusable grants or revocation-dependent messages.
-        this.#db.run("PRAGMA user_version = 9");
+        // Earlier binaries cannot preserve urgent delivery for saved peer directions.
+        this.#db.run("PRAGMA user_version = 10");
       }).immediate();
     } catch (error) {
       this.#db.close();

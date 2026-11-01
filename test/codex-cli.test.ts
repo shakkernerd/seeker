@@ -422,6 +422,109 @@ test("CLI worker event admission delivers a saved result whatever turn the task 
   expect(f.store.events.claim(1, Date.now(), [])).toEqual([]);
 });
 
+async function peerDelivery(f: Fixture, urgent = true) {
+  const receiver = invocation("peer-receiver"), peer = invocation();
+  const grant = { waitId: "peer-directions", title: "Directions", peerTaskId: peer.threadId, expiresAt: f.core.clock() + 60_000 };
+  expect((await f.invoke(receiver, "channel_open", grant)).status).toBe(200);
+  const input = { waitId: grant.waitId, messageId: "stop-direction", text: "Stop and report command settlement.", ...(urgent ? { urgent: true } : {}) };
+  const response = await f.invoke(peer, "channel_send", input);
+  expect(response.status).toBe(200);
+  const receipt = await response.json() as { waitId: string; receiptId: string };
+  const wait = f.store.events.claim(1, f.core.clock(), [])[0]!;
+  expect(wait.waitId).toBe(receipt.waitId);
+  const target = eventReturnTarget(wait), envelope = eventEnvelope(wait);
+  const ready = deferred<number>(); f.behavior.restored = ready.resolve;
+  expect((await f.host.deliver(target, envelope, new AbortController().signal)).status).toBe("retry");
+  await ready.promise;
+  const deliver = () => f.host.deliver(target, envelope, new AbortController().signal);
+  const complete = (result: DeliveryResult) => f.store.events.complete(wait.waitId, wait.generation, wait.delivery!.attemptId!, result, f.core.clock());
+  return { receiver, peer, grant, input, receipt, wait, deliver, complete };
+}
+
+test("an explicitly urgent peer direction steers the exact active CLI turn and confirms delivery only", async () => {
+  const f = fixture();
+  f.behavior.request = async (call) => {
+    if (call.method === "thread/turns/list") return { data: [{ id: "active-turn", status: "inProgress" }] };
+    if (call.method === "turn/steer") return { turnId: "active-turn" };
+    return f.defaultResponse(call);
+  };
+  const message = await peerDelivery(f);
+  const result = await message.deliver();
+  expect(result).toEqual({ status: "accepted", reference: "cli:peer-receiver:active-turn" });
+  expect(await message.deliver()).toEqual(result);
+  message.complete(result);
+  expect(f.calls.filter((call) => call.method === "turn/steer").map((call) => call.params)).toEqual([
+    { threadId: "peer-receiver", expectedTurnId: "active-turn", input: [{ type: "text", text: expect.stringContaining(message.input.text) }] },
+  ]);
+  expect(f.calls.some((call) => call.method === "turn/start" || call.method === "turn/interrupt")).toBe(false);
+  expect(f.core.events({ hostId: cliHostId, taskId: message.receiver.threadId, turnId: message.receiver.turnId, callId: "read" }).get(message.receipt)).toMatchObject({ state: "delivered", receipt: { disposition: "received" } });
+  const duplicate = await f.invoke(message.peer, "channel_send", message.input);
+  expect(await duplicate.json()).toMatchObject({ ...message.receipt, status: "duplicate" });
+  expect(f.calls.filter((call) => call.method === "turn/steer")).toHaveLength(1);
+});
+
+test("Stop text without explicit urgency stays queued during an active CLI turn", async () => {
+  const f = fixture();
+  f.behavior.request = async (call) => call.method === "thread/turns/list" ? { data: [{ id: "active-turn", status: "inProgress" }] } : f.defaultResponse(call);
+  const message = await peerDelivery(f, false);
+  expect(await message.deliver()).toMatchObject({ status: "retry", code: "event_owner_active" });
+  expect(f.calls.some((call) => call.method === "turn/start" || call.method === "turn/steer")).toBe(false);
+});
+
+for (const refusal of ["no active turn to steer", "expected active turn id `active-turn` but found `next-turn`", "cannot steer a compact turn"]) test(`urgent CLI delivery retains an explicit native refusal: ${refusal}`, async () => {
+  const f = fixture();
+  let active = true;
+  f.behavior.request = async (call) => {
+    if (call.method === "thread/turns/list") return { data: [{ id: "active-turn", status: active ? "inProgress" : "completed" }] };
+    if (call.method === "turn/steer") throw new NativeRpcError(true, "native_rejection", -32600, refusal);
+    return f.defaultResponse(call);
+  };
+  const message = await peerDelivery(f);
+  const refused = await message.deliver();
+  expect(refused).toMatchObject({ status: "retry", code: "event_owner_active" });
+  message.complete(refused);
+  expect(f.calls.some((call) => call.method === "turn/start")).toBe(false);
+  active = false; f.advance();
+  const wait = f.store.events.claim(1, f.core.clock(), [])[0]!;
+  expect(wait.waitId).toBe(message.receipt.waitId);
+  expect(await f.host.deliver(eventReturnTarget(wait), eventEnvelope(wait), new AbortController().signal)).toMatchObject({ status: "accepted" });
+  expect(f.calls.filter((call) => call.method === "turn/start")).toHaveLength(1);
+});
+
+for (const failure of ["lost", "wrong-turn"]) test(`urgent CLI delivery never replays an ambiguous steering write: ${failure}`, async () => {
+  const f = fixture();
+  f.behavior.request = async (call) => {
+    if (call.method === "thread/turns/list") return { data: [{ id: "active-turn", status: "inProgress" }] };
+    if (call.method === "turn/steer") {
+      if (failure === "lost") throw new NativeRpcError(true, "native_connection_lost");
+      return { turnId: "another-turn" };
+    }
+    return f.defaultResponse(call);
+  };
+  const message = await peerDelivery(f);
+  const result = await message.deliver();
+  expect(result.status).toBe("unknown");
+  expect(await message.deliver()).toEqual(result);
+  message.complete(result);
+  f.advance(); f.core.resumeHost(cliHostId);
+  expect(f.store.events.claim(1, f.core.clock(), [])).toEqual([]);
+  expect(await (await f.invoke(message.peer, "channel_send", message.input)).json()).toMatchObject({ ...message.receipt, status: "duplicate" });
+  expect(f.calls.filter((call) => call.method === "turn/steer")).toHaveLength(1);
+});
+
+test("revoking the peer grant during the active-turn read fences urgent CLI steering", async () => {
+  const f = fixture(), message = await peerDelivery(f);
+  f.behavior.request = async (call) => {
+    if (call.method === "thread/turns/list") {
+      f.core.events({ hostId: cliHostId, taskId: message.receiver.threadId, turnId: message.receiver.turnId, callId: "revoke" }).cancel(message.grant);
+      return { data: [{ id: "active-turn", status: "inProgress" }] };
+    }
+    return f.defaultResponse(call);
+  };
+  expect(await message.deliver()).toMatchObject({ status: "retry", code: "cli_delivery_cancelled" });
+  expect(f.calls.some((call) => call.method === "turn/start" || call.method === "turn/steer")).toBe(false);
+});
+
 test("the CLI host reads a watched task's latest turn through its app-server, reconnecting to the running one after a restart but never starting one", async () => {
   const f = fixture();
   f.behavior.request = async (call) => call.method === "thread/turns/list" ? { data: [{ id: "lead-turn", status: "interrupted", items: [{ text: "Untrusted" }] }] } : f.defaultResponse(call);

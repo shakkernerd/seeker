@@ -179,8 +179,8 @@ test("native channel dispatch admits explicit task peers, authenticates the send
     expect.objectContaining({ waitId: "peer-reverse", channelDirection: "receive" }),
     expect.objectContaining({ waitId: grant.waitId, channelDirection: "send", owner: { hostId: "codex-test", taskId: "native-manager" } }),
   ]);
-  const input = { waitId: grant.waitId, messageId: "delivery-report", text: "Implementation is ready for review." };
-  for (const extra of [{ taskId: "native-manager" }, { sender: "native-manager" }, { source: "human" }, { readyChannelId: "fake-grant" }, { hostId: "another-host" }]) {
+  const input = { waitId: grant.waitId, messageId: "stop-direction", text: "Stop and report command settlement.", urgent: true };
+  for (const extra of [{ taskId: "native-manager" }, { sender: "native-manager" }, { source: "human" }, { readyChannelId: "fake-grant" }, { hostId: "another-host" }, { urgent: "true" }]) {
     expect((await f.invoke(session, "native-lead", "channel_send", { ...input, ...extra })).status).toBe(400);
   }
   expect((await f.invoke(session, "unlinked-task", "channel_send", input)).status).toBe(403);
@@ -189,7 +189,7 @@ test("native channel dispatch admits explicit task peers, authenticates the send
   expect(sent.status).toBe(200);
   const receipt = await sent.json();
   const saved = await f.invoke(session, "native-manager", "event_get", { waitId: receipt.waitId });
-  expect(await saved.json()).toMatchObject({ message: { sender: { hostId: "codex-test", taskId: "native-lead", turnId: "native-turn", callId: "native-call" } }, receipt: { source: "channel", signal: { outcome: "message" } } });
+  expect(await saved.json()).toMatchObject({ message: { urgent: true, sender: { hostId: "codex-test", taskId: "native-lead", turnId: "native-turn", callId: "native-call" } }, receipt: { source: "channel", signal: { outcome: "message" } } });
   expect((await f.invoke(session, "native-lead", "event_cancel", { waitId: grant.waitId })).status).toBe(403);
   expect((await f.invoke(session, "unlinked-task", "event_get", { waitId: receipt.waitId })).status).toBe(403);
   for (const task of ["native-manager", "native-lead"]) {

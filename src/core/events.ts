@@ -55,11 +55,12 @@ export function taskChannelRequest(raw: unknown): TaskChannelRequest {
   const value = object(raw); keys(value, ["title", "peerTaskId", "expiresAt", "waitId"]);
   return { title: text(value.title, "Channel title", 200), peerTaskId: id(value.peerTaskId, "Peer task"), expiresAt: integer(value.expiresAt, "Expiry", 1), ...(value.waitId !== undefined ? { waitId: id(value.waitId, "Channel") } : {}) };
 }
-export function taskChannelSend(raw: unknown): Required<TaskChannelSend> {
-  const value = object(raw); keys(value, ["waitId", "messageId", "text", "evidenceRefs"]);
+export function taskChannelSend(raw: unknown): TaskChannelSend & { evidenceRefs: string[] } {
+  const value = object(raw); keys(value, ["waitId", "messageId", "text", "evidenceRefs", "urgent"]);
   const refs = value.evidenceRefs ?? [];
   if (!Array.isArray(refs) || refs.length > 8) fail("invalid_input", "Provide up to eight evidence references.");
-  const result = { waitId: id(value.waitId, "Channel"), messageId: id(value.messageId, "Message"), text: text(value.text, "Peer message", 8192), evidenceRefs: refs.map((ref) => text(ref, "Evidence reference", 1000)) };
+  if (value.urgent !== undefined && typeof value.urgent !== "boolean") fail("invalid_input", "Urgent must be a boolean.");
+  const result = { waitId: id(value.waitId, "Channel"), messageId: id(value.messageId, "Message"), text: text(value.text, "Peer message", 8192), evidenceRefs: refs.map((ref) => text(ref, "Evidence reference", 1000)), ...(value.urgent === true ? { urgent: true } : {}) };
   if (Buffer.byteLength(JSON.stringify(result)) > eventLimits.resultBytes) fail("too_large", "The saved peer message exceeds its byte limit.", 413);
   return result;
 }
@@ -115,6 +116,7 @@ export function eventResult(wait: EventWait): EventResult {
   if (wait.receipt.source) result.source = wait.receipt.source;
   if (wait.message) result.peer = { hostId: wait.message.sender.hostId, taskId: wait.message.sender.taskId, channelId: wait.message.channelId };
   if (wait.message?.readyChannelId) result.readyChannelId = wait.message.readyChannelId;
+  if (wait.message?.urgent) result.urgent = true;
   return result;
 }
 export function eventSignal(raw: unknown): EventSignal {

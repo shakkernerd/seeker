@@ -38,7 +38,7 @@ The local channel is available immediately. [Codex Desktop setup](docs/codex.md)
 
 ## Task reports
 
-[Task channels](docs/events.md#task-channels) carry repeated manager/lead reports through the same durable event queue. Each receiver grants one named native peer until an explicit deadline. Reciprocal grants establish the return path without model polling; messages deduplicate, and Stop or cleanup revokes the grant. Native caller identity supplies provenance. Machine reports never become human approvals.
+[Task channels](docs/events.md#task-channels) carry repeated manager/lead reports through the same durable event queue. Each receiver grants one named native peer until an explicit deadline. Reciprocal grants establish the return path without model polling; messages deduplicate, and explicit revocation or cleanup closes the grant. Native caller identity supplies provenance. Machine reports never become human approvals.
 
 ## Use and extend
 

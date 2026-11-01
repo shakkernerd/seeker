@@ -244,7 +244,9 @@ export class SqliteEventStore implements EventStore {
       while (claimed.length < limit) {
         const routes = [...excluded];
         const route = "json_array('event',host_id,task_id)";
-        const row = this.db.query<Row, (string | number)[]>(`SELECT data FROM event_waits WHERE state='ready' AND next_at<=? AND json_extract(data,'$.delivery.state') IN ('queued','retry') ${routes.length ? `AND (${route}) NOT IN (${routes.map(() => "?").join(",")})` : ""} ORDER BY next_at,rowid LIMIT 1`).get(now, ...routes);
+        // Urgent peer directions precede routine results on the existing queue. The route
+        // exclusion still protects a send in flight, including unsettled timed-out I/O.
+        const row = this.db.query<Row, (string | number)[]>(`SELECT data FROM event_waits WHERE state='ready' AND next_at<=? AND json_extract(data,'$.delivery.state') IN ('queued','retry') ${routes.length ? `AND (${route}) NOT IN (${routes.map(() => "?").join(",")})` : ""} ORDER BY coalesce(json_extract(data,'$.message.urgent'),0) DESC,next_at,rowid LIMIT 1`).get(now, ...routes);
         if (!row) break;
         const wait = decode(row); this.#expire(wait, now);
         if (wait.state !== "ready" || !wait.delivery) continue;
@@ -404,14 +406,14 @@ export class SqliteEventStore implements EventStore {
   #messageId(channel: StoredEventWait, messageId: string, readyChannelId?: string): string {
     return `message-${eventFingerprint([channel.waitId, channel.generation, readyChannelId === undefined ? "peer" : "ready", messageId])}`;
   }
-  #queueMessage(channel: StoredEventWait, sender: EventOwner, input: Required<TaskChannelSend>, now: number, readyChannelId?: string): ReturnType<EventStore["sendChannel"]> {
+  #queueMessage(channel: StoredEventWait, sender: EventOwner, input: ReturnType<typeof taskChannelSend>, now: number, readyChannelId?: string): ReturnType<EventStore["sendChannel"]> {
     const owner = channel.owner as EventOwner;
     this.#admit(owner);
     const address: EventAddress = { waitId: this.#messageId(channel, input.messageId, readyChannelId), generation: randomUUID(), revision: "task-message" };
     const signal: TaskMessageSignal = { ...address, eventId: input.messageId, outcome: "message", summary: input.text, evidenceRefs: input.evidenceRefs };
     if (Buffer.byteLength(JSON.stringify(signal)) > eventLimits.resultBytes) fail("too_large", "The saved peer message exceeds its byte limit.", 413);
     const wait: StoredEventWait = { ...address, title: channel.title, expiresAt: channel.expiresAt, owner,
-      message: { channelId: channel.waitId, channelGeneration: channel.generation, sender, ...(readyChannelId !== undefined ? { readyChannelId } : {}) }, version: 1, state: "ready", createdAt: now, updatedAt: now,
+      message: { channelId: channel.waitId, channelGeneration: channel.generation, sender, ...(input.urgent ? { urgent: true as const } : {}), ...(readyChannelId !== undefined ? { readyChannelId } : {}) }, version: 1, state: "ready", createdAt: now, updatedAt: now,
       signalFingerprint: eventFingerprint(input), receipt: { id: randomUUID(), source: "channel", signal, recordedAt: now, disposition: "pending" }, delivery: { id: randomUUID(), state: "queued", attempts: 0, nextAt: now } };
     this.#insert(wait, now);
     return { status: "recorded", waitId: wait.waitId, receiptId: wait.receipt!.id };

@@ -72,3 +72,5 @@ The same connector exposes separate [machine event tools](events.md) to host-aut
 For stable installed commands, managed startup and explicit relocation of existing state/configuration, see [installation and migration](installation.md).
 
 For ongoing machine reports, use [task channels](events.md#task-channels) through `channel_open` and `channel_send`. Both tasks explicitly grant their peer; no human-manager registration is required. Reload the connector after upgrading, preserving custom tool filters. Do not substitute repeated one-shot capability handoffs for a task channel.
+
+Routine channel messages wait while the receiving turn is active. For a governing direction that cannot wait, such as Stop, send with `urgent: true`: Seeker uses native `turn/steer` against the observed active turn, or `turn/start` when idle. A confirmed delivery means the task received the direction, not that it stopped. The receiver must stop its owned commands and report settlement; unknown delivery remains saved for reconciliation.

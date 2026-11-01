@@ -54,6 +54,8 @@ export interface TaskChannelSend {
   messageId: string;
   text: string;
   evidenceRefs?: string[];
+  /** Time-sensitive governing direction; delivery urgency grants no execution authority. */
+  urgent?: boolean;
 }
 export interface TaskChannel {
   peerTaskId: string;
@@ -65,6 +67,7 @@ export interface TaskMessage {
   channelId: string;
   channelGeneration: string;
   sender: EventOwner;
+  urgent?: true;
   /** Set only by channel_open when the peer explicitly grants the reverse direction. */
   readyChannelId?: string;
 }
@@ -144,6 +147,7 @@ export interface EventResult {
   /** Service-authenticated provenance, separate from untrusted message text. */
   peer?: { hostId: string; taskId: string; channelId: string };
   readyChannelId?: string;
+  urgent?: true;
 }
 /** Machine result identity and its bounded result. */
 export interface EventEnvelope {

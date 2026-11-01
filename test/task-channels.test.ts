@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SeekerCore } from "../src/core/seeker.ts";
 import { eventEnvelope, eventReturnCurrent, eventReturnTarget } from "../src/core/event-return.ts";
-import { eventDigest, eventLimits } from "../src/core/events.ts";
+import { eventDigest, eventLimits, eventRoute } from "../src/core/events.ts";
 import type { EventOwner, EventWait } from "../src/events.ts";
 import { fixtureBinding } from "../src/local/fixture.ts";
 import { nativeWakeup } from "../src/hosts/codex/protocol.ts";
@@ -73,6 +73,37 @@ test("an explicit native receiver grant permits repeated peer reports without hu
   expect(next.map((wait) => wait.waitId)).toEqual([second.waitId]);
   complete(f, next[0]!);
   expect(f.receiver().pending().map((wait) => wait.waitId)).toEqual([grant.waitId]);
+});
+
+test("explicit urgent directions precede routine retries without overtaking in-flight delivery", () => {
+  const f = fixture(true);
+  f.receiver().openChannel(grant);
+  const routineInput = { ...report, text: "Stop appears in this ordinary report." };
+  const routine = f.sender().sendChannel(routineInput);
+  const inFlight = f.store.events.claim(1, f.now(), [])[0]!;
+  expect(inFlight.message?.urgent).toBeUndefined();
+  f.store.events.complete(inFlight.waitId, inFlight.generation, inFlight.delivery!.attemptId!, { status: "retry", code: "event_owner_active", retryAfterMs: 1000 }, f.now());
+  f.setTime(2500);
+  const input = { ...report, messageId: "stop-1", text: "Stop the assigned work and report command settlement.", urgent: true };
+  const urgent = f.sender().sendChannel(input);
+  // The pump excludes an occupied route, even when an urgent message is due there.
+  expect(f.store.events.claim(1, f.now(), [eventRoute(inFlight)])).toEqual([]);
+  f.restart();
+  expect(f.sender().sendChannel(input)).toEqual({ ...urgent, status: "duplicate" });
+  expect(() => f.sender().sendChannel({ ...input, urgent: false })).toThrow("different content");
+  expect(f.sender().sendChannel({ ...routineInput, urgent: false })).toEqual({ ...routine, status: "duplicate" });
+  const selected = f.store.events.claim(1, f.now(), [])[0]!;
+  expect(selected.waitId).toBe(urgent.waitId);
+  expect(selected.message?.urgent).toBe(true);
+  expect(eventEnvelope(selected).event.result.urgent).toBe(true);
+  const prompt = nativeWakeup({ attemptId: "urgent-attempt", binding: eventReturnTarget(selected), envelope: eventEnvelope(selected) });
+  expect(prompt).toContain("Delivery does not confirm");
+  complete(f, selected, "unknown");
+  // Reconnection and an exact retry retain ambiguity rather than steering twice.
+  f.core.resumeHost(receiver.hostId);
+  expect(f.sender().sendChannel(input)).toEqual({ ...urgent, status: "duplicate" });
+  expect(f.store.events.claim(1, f.now(), [])[0]!.waitId).toBe(routine.waitId);
+  expect(f.receiver().get(urgent).delivery?.state).toBe("unknown");
 });
 
 test("one active grant per native receiver/peer pair makes idless retries and reverse routing unambiguous", () => {
@@ -277,9 +308,9 @@ test("schema upgrade preserves existing one-shot rows and rejects unsupported st
   f.reopen(); expect(f.receiver().get(old).state).toBe("waiting");
   f.receiver().openChannel(grant); f.store.close();
   db = new Database(f.path);
-  expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(9);
-  db.run("PRAGMA user_version=10"); db.close();
+  expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(10);
+  db.run("PRAGMA user_version=11"); db.close();
   expect(() => new SqliteExchangeStore(f.path)).toThrow("compatible Seeker version");
-  db = new Database(f.path); expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(10); db.run("PRAGMA user_version=9"); db.close();
+  db = new Database(f.path); expect(db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version).toBe(11); db.run("PRAGMA user_version=10"); db.close();
   f.reopen(); expect(f.receiver().get(grant).state).toBe("waiting");
 });
