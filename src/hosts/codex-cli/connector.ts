@@ -1,14 +1,14 @@
 import { readConnectorCredential } from "../codex/config.ts";
 import { privateRequest } from "../codex/private-http.ts";
 import { ConnectorError, record, type NativeInvocation } from "../codex/protocol.ts";
-import { serveSeekerTools } from "../codex-common/mcp.ts";
+import { serveSeekerTools, type SeekerToolsConnector } from "../codex-common/mcp.ts";
 import { cliRoute, readCliConfig } from "./config.ts";
 import type { CliOwner } from "./owner.ts";
 
 /** Host identity is captured by the shared entry from the real MCP parent, never from tool arguments. */
-export async function runCliConnector(configPath: string, owner: CliOwner): Promise<void> {
+export function createCliConnector(configPath: string, owner: CliOwner): SeekerToolsConnector {
   const config = readCliConfig(configPath), credential = readConnectorCredential(config.credentialFile), lifetime = new AbortController();
-  await serveSeekerTools({
+  return {
     async invoke(origin: NativeInvocation, operation: string, args: unknown, signal?: AbortSignal): Promise<unknown> {
       let response: { status: number; text: string };
       try { response = await privateRequest(config.socketPath, cliRoute, credential, { owner, origin, operation, arguments: args }, AbortSignal.any([lifetime.signal, AbortSignal.timeout(5_000), ...(signal ? [signal] : [])])); }
@@ -18,5 +18,9 @@ export async function runCliConnector(configPath: string, owner: CliOwner): Prom
       return result;
     },
     async close() { lifetime.abort(); },
-  });
+  };
+}
+
+export async function runCliConnector(configPath: string, owner: CliOwner): Promise<void> {
+  await serveSeekerTools(createCliConnector(configPath, owner));
 }
