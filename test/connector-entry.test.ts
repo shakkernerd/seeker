@@ -49,8 +49,10 @@ async function fixture(mode: string) {
     }));
     const { runNativeConnector } = await import(${module("../src/hosts/codex-common/entry.ts")});
     const running = runNativeConnector(${module("../package.json")}.replace("file://", ""));
-    const control = createInterface({ input: process.stdin });
-    control.on("line", line => { if (JSON.parse(line).method === "notifications/fixture-ready") release(); });
+    if (mode === "concurrent") {
+      const control = createInterface({ input: process.stdin });
+      control.on("line", line => { if (JSON.parse(line).method === "notifications/fixture-ready") release(); });
+    }
     await running;
     console.log(JSON.stringify({ settled: true, probes, created, invoked, closed }));
     store.close();
