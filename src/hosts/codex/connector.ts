@@ -5,7 +5,7 @@ import { privateSocket, readConnectorConfig, readConnectorCredential, type Codex
 import { CodexNativeClient } from "./native.ts";
 import { captureDesktopOwner, type DesktopOwner } from "./desktop-owner.ts";
 import { ConnectorError, codexRoute, connectorProtocol, record, type NativeInvocation } from "./protocol.ts";
-import { serveSeekerTools } from "../codex-common/mcp.ts";
+import { serveSeekerTools, type SeekerToolsConnector } from "../codex-common/mcp.ts";
 import { privateRequest } from "./private-http.ts";
 
 export class CodexConnector {
@@ -79,16 +79,25 @@ export class CodexConnector {
   }
 }
 
-export async function runCodexConnector(configPath: string, owner?: DesktopOwner): Promise<void> {
+export async function createCodexConnector(configPath: string, owner?: DesktopOwner, signal?: AbortSignal): Promise<SeekerToolsConnector> {
   const pipe = process.env.CODEX_APP_TOOLS_PIPE_PATH;
   if (!pipe) throw new ConnectorError("native_host_required", "Run this connector through Codex Desktop's configured MCP server.");
   const config = readConnectorConfig(configPath);
-  const desktop = owner ?? await captureDesktopOwner();
+  const credential = readConnectorCredential(config.credentialFile);
+  const desktop = owner ?? await captureDesktopOwner(signal);
   const native = new CodexNativeClient(pipe, 3_000);
-  await native.qualify();
+  await native.qualify(signal);
+  signal?.throwIfAborted();
   const bridge = await listenNativeBridge(dirname(config.socketPath), native);
-  const connector = new CodexConnector(config, readConnectorCredential(config.credentialFile), native, desktop, bridge.endpoint);
+  if (signal?.aborted) { await bridge.close(); signal.throwIfAborted(); }
+  const connector = new CodexConnector(config, credential, native, desktop, bridge.endpoint);
   const receiving = connector.receive();
-  try { await serveSeekerTools(connector); }
-  finally { await connector.close(); await receiving; await bridge.close(); }
+  return {
+    invoke: (origin, operation, args, requestSignal) => connector.invoke(origin, operation, args, requestSignal),
+    async close() { try { await connector.close(); await receiving; } finally { await bridge.close(); } },
+  };
+}
+
+export async function runCodexConnector(configPath: string, owner?: DesktopOwner): Promise<void> {
+  await serveSeekerTools(await createCodexConnector(configPath, owner));
 }

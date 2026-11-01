@@ -38,12 +38,20 @@ Repeat setup retains explicit enabled/required and timeout settings, including a
 deliberately disabled connector. It refuses to redirect a project to another
 Seeker data directory implicitly.
 
-Reload the Seeker MCP server through Codex Desktop's supported MCP settings. For
+After installing a connector update, reload the Seeker MCP server through Codex Desktop's supported MCP settings. For
 an already loaded task, follow the host's supported reload/resume procedure while
 keeping its identity. A project must be trusted for its MCP configuration to load.
 Ask the manager to use Seeker's `pending` tool once to confirm admission; routine
 conversation then needs no polling. Setup does not change native permission
 policies or approve other tools.
+
+A transient native-host initialization failure is retried once after 250 ms,
+with a four-second limit per preparation attempt. Concurrent tool calls share
+that preparation. If it still fails, a later tool call can initialize the same
+connector without a reload. The connector preserves the diagnostic code in its
+private stderr log and returns the specific failure to the caller; a genuinely
+unsupported host or missing registration still requires correction. Recovery
+never repeats a tool operation that may already have been submitted.
 
 That first admitted call also records the qualified Desktop application, profile,
 native storage locations and process owner in a private `codex-desktop.json`

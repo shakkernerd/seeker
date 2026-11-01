@@ -52,6 +52,13 @@ An authenticated reply enters Seeker's existing durable queue. The service sends
 
 If that manager is unloaded, Seeker resumes its saved UUID on the same host. If its recorded host process has exited, Seeker first checks whether the original Unix endpoint already belongs to a restarted host. It reuses that process only after verifying the executable identity, actual native home, state directory, working directory, listener and effective remote-access mode against the registration. This also recovers when Seeker stops before saving a newly started host's PID. If no host owns the endpoint, Seeker can start the captured native executable with those same settings, then resume the same task. Preparation is bounded and shared by pending deliveries; it does not submit input. A fresh delivery attempt checks the current assignment and exchange before writing.
 
+The MCP connector also retries transient native-host initialization once after
+250 ms, allowing four seconds per attempt. Concurrent calls share preparation;
+a later call can recover after an earlier failure without reloading MCP. Actual
+diagnostic codes remain in the private stderr log and tool response. Unsupported
+launches and missing registration are still rejected. Initialization recovery
+does not repeat submitted tool operations or replay uncertain delivery.
+
 Native permissions still apply to every tool. In particular, Codex can reject unapproved mutating MCP tools under approval policy `never`, or request permission in its native interface under `on-request`. Seeker does not answer, auto-approve or auto-deny those requests. Reconnect the original CLI interface to answer native approvals after a headless recovery. A Seeker owner reply is not a native execution permission.
 
 Known-unaccepted work may retry after readiness returns. A lost response after a native write remains uncertain and is not replayed automatically. Reconcile it against the original task and retained exchange. No durable native idempotency guarantee is inferred from an input identifier.
